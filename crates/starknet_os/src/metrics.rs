@@ -6,16 +6,17 @@ use cairo_vm::vm::runners::cairo_runner::{CairoRunner, ExecutionResources};
 use serde::Serialize;
 
 use crate::hint_processor::snos_hint_processor::SnosHintProcessor;
+use crate::opcode_instances::{get_opcode_instances, OpcodeInstanceCounts};
 
-#[derive(Serialize)]
-pub struct OsRunInfo {
+#[derive(Debug, Serialize)]
+pub struct ProgramRunInfo {
     pub pc: MaybeRelocatable,
     pub ap: MaybeRelocatable,
     pub fp: MaybeRelocatable,
     pub used_memory_cells: usize,
 }
 
-impl OsRunInfo {
+impl ProgramRunInfo {
     pub fn new(runner: &mut CairoRunner) -> Self {
         Self {
             pc: runner.vm.get_pc().into(),
@@ -26,11 +27,18 @@ impl OsRunInfo {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct OsMetrics {
     pub syscall_usages: Vec<SyscallUsageMap>,
     pub deprecated_syscall_usages: Vec<SyscallUsageMap>,
-    pub run_info: OsRunInfo,
+    pub run_info: ProgramRunInfo,
+    pub execution_resources: ExecutionResources,
+    pub opcode_instances: OpcodeInstanceCounts,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AggregatorMetrics {
+    pub run_info: ProgramRunInfo,
     pub execution_resources: ExecutionResources,
 }
 
@@ -44,7 +52,17 @@ impl OsMetrics {
             deprecated_syscall_usages: hint_processor
                 .execution_helpers_manager
                 .get_deprecated_syscall_usages(),
-            run_info: OsRunInfo::new(runner),
+            run_info: ProgramRunInfo::new(runner),
+            execution_resources: runner.get_execution_resources()?,
+            opcode_instances: get_opcode_instances(runner),
+        })
+    }
+}
+
+impl AggregatorMetrics {
+    pub fn new(runner: &mut CairoRunner) -> Result<Self, RunnerError> {
+        Ok(Self {
+            run_info: ProgramRunInfo::new(runner),
             execution_resources: runner.get_execution_resources()?,
         })
     }

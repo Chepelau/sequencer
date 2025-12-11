@@ -18,7 +18,6 @@ use indexmap::IndexMap;
 use papyrus_common::state::{DeployedContract, ReplacedClass, StorageEntry};
 // Expose the tool for creating entry point selectors from function names.
 pub use starknet_api::abi::abi_utils::selector_from_name;
-use starknet_api::contract_class::SierraVersion;
 use starknet_api::core::{ClassHash, ContractAddress, Nonce};
 use starknet_api::state::{StateNumber, StorageKey, ThinStateDiff};
 use starknet_types_core::felt::Felt;
@@ -73,8 +72,8 @@ pub(crate) fn get_contract_class(
             let (Some(casm), Some(sierra)) = txn.get_casm_and_sierra(class_hash)? else {
                 return Err(ExecutionUtilsError::CasmTableNotSynced);
             };
-            let sierra_version = SierraVersion::extract_from_program(&sierra.sierra_program)
-                .map_err(ExecutionUtilsError::SierraValidationError)?;
+            let sierra_version =
+                sierra.get_sierra_version().map_err(ExecutionUtilsError::SierraValidationError)?;
             return Ok(Some(RunnableCompiledClass::V1(CompiledClassV1::try_from((
                 casm,
                 sierra_version,
@@ -128,7 +127,6 @@ pub fn get_trace_constructor(
 /// it is not provided by the blockifier API.
 // TODO(Dan, Yair): consider box large elements (because of BadDeclareTransaction) or use ID
 // instead.
-#[allow(clippy::result_large_err)]
 pub fn induced_state_diff(
     transactional_state: &mut CachedState<MutRefState<'_, CachedState<ExecutionStateReader>>>,
     deprecated_declared_class_hash: Option<ClassHash>,
@@ -139,7 +137,7 @@ pub fn induced_state_diff(
     Ok(ThinStateDiff {
         deployed_contracts: blockifier_state_diff.address_to_class_hash,
         storage_diffs: blockifier_state_diff.storage_updates,
-        declared_classes: blockifier_state_diff.class_hash_to_compiled_class_hash,
+        class_hash_to_compiled_class_hash: blockifier_state_diff.class_hash_to_compiled_class_hash,
         deprecated_declared_classes: deprecated_declared_class_hash
             .map_or_else(Vec::new, |class_hash| vec![class_hash]),
         nonces: blockifier_state_diff.address_to_nonce,

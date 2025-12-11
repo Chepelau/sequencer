@@ -20,6 +20,7 @@ use crate::transaction::fields::{
     Calldata,
     Fee,
     PaymasterData,
+    ProofFacts,
     Tip,
     TransactionSignature,
     ValidResourceBounds,
@@ -49,6 +50,7 @@ pub struct InvokeTxArgs {
     pub nonce: Nonce,
     pub only_query: bool,
     pub tx_hash: TransactionHash,
+    pub proof_facts: ProofFacts,
 }
 
 impl Default for InvokeTxArgs {
@@ -59,7 +61,7 @@ impl Default for InvokeTxArgs {
             sender_address: ContractAddress::default(),
             calldata: calldata![],
             version: TransactionVersion::THREE,
-            resource_bounds: ValidResourceBounds::create_for_testing_no_fee_enforcement(),
+            resource_bounds: ValidResourceBounds::create_for_testing(),
             tip: Tip::default(),
             nonce_data_availability_mode: DataAvailabilityMode::L1,
             fee_data_availability_mode: DataAvailabilityMode::L1,
@@ -68,6 +70,7 @@ impl Default for InvokeTxArgs {
             nonce: Nonce::default(),
             only_query: false,
             tx_hash: TransactionHash::default(),
+            proof_facts: ProofFacts::default(),
         }
     }
 }
@@ -120,6 +123,7 @@ pub fn invoke_tx(invoke_args: InvokeTxArgs) -> InvokeTransaction {
             fee_data_availability_mode: invoke_args.fee_data_availability_mode,
             paymaster_data: invoke_args.paymaster_data,
             account_deployment_data: invoke_args.account_deployment_data,
+            proof_facts: invoke_args.proof_facts,
         })
     } else {
         panic!("Unsupported transaction version: {:?}.", invoke_args.version)
@@ -178,5 +182,43 @@ impl TestingTxArgs for InvokeTxArgs {
 
     fn get_internal_tx(&self) -> InternalRpcTransaction {
         internal_invoke_tx(self.clone())
+    }
+
+    fn get_executable_tx(&self) -> AccountTransaction {
+        executable_invoke_tx(self.clone())
+    }
+}
+
+// TODO(Itamar): Change this to use a macro and apply the same logic to DeclareTxArgs and
+// DeployAccountTxArgs.
+impl InvokeTxArgs {
+    pub fn signature(mut self, signature: TransactionSignature) -> Self {
+        self.signature = signature;
+        self
+    }
+
+    pub fn sender_address(mut self, sender_address: ContractAddress) -> Self {
+        self.sender_address = sender_address;
+        self
+    }
+
+    pub fn calldata(mut self, calldata: Calldata) -> Self {
+        self.calldata = calldata;
+        self
+    }
+
+    pub fn resource_bounds(mut self, resource_bounds: ValidResourceBounds) -> Self {
+        self.resource_bounds = resource_bounds;
+        self
+    }
+
+    pub fn tip(mut self, tip: Tip) -> Self {
+        self.tip = tip;
+        self
+    }
+
+    pub fn nonce(mut self, nonce: Nonce) -> Self {
+        self.nonce = nonce;
+        self
     }
 }

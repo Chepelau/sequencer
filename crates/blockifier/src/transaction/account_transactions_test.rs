@@ -18,6 +18,8 @@ use starknet_api::abi::abi_utils::{
     selector_from_name,
 };
 use starknet_api::block::{FeeType, GasPrice};
+use starknet_api::contract_class::compiled_class_hash::{HashVersion, HashableCompiledClass};
+use starknet_api::contract_class::ContractClass;
 use starknet_api::core::{
     calculate_contract_address,
     ClassHash,
@@ -77,11 +79,11 @@ use starknet_api::{
 };
 use starknet_types_core::felt::Felt;
 
-use crate::check_tx_execution_error_for_invalid_scenario;
 use crate::context::{BlockContext, TransactionContext};
 use crate::execution::call_info::CallInfo;
 use crate::execution::contract_class::TrackedResource;
 use crate::execution::entry_point::{EntryPointExecutionContext, SierraGasRevertTracker};
+use crate::execution::syscalls::hint_processor::ENTRYPOINT_NOT_FOUND_ERROR;
 use crate::execution::syscalls::vm_syscall_utils::SyscallSelector;
 use crate::fee::fee_utils::{
     get_fee_by_gas_vector,
@@ -139,6 +141,7 @@ use crate::transaction::test_utils::{
 };
 use crate::transaction::transactions::ExecutableTransaction;
 use crate::utils::u64_from_usize;
+use crate::{check_tx_execution_error_for_invalid_scenario, retdata};
 
 #[rstest]
 #[case::cairo1(CairoVersion::Cairo1(RunnableCairo1::Casm))]
@@ -267,9 +270,11 @@ fn test_fee_enforcement(
     if enforce_fee {
         assert_matches!(
             result,
-            Err(TransactionExecutionError::TransactionPreValidationError(
+            Err(TransactionExecutionError::TransactionPreValidationError(boxed_error))
+            if matches!(
+                *boxed_error,
                 TransactionPreValidationError::TransactionFeeError(_)
-            ))
+            )
         );
     } else {
         assert!(result.is_ok());
@@ -502,6 +507,11 @@ fn test_max_fee_limit_validate(
     let block_info = block_context.block_info.clone();
     let class_info = calculate_class_info_for_testing(grindy_validate_account.get_class());
 
+    let compiled_class_hash = match &class_info.contract_class {
+        ContractClass::V0(_) => CompiledClassHash::default(),
+        ContractClass::V1((casm, _)) => casm.hash(&HashVersion::V2),
+    };
+
     // Declare the grindy-validation account.
     let tx = executable_declare_tx(
         declare_tx_args! {
@@ -509,6 +519,7 @@ fn test_max_fee_limit_validate(
             sender_address: account_address,
             resource_bounds,
             nonce: nonce_manager.next(account_address),
+            compiled_class_hash,
         },
         class_info,
     );
@@ -882,23 +893,30 @@ fn test_fail_declare(block_context: BlockContext, max_fee: Fee) {
     class_hash: class_hash!(7_u64),
     compiled_class_hash: CompiledClassHash(8_u64.into()),
     ..Default::default()
-}))]
+}), HashVersion::V2)]
+#[should_panic(expected = "DeclareTransactionCasmHashMissMatch")]
+#[case::poseidon_declare_tx(DeclareTransaction::V3(DeclareTransactionV3 {
+    sender_address: ApiExecutableDeclareTransaction::bootstrap_address(),
+    class_hash: class_hash!(7_u64),
+    compiled_class_hash: CompiledClassHash(8_u64.into()),
+    ..Default::default()
+}), HashVersion::V1)]
 #[should_panic(expected = "UninitializedStorageAddress")]
 #[case::wrong_tx_version(DeclareTransaction::V2(DeclareTransactionV2 {
     sender_address: ApiExecutableDeclareTransaction::bootstrap_address(),
     ..Default::default()
-}))]
+}), HashVersion::V2)]
 #[should_panic(expected = "InvalidNonce")]
 #[case::wrong_nonce(DeclareTransaction::V3(DeclareTransactionV3 {
     sender_address: ApiExecutableDeclareTransaction::bootstrap_address(),
     nonce: Nonce(felt!(1_u64)),
     ..Default::default()
-}))]
+}), HashVersion::V2)]
 #[should_panic(expected = "UninitializedStorageAddress")]
 #[case::wrong_sender_address(DeclareTransaction::V3(DeclareTransactionV3 {
     sender_address: ContractAddress(PatriciaKey::from(1_u128)),
     ..Default::default()
-}))]
+}), HashVersion::V2)]
 #[should_panic(expected = "InsufficientResourceBounds")]
 #[case::non_trivial_resource_bounds(DeclareTransaction::V3(DeclareTransactionV3 {
     sender_address: ApiExecutableDeclareTransaction::bootstrap_address(),
@@ -908,16 +926,30 @@ fn test_fail_declare(block_context: BlockContext, max_fee: Fee) {
         l1_data_gas: ResourceBounds::default(),
     }),
     ..Default::default()
-}))]
-fn test_bootstrap_declare(block_context: BlockContext, #[case] declare_tx: DeclareTransaction) {
+}), HashVersion::V2)]
+fn test_bootstrap_declare(
+    block_context: BlockContext,
+    #[case] declare_tx: DeclareTransaction,
+    #[case] hash_version: HashVersion,
+) {
     let class_info = calculate_class_info_for_testing(
         FeatureContract::Empty(CairoVersion::Cairo1(RunnableCairo1::Casm)).get_class(),
     );
-    let executable_declare = ApiExecutableDeclareTransaction {
+    let contract_class = class_info.contract_class();
+    let mut executable_declare = ApiExecutableDeclareTransaction {
         tx: declare_tx.clone(),
         tx_hash: TransactionHash::default(),
         class_info,
     };
+
+    // Update compiled_class_hash in V3 declare txs to match the contract class with the given hash
+    // version.
+    if let DeclareTransaction::V3(tx) = &mut executable_declare.tx {
+        if let ContractClass::V1((casm, _)) = &contract_class {
+            tx.compiled_class_hash = casm.hash(&hash_version);
+        }
+    }
+    let compiled_class_hash = executable_declare.tx.compiled_class_hash();
     let declare_account_tx = AccountTransaction::new_for_sequencing(
         ApiExecutableTransaction::Declare(executable_declare),
     );
@@ -928,7 +960,7 @@ fn test_bootstrap_declare(block_context: BlockContext, #[case] declare_tx: Decla
     // Check declaration.
     assert_eq!(
         state.get_compiled_class_hash(declare_tx.class_hash()).unwrap(),
-        declare_tx.compiled_class_hash()
+        compiled_class_hash
     );
 
     // Ensure the only change is the class declaration: no fees, nonce bump, etc.
@@ -936,10 +968,7 @@ fn test_bootstrap_declare(block_context: BlockContext, #[case] declare_tx: Decla
     assert_eq!(
         state.to_state_diff().unwrap().state_maps,
         StateMaps {
-            compiled_class_hashes: HashMap::from([(
-                declare_tx.class_hash(),
-                declare_tx.compiled_class_hash()
-            )]),
+            compiled_class_hashes: HashMap::from([(declare_tx.class_hash(), compiled_class_hash)]),
             declared_contracts: HashMap::from([(declare_tx.class_hash(), true)]),
             ..Default::default()
         }
@@ -2093,6 +2122,7 @@ fn test_call_contract_that_panics(
 
     let new_class_hash = FeatureContract::TestContract(cairo_version).get_class_hash();
     let to_panic = true.into();
+    let meta_tx = false.into();
 
     let calldata = [
         *contract_address.0.key(),
@@ -2100,6 +2130,7 @@ fn test_call_contract_that_panics(
         felt!(2_u8),
         new_class_hash.0,
         to_panic,
+        meta_tx,
     ];
 
     // Invoke a function that changes the state and reverts.
@@ -2107,9 +2138,9 @@ fn test_call_contract_that_panics(
         sender_address: account_address,
         calldata: create_calldata(
             contract_address,
-               "test_call_contract_revert",
-                &calldata
-            ),
+            "test_call_contract_revert",
+            &calldata
+        ),
         nonce: nonce_manager.next(account_address)
     };
     let tx_execution_info = run_invoke_tx(
@@ -2132,4 +2163,31 @@ fn test_call_contract_that_panics(
             assert_eq!(call.tracked_resource, TrackedResource::SierraGas);
         }
     }
+}
+
+#[rstest]
+fn test_missing_validate_entrypoint_rejects(
+    block_context: BlockContext,
+    default_all_resource_bounds: ValidResourceBounds,
+) {
+    let chain_info = &block_context.chain_info;
+    let account = FeatureContract::AccountWithoutValidations(CairoVersion::Cairo0);
+    let test_contract = FeatureContract::TestContract(CairoVersion::Cairo0);
+    let mut state = test_state(chain_info, BALANCE, &[(account, 1u16), (test_contract, 1u16)]);
+    let test_contract_address = test_contract.get_instance_address(0_u16);
+    // Fund the test contract.
+    fund_account(chain_info, test_contract_address, BALANCE, &mut state.state);
+    // Send an invoke transaction with the test contract as the sender.
+    let tx_args = invoke_tx_args! {
+        sender_address: test_contract_address,
+        resource_bounds: default_all_resource_bounds
+    };
+    let result = run_invoke_tx(&mut state, &block_context, tx_args);
+    assert!(result.is_err());
+    let error = result.unwrap_err();
+    assert_matches!(
+        error,
+        TransactionExecutionError::ValidateCairo0Error(ret)
+        if ret == retdata![Felt::from_hex(ENTRYPOINT_NOT_FOUND_ERROR).unwrap()]
+    );
 }

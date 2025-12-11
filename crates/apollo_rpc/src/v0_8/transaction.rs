@@ -35,6 +35,7 @@ use starknet_api::transaction::fields::{
     ContractAddressSalt,
     Fee,
     PaymasterData,
+    ProofFacts,
     Resource,
     ResourceBounds,
     Tip,
@@ -447,6 +448,7 @@ pub struct InvokeTransactionV3 {
     pub account_deployment_data: AccountDeploymentData,
     pub nonce_data_availability_mode: DataAvailabilityMode,
     pub fee_data_availability_mode: DataAvailabilityMode,
+    pub proof_facts: ProofFacts,
 }
 
 impl From<InvokeTransactionV3> for client_transaction::InvokeTransaction {
@@ -465,6 +467,7 @@ impl From<InvokeTransactionV3> for client_transaction::InvokeTransaction {
             paymaster_data: tx.paymaster_data,
             account_deployment_data: tx.account_deployment_data,
             r#type: client_transaction::InvokeType::Invoke,
+            proof_facts: tx.proof_facts,
         })
     }
 }
@@ -536,6 +539,7 @@ impl TryFrom<starknet_api::transaction::InvokeTransaction> for InvokeTransaction
                     fee_data_availability_mode,
                     paymaster_data,
                     account_deployment_data,
+                    proof_facts,
                 },
             ) => Ok(Self::Version3(InvokeTransactionV3 {
                 sender_address,
@@ -549,6 +553,7 @@ impl TryFrom<starknet_api::transaction::InvokeTransaction> for InvokeTransaction
                 fee_data_availability_mode,
                 paymaster_data,
                 account_deployment_data,
+                proof_facts,
             })),
         }
     }
@@ -1001,7 +1006,7 @@ impl From<starknet_api::execution_resources::ExecutionResources> for Computation
                 .builtin_instance_counter
                 .into_iter()
                 .filter_map(|(k, v)| {
-                    v.try_into().ok().and_then(|v| (k.try_into().ok().map(|k| (k, v))))
+                    v.try_into().ok().and_then(|v| k.try_into().ok().map(|k| (k, v)))
                 })
                 .collect(),
             memory_holes: value.memory_holes.try_into().ok(),
@@ -1210,7 +1215,7 @@ impl Serialize for L1L2MsgHash {
     where
         S: Serializer,
     {
-        serializer.serialize_str(format!("{}", self).as_str())
+        serializer.serialize_str(format!("{self}").as_str())
     }
 }
 
@@ -1297,7 +1302,7 @@ where
     S: serde::Serializer,
 {
     let hex_string = hex::encode(eth_address.0.as_bytes());
-    let fixed_size_hex_string = format!("0x{:0<40}", hex_string);
+    let fixed_size_hex_string = format!("0x{hex_string:0<40}");
     serializer.serialize_str(fixed_size_hex_string.as_str())
 }
 

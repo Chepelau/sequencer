@@ -11,12 +11,13 @@ use std::collections::HashMap;
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use starknet_committer::block_committer::input::StarknetStorageValue;
+use starknet_committer::db::external_test_utils::tree_computation_flow;
 use starknet_committer::hash_function::hash::TreeHashFunctionImpl;
 use starknet_committer::patricia_merkle_tree::tree::OriginalSkeletonStorageTrieConfig;
 use starknet_committer_and_os_cli::committer_cli::commands::commit;
+use starknet_committer_and_os_cli::committer_cli::parse_input::cast::CommitterInputImpl;
 use starknet_committer_and_os_cli::committer_cli::parse_input::read::parse_input;
-use starknet_committer_and_os_cli::committer_cli::tests::utils::parse_from_python::TreeFlowInput;
-use starknet_patricia::patricia_merkle_tree::external_test_utils::tree_computation_flow;
+use starknet_committer_and_os_cli::committer_cli::tests::parse_from_python::TreeFlowInput;
 use starknet_patricia::patricia_merkle_tree::node_data::leaf::LeafModifications;
 use starknet_patricia::patricia_merkle_tree::types::NodeIndex;
 
@@ -26,9 +27,8 @@ const FLOW_TEST_INPUT: &str = include_str!("../test_inputs/committer_flow_inputs
 const OUTPUT_PATH: &str = "benchmark_output.txt";
 
 pub fn single_tree_flow_benchmark(criterion: &mut Criterion) {
-    let TreeFlowInput { leaf_modifications, storage, root_hash } =
+    let TreeFlowInput { leaf_modifications, mut storage, root_hash } =
         serde_json::from_str(SINGLE_TREE_FLOW_INPUT).unwrap();
-
     let runtime = match CONCURRENCY_MODE {
         true => tokio::runtime::Builder::new_multi_thread().build().unwrap(),
         false => tokio::runtime::Builder::new_current_thread().build().unwrap(),
@@ -46,7 +46,7 @@ pub fn single_tree_flow_benchmark(criterion: &mut Criterion) {
                 runtime.block_on(
                     tree_computation_flow::<StarknetStorageValue, TreeHashFunctionImpl>(
                         leaf_modifications_input,
-                        &storage,
+                        &mut storage,
                         root_hash,
                         OriginalSkeletonStorageTrieConfig::new(false),
                     ),
@@ -72,10 +72,10 @@ pub fn full_committer_flow_benchmark(criterion: &mut Criterion) {
     criterion.bench_function("full_committer_flow", |benchmark| {
         benchmark.iter(|| {
             runtime.block_on({
-                let input =
+                let CommitterInputImpl { input, storage } =
                     parse_input(committer_input_string).expect("Failed to parse the given input.");
                 // Set the given log level if handle is passed.
-                commit(input, OUTPUT_PATH.to_owned())
+                commit(input, OUTPUT_PATH.to_owned(), storage)
             });
         })
     });

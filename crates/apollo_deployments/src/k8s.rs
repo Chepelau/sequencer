@@ -1,13 +1,12 @@
+use apollo_http_server_config::config::HTTP_SERVER_PORT;
 use serde::{Serialize, Serializer};
 
 use crate::deployment::P2PCommunicationType;
 use crate::deployment_definitions::Environment;
-
 // Controls whether external P2P communication is enabled.
 const INTERNAL_ONLY_P2P_COMMUNICATION: bool = true;
 
 const INGRESS_ROUTE: &str = "/gateway";
-const INGRESS_PORT: u16 = 8080;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub enum Controller {
@@ -17,8 +16,11 @@ pub enum Controller {
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub enum K8SServiceType {
+    // TODO(Tsabary): remove dead_code annotations when instances require these variants.
+    #[allow(dead_code)]
     ClusterIp,
     LoadBalancer,
+    #[allow(dead_code)]
     NodePort,
 }
 
@@ -105,18 +107,14 @@ pub(crate) fn get_ingress(ingress_params: IngressParams, internal: bool) -> Opti
     Some(Ingress::new(
         ingress_params,
         internal,
-        vec![IngressRule::new(String::from(INGRESS_ROUTE), INGRESS_PORT, None)],
+        vec![IngressRule::new(String::from(INGRESS_ROUTE), HTTP_SERVER_PORT, None)],
     ))
 }
 
 pub(crate) fn get_environment_ingress_internal(environment: &Environment) -> bool {
     match environment {
-        Environment::Testing => true,
-        Environment::SepoliaIntegration
-        | Environment::UpgradeTest
-        | Environment::TestingEnvThree
-        | Environment::StressTest => false,
-        _ => unimplemented!(),
+        Environment::CloudK8s(_) => false,
+        Environment::LocalK8s => true,
     }
 }
 
@@ -172,8 +170,15 @@ impl Resources {
 #[serde(rename_all = "kebab-case")]
 pub enum Toleration {
     ApolloCoreService,
+    #[serde(rename = "apollo-core-service-c2d-16")]
     ApolloCoreServiceC2D16,
+    #[serde(rename = "apollo-core-service-c2d-32")]
     ApolloCoreServiceC2D32,
+    #[serde(rename = "apollo-core-service-c2d-56")]
     ApolloCoreServiceC2D56,
     ApolloGeneralService,
+    ApolloL1Service,
+    ApolloMempoolService,
+    #[serde(rename = "batcher-8-64")]
+    Batcher864,
 }

@@ -13,9 +13,12 @@ use apollo_integration_tests::utils::{
 };
 use clap::Parser;
 use mempool_test_utils::starknet_api_test_utils::MultiAccountTransactionGenerator;
-use papyrus_base_layer::ethereum_base_layer_contract::EthereumBaseLayerConfig;
+use papyrus_base_layer::ethereum_base_layer_contract::{
+    EthereumBaseLayerConfig,
+    EthereumBaseLayerContract,
+    Starknet,
+};
 use papyrus_base_layer::test_utils::{
-    deploy_starknet_l1_contract,
     make_block_history_on_anvil,
     DEFAULT_ANVIL_L1_DEPLOYED_ADDRESS,
 };
@@ -63,13 +66,13 @@ fn read_ports_from_file(path: &str) -> (u16, u16) {
 
     let http_port: u16 = json[HTTP_PORT_ARG]
         .as_u64()
-        .unwrap_or_else(|| panic!("http port should be available in {}", path))
+        .unwrap_or_else(|| panic!("http port should be available in {path}"))
         .try_into()
         .expect("http port should be within the valid range for u16");
 
     let monitoring_port: u16 = json[MONITORING_PORT_ARG]
         .as_u64()
-        .unwrap_or_else(|| panic!("monitoring port should be available in {}", path))
+        .unwrap_or_else(|| panic!("monitoring port should be available in {path}"))
         .try_into()
         .expect("monitoring port should be within the valid range for u16");
 
@@ -133,30 +136,31 @@ async fn initialize_anvil_state(sender_address: Address, receiver_address: Addre
         sender_address, receiver_address
     );
 
-    let base_layer_config = build_base_layer_config_for_testing();
+    let (base_layer_config, base_layer_url) = build_base_layer_config_for_testing();
 
-    deploy_starknet_l1_contract(base_layer_config.clone()).await;
+    let ethereum_base_layer_contract =
+        EthereumBaseLayerContract::new(base_layer_config.clone(), base_layer_url.clone());
+    Starknet::deploy(ethereum_base_layer_contract.contract.provider().clone()).await.unwrap();
 
     make_block_history_on_anvil(
         sender_address,
         receiver_address,
         base_layer_config,
+        &base_layer_url,
         NUM_BLOCKS_NEEDED_ON_L1,
     )
     .await;
 }
 
-fn build_base_layer_config_for_testing() -> EthereumBaseLayerConfig {
+// TODO(Arni): Use `AnvilBaseLayer`.
+fn build_base_layer_config_for_testing() -> (EthereumBaseLayerConfig, Url) {
     let starknet_contract_address: EthereumContractAddress =
         DEFAULT_ANVIL_L1_DEPLOYED_ADDRESS.parse().expect("Invalid contract address");
     let node_url = Url::parse(ANVIL_NODE_URL).expect("Failed to parse Anvil URL");
 
-    EthereumBaseLayerConfig {
-        node_url,
-        starknet_contract_address,
-        prague_blob_gas_calc: true,
-        ..Default::default()
-    }
+    let base_layer_config =
+        EthereumBaseLayerConfig { starknet_contract_address, ..Default::default() };
+    (base_layer_config, node_url)
 }
 
 #[derive(Parser, Debug)]
@@ -207,7 +211,7 @@ async fn main() -> anyhow::Result<()> {
     let (http_port, monitoring_port) = get_ports(&args);
 
     let sequencer_simulator =
-        SequencerSimulator::new(args.http_url, http_port, args.monitoring_url, monitoring_port);
+        SequencerSimulator::new(&args.http_url, http_port, &args.monitoring_url, monitoring_port);
 
     info!("Sending deploy and invoke txs");
     sequencer_simulator.send_txs(&mut tx_generator, &DeployAndInvokeTxs, ACCOUNT_ID_0).await;

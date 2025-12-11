@@ -1,15 +1,16 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use starknet_api::contract_class::compiled_class_hash::{HashVersion, HashableCompiledClass};
 use starknet_api::core::{ClassHash, CompiledClassHash, ContractAddress, Nonce};
 use starknet_api::state::{SierraContractClass, StorageKey};
 use starknet_types_core::felt::Felt;
 
 use crate::execution::contract_class::RunnableCompiledClass;
-use crate::state::cached_state::StorageEntry;
+use crate::state::cached_state::{ContractClassMapping, StateMaps, StorageEntry};
 use crate::state::errors::StateError;
 use crate::state::global_cache::CompiledClasses;
-use crate::state::state_api::{StateReader, StateResult};
+use crate::state::state_api::{StateReader, StateResult, UpdatableState};
 use crate::state::state_reader_and_contract_manager::FetchCompiledClasses;
 use crate::test_utils::contracts::FeatureContractData;
 
@@ -21,14 +22,18 @@ pub struct DictStateReader {
     pub address_to_class_hash: HashMap<ContractAddress, ClassHash>,
     pub class_hash_to_class: HashMap<ClassHash, RunnableCompiledClass>,
     pub class_hash_to_sierra: HashMap<ClassHash, SierraContractClass>,
+    // A mapping: class hash to compiled class hash, part of the state.
     pub class_hash_to_compiled_class_hash: HashMap<ClassHash, CompiledClassHash>,
+    // A mapping: class hash to compiled class hash v2, **not** part of the state.
+    pub class_hash_to_compiled_class_hash_v2: Arc<Mutex<HashMap<ClassHash, CompiledClassHash>>>,
 }
 
 impl DictStateReader {
-    pub fn add_class(&mut self, contract: &FeatureContractData) {
+    /// Pre-process: declares a class.
+    pub fn add_class(&mut self, contract: &FeatureContractData, hash_version: &HashVersion) {
         self.class_hash_to_class.insert(contract.class_hash, contract.runnable_class.clone());
 
-        match contract.runnable_class {
+        match &contract.runnable_class {
             RunnableCompiledClass::V0(_) => {
                 assert!(
                     contract.sierra.is_none(),
@@ -39,10 +44,38 @@ impl DictStateReader {
                 assert!(contract.sierra.is_some(), "Sierra class is required for Cairo1");
                 self.class_hash_to_sierra
                     .insert(contract.class_hash, contract.sierra.clone().unwrap());
+                self.add_compiled_class_hashes(contract, hash_version);
             }
             #[cfg(feature = "cairo_native")]
             RunnableCompiledClass::V1Native(_) => {
-                // Do nothing, Sierra class is not required for native classes.
+                // Sierra class is not required for native classes.
+                self.add_compiled_class_hashes(contract, hash_version);
+            }
+        }
+    }
+
+    /// Adds the compiled class hashes of the contract to the state reader.
+    /// The `hash_version` parameter is used to determine what it the hash version in the state.
+    fn add_compiled_class_hashes(
+        &mut self,
+        contract: &FeatureContractData,
+        hash_version: &HashVersion,
+    ) {
+        // Always add compiled class hash v2 as it is used for migration.
+        self.class_hash_to_compiled_class_hash_v2
+            .lock()
+            .unwrap()
+            .insert(contract.class_hash, contract.compiled_class_hash_v2);
+
+        // Add to the sate compiled class hash mapping according to the hash version.
+        match hash_version {
+            HashVersion::V1 => {
+                self.class_hash_to_compiled_class_hash
+                    .insert(contract.class_hash, contract.compiled_class_hash_v1);
+            }
+            HashVersion::V2 => {
+                self.class_hash_to_compiled_class_hash
+                    .insert(contract.class_hash, contract.compiled_class_hash_v2);
             }
         }
     }
@@ -78,13 +111,38 @@ impl StateReader for DictStateReader {
         Ok(class_hash)
     }
 
-    fn get_compiled_class_hash(
-        &self,
-        class_hash: ClassHash,
-    ) -> StateResult<starknet_api::core::CompiledClassHash> {
+    fn get_compiled_class_hash(&self, class_hash: ClassHash) -> StateResult<CompiledClassHash> {
         let compiled_class_hash =
             self.class_hash_to_compiled_class_hash.get(&class_hash).copied().unwrap_or_default();
         Ok(compiled_class_hash)
+    }
+
+    fn get_compiled_class_hash_v2(
+        &self,
+        class_hash: ClassHash,
+        compiled_class: &RunnableCompiledClass,
+    ) -> StateResult<CompiledClassHash> {
+        let compiled_class_hash_opt =
+            self.class_hash_to_compiled_class_hash_v2.lock().unwrap().get(&class_hash).copied();
+        match compiled_class_hash_opt {
+            Some(compiled_class_hash) => Ok(compiled_class_hash),
+            None => {
+                let compiled_class_hash = match compiled_class {
+                    RunnableCompiledClass::V0(_) => {
+                        panic!("Cairo0 classes should not have compiled class hash v2")
+                    }
+                    RunnableCompiledClass::V1(casm) => casm.hash(&HashVersion::V2),
+                    #[cfg(feature = "cairo_native")]
+                    RunnableCompiledClass::V1Native(casm) => casm.hash(&HashVersion::V2),
+                };
+                self.class_hash_to_compiled_class_hash_v2
+                    .lock()
+                    .unwrap()
+                    .insert(class_hash, compiled_class_hash);
+
+                Ok(compiled_class_hash)
+            }
+        }
     }
 }
 
@@ -115,5 +173,17 @@ impl FetchCompiledClasses for DictStateReader {
             Some(class) => !matches!(class, RunnableCompiledClass::V0(_)),
             None => false,
         })
+    }
+}
+
+impl UpdatableState for DictStateReader {
+    fn apply_writes(&mut self, writes: &StateMaps, class_hash_to_class: &ContractClassMapping) {
+        self.storage_view.extend(writes.storage.iter().map(|(k, v)| (*k, *v)));
+        self.address_to_nonce.extend(writes.nonces.iter().map(|(k, v)| (*k, *v)));
+        self.address_to_class_hash.extend(writes.class_hashes.iter().map(|(k, v)| (*k, *v)));
+        self.class_hash_to_compiled_class_hash
+            .extend(writes.compiled_class_hashes.iter().map(|(k, v)| (*k, *v)));
+        self.class_hash_to_class
+            .extend(class_hash_to_class.iter().map(|(k, class)| (*k, class.clone())));
     }
 }

@@ -2,11 +2,14 @@ use std::collections::HashSet;
 
 use blockifier::execution::syscalls::vm_syscall_utils::SyscallUsageMap;
 use cairo_vm::types::relocatable::MaybeRelocatable;
+use cairo_vm::vm::runners::cairo_pie::CairoPieAdditionalData;
 use cairo_vm::vm::runners::cairo_runner::ExecutionResources;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
+use starknet_os::hint_processor::os_logger::OsTransactionTrace;
 use starknet_os::hints::enum_definition::AllHints;
-use starknet_os::metrics::OsMetrics;
+use starknet_os::metrics::{AggregatorMetrics, OsMetrics, ProgramRunInfo};
+use starknet_os::opcode_instances::OpcodeInstanceCounts;
 use starknet_types_core::felt::Felt;
 use tracing::info;
 use tracing::level_filters::LevelFilter;
@@ -62,6 +65,8 @@ enum Command {
     RunOsStateless {
         #[clap(flatten)]
         io_args: IoArgs,
+        #[clap(long)]
+        include_txs_trace: bool,
     },
     RunAggregator {
         #[clap(flatten)]
@@ -71,7 +76,7 @@ enum Command {
 
 pub async fn run_os_cli(
     os_command: OsCliCommand,
-    _log_filter_handle: Handle<LevelFilter, Registry>,
+    log_filter_handle: Handle<LevelFilter, Registry>,
 ) {
     info!("Starting starknet-os-cli with command: \n{:?}", os_command);
     match os_command.command {
@@ -81,11 +86,14 @@ pub async fn run_os_cli(
         Command::PythonTest(python_test_arg) => {
             run_python_test::<OsPythonTestRunner>(python_test_arg).await;
         }
-        Command::RunOsStateless { io_args: IoArgs { input_path, output_path } } => {
-            parse_and_run_os(input_path, output_path);
+        Command::RunOsStateless {
+            io_args: IoArgs { input_path, output_path },
+            include_txs_trace,
+        } => {
+            parse_and_run_os(input_path, output_path, log_filter_handle, include_txs_trace);
         }
         Command::RunAggregator { io_args: IoArgs { input_path, output_path } } => {
-            parse_and_run_aggregator(input_path, output_path);
+            parse_and_run_aggregator(input_path, output_path, log_filter_handle);
         }
     }
 }
@@ -100,13 +108,15 @@ pub struct OsCliRunInfo {
     pub used_memory_cells: usize,
 }
 
-/// Intermediate metrics struct to properly serialize to a python-deserializable format.
-#[derive(Serialize)]
-pub(crate) struct OsCliMetrics {
-    pub syscall_usages: Vec<SyscallUsageMap>,
-    pub deprecated_syscall_usages: Vec<SyscallUsageMap>,
-    pub run_info: OsCliRunInfo,
-    pub execution_resources: ExecutionResources,
+impl From<ProgramRunInfo> for OsCliRunInfo {
+    fn from(run_info: ProgramRunInfo) -> Self {
+        Self {
+            pc: maybe_relocatable_to_vec(&run_info.pc),
+            ap: maybe_relocatable_to_vec(&run_info.ap),
+            fp: maybe_relocatable_to_vec(&run_info.fp),
+            used_memory_cells: run_info.used_memory_cells,
+        }
+    }
 }
 
 fn maybe_relocatable_to_vec(maybe_relocatable: &MaybeRelocatable) -> Vec<Felt> {
@@ -119,33 +129,56 @@ fn maybe_relocatable_to_vec(maybe_relocatable: &MaybeRelocatable) -> Vec<Felt> {
         }
     }
 }
+/// Intermediate metrics struct to properly serialize to a python-deserializable format.
+#[derive(Serialize)]
+pub(crate) struct OsCliMetrics {
+    pub syscall_usages: Vec<SyscallUsageMap>,
+    pub deprecated_syscall_usages: Vec<SyscallUsageMap>,
+    pub run_info: OsCliRunInfo,
+    pub execution_resources: ExecutionResources,
+    pub opcode_instances: OpcodeInstanceCounts,
+}
 
 impl From<OsMetrics> for OsCliMetrics {
     fn from(metrics: OsMetrics) -> Self {
         Self {
             syscall_usages: metrics.syscall_usages,
             deprecated_syscall_usages: metrics.deprecated_syscall_usages,
-            run_info: OsCliRunInfo {
-                pc: maybe_relocatable_to_vec(&metrics.run_info.pc),
-                ap: maybe_relocatable_to_vec(&metrics.run_info.ap),
-                fp: maybe_relocatable_to_vec(&metrics.run_info.fp),
-                used_memory_cells: metrics.run_info.used_memory_cells,
-            },
+            run_info: metrics.run_info.into(),
             execution_resources: metrics.execution_resources,
+            opcode_instances: metrics.opcode_instances,
         }
     }
 }
 
+/// Intermediate metrics struct to properly serialize to a python-deserializable format.
 #[derive(Serialize)]
-pub(crate) struct OsCliOutput {
-    pub(crate) os_output: Vec<Felt>,
-    pub(crate) da_segment: Option<Vec<Felt>>,
-    pub(crate) metrics: OsCliMetrics,
-    pub unused_hints: HashSet<AllHints>,
+pub(crate) struct AggregatorCliMetrics {
+    pub run_info: OsCliRunInfo,
+    pub execution_resources: ExecutionResources,
+}
+
+impl From<AggregatorMetrics> for AggregatorCliMetrics {
+    fn from(metrics: AggregatorMetrics) -> Self {
+        Self { run_info: metrics.run_info.into(), execution_resources: metrics.execution_resources }
+    }
 }
 
 #[derive(Serialize)]
-pub(crate) struct AggregatorCliOutput {
-    pub(crate) aggregator_output: Vec<Felt>,
+pub(crate) struct OsCliOutput<'a> {
+    // TODO(Rotem): add program_output here instead of writing it to a separate file.
+    pub(crate) additional_data: &'a CairoPieAdditionalData,
+    pub(crate) da_segment: Option<Vec<Felt>>,
+    pub(crate) metrics: OsCliMetrics,
+    pub unused_hints: HashSet<AllHints>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) txs_trace: Option<Vec<OsTransactionTrace>>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct AggregatorCliOutput<'a> {
+    pub(crate) program_output: Vec<Felt>,
+    pub(crate) additional_data: &'a CairoPieAdditionalData,
+    pub(crate) metrics: AggregatorCliMetrics,
     pub unused_hints: HashSet<AllHints>,
 }

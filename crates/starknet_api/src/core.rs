@@ -3,18 +3,19 @@
 mod core_test;
 
 use std::fmt::Debug;
+use std::str::FromStr;
 use std::sync::LazyLock;
 
+use apollo_sizeof::SizeOf;
 use num_traits::ToPrimitive;
 use primitive_types::H160;
 use serde::de::Error;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use size_of::SizeOf;
 use starknet_types_core::felt::{Felt, NonZeroFelt};
 use starknet_types_core::hash::{Pedersen, StarkHash as CoreStarkHash};
 
 use crate::crypto::utils::PublicKey;
-use crate::hash::{PoseidonHash, StarkHash};
+use crate::hash::{HashOutput, PoseidonHash, StarkHash};
 use crate::serde_utils::{BytesAsHex, PrefixedBytesAsHex};
 use crate::transaction::fields::{Calldata, ContractAddressSalt};
 use crate::{impl_from_through_intermediate, StarknetApiError};
@@ -22,7 +23,7 @@ use crate::{impl_from_through_intermediate, StarknetApiError};
 /// Felt.
 pub fn ascii_as_felt(ascii_str: &str) -> Result<Felt, StarknetApiError> {
     Felt::from_hex(hex::encode(ascii_str).as_str()).map_err(|_| StarknetApiError::OutOfRange {
-        string: format!("The str {}, does not fit into a single felt", ascii_str),
+        string: format!("The str {ascii_str}, does not fit into a single felt"),
     })
 }
 
@@ -75,8 +76,18 @@ impl std::fmt::Display for ChainId {
             ChainId::Mainnet => write!(f, "SN_MAIN"),
             ChainId::Sepolia => write!(f, "SN_SEPOLIA"),
             ChainId::IntegrationSepolia => write!(f, "SN_INTEGRATION_SEPOLIA"),
-            ChainId::Other(ref s) => write!(f, "{}", s),
+            ChainId::Other(ref s) => write!(f, "{s}"),
         }
+    }
+}
+
+impl TryFrom<&ChainId> for Felt {
+    type Error = StarknetApiError;
+
+    fn try_from(chain_id: &ChainId) -> Result<Self, Self::Error> {
+        Self::from_hex(chain_id.as_hex().as_str()).map_err(|_| Self::Error::OutOfRange {
+            string: format!("Failed to convert chain id {chain_id} to felt."),
+        })
     }
 }
 
@@ -93,11 +104,9 @@ where
     let hex_str = String::deserialize(deserializer)?;
     let chain_id_str =
         std::str::from_utf8(&hex::decode(hex_str.trim_start_matches("0x")).map_err(|e| {
-            D::Error::custom(format!("Failed to decode the hex string {hex_str}. Error: {:?}", e))
+            D::Error::custom(format!("Failed to decode the hex string {hex_str}. Error: {e:?}"))
         })?)
-        .map_err(|e| {
-            D::Error::custom(format!("Failed to convert to UTF-8 string. Error: {:?}", e))
-        })?
+        .map_err(|e| D::Error::custom(format!("Failed to convert to UTF-8 string. Error: {e:?}")))?
         .to_string();
     Ok(ChainId::from(chain_id_str))
 }
@@ -138,7 +147,7 @@ impl ContractAddress {
             return Ok(());
         }
 
-        Err(StarknetApiError::OutOfRange { string: format!("[0x2, {})", l2_address_upper_bound) })
+        Err(StarknetApiError::OutOfRange { string: format!("[0x2, {l2_address_upper_bound})") })
     }
 }
 
@@ -155,6 +164,15 @@ impl From<u128> for ContractAddress {
 }
 
 impl_from_through_intermediate!(u128, ContractAddress, u8, u16, u32, u64);
+
+impl FromStr for ContractAddress {
+    type Err = StarknetApiError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let felt = Felt::from_str(s)
+            .map_err(|e| StarknetApiError::OutOfRange { string: format!("{e}") })?;
+        Ok(ContractAddress(PatriciaKey::try_from(felt)?))
+    }
+}
 
 /// The maximal size of storage var.
 pub const MAX_STORAGE_ITEM_SIZE: u16 = 256;
@@ -216,6 +234,12 @@ pub fn calculate_contract_address(
 )]
 pub struct ClassHash(pub StarkHash);
 
+impl From<ClassHash> for Felt {
+    fn from(class_hash: ClassHash) -> Felt {
+        class_hash.0
+    }
+}
+
 /// The hash of a compiled ContractClass.
 #[derive(
     Debug,
@@ -234,6 +258,11 @@ pub struct ClassHash(pub StarkHash);
 )]
 pub struct CompiledClassHash(pub StarkHash);
 
+impl From<CompiledClassHash> for Felt {
+    fn from(compiled_class_hash: CompiledClassHash) -> Felt {
+        compiled_class_hash.0
+    }
+}
 /// A general type for nonces.
 #[derive(
     Debug,
@@ -258,7 +287,7 @@ impl Nonce {
         // Check if an overflow occurred during increment.
         let incremented = self.0 + Felt::ONE;
         if incremented == Felt::ZERO {
-            return Err(StarknetApiError::OutOfRange { string: format!("{:?}", self) });
+            return Err(StarknetApiError::OutOfRange { string: format!("{self:?}") });
         }
         Ok(Self(incremented))
     }
@@ -266,7 +295,7 @@ impl Nonce {
     pub fn try_decrement(&self) -> Result<Self, StarknetApiError> {
         // Check if an underflow occurred during decrement.
         if self.0 == Felt::ZERO {
-            return Err(StarknetApiError::OutOfRange { string: format!("{:?}", self) });
+            return Err(StarknetApiError::OutOfRange { string: format!("{self:?}") });
         }
         Ok(Self(self.0 - Felt::ONE))
     }
@@ -306,6 +335,14 @@ pub struct EntryPointSelector(pub StarkHash);
     derive_more::Display,
 )]
 pub struct GlobalRoot(pub StarkHash);
+
+impl GlobalRoot {
+    pub const ROOT_OF_EMPTY_STATE: GlobalRoot = GlobalRoot(HashOutput::ROOT_OF_EMPTY_TREE.0);
+}
+
+// Hex of 'STARKNET_STATE_V0'.
+pub const GLOBAL_STATE_VERSION: Felt =
+    Felt::from_hex_unchecked("0x535441524b4e45545f53544154455f5630");
 
 /// The commitment on the transactions in a [Block](`crate::block::Block`).
 #[derive(
@@ -461,6 +498,51 @@ macro_rules! contract_address {
 #[serde(try_from = "PrefixedBytesAsHex<20_usize>", into = "PrefixedBytesAsHex<20_usize>")]
 pub struct EthAddress(pub H160);
 
+#[derive(
+    Debug, Copy, Clone, Default, Eq, PartialEq, Hash, Deserialize, Serialize, PartialOrd, Ord,
+)]
+pub struct L1Address(pub Felt);
+
+impl From<ContractAddress> for L1Address {
+    fn from(address: ContractAddress) -> Self {
+        L1Address(address.0.0)
+    }
+}
+
+impl TryFrom<L1Address> for ContractAddress {
+    type Error = StarknetApiError;
+
+    fn try_from(address: L1Address) -> Result<Self, Self::Error> {
+        Ok(ContractAddress(PatriciaKey::try_from(address.0)?))
+    }
+}
+
+impl From<EthAddress> for L1Address {
+    fn from(address: EthAddress) -> Self {
+        L1Address(address.into())
+    }
+}
+
+impl TryFrom<L1Address> for EthAddress {
+    type Error = StarknetApiError;
+
+    fn try_from(address: L1Address) -> Result<Self, Self::Error> {
+        EthAddress::try_from(address.0)
+    }
+}
+
+impl From<Felt> for L1Address {
+    fn from(felt: Felt) -> Self {
+        L1Address(felt)
+    }
+}
+
+impl From<L1Address> for Felt {
+    fn from(address: L1Address) -> Self {
+        address.0
+    }
+}
+
 impl TryFrom<Felt> for EthAddress {
     type Error = StarknetApiError;
     fn try_from(felt: Felt) -> Result<Self, Self::Error> {
@@ -496,9 +578,7 @@ impl From<EthAddress> for PrefixedBytesAsHex<20_usize> {
 }
 
 /// A public key of a sequencer.
-#[derive(
-    Debug, Copy, Clone, Default, Eq, PartialEq, Hash, Deserialize, Serialize, PartialOrd, Ord,
-)]
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Hash, Deserialize, Serialize)]
 pub struct SequencerPublicKey(pub PublicKey);
 
 #[derive(

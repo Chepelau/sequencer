@@ -1,6 +1,8 @@
-use apollo_batcher::metrics::STORAGE_HEIGHT;
+use apollo_batcher::metrics::{REVERTED_TRANSACTIONS, STORAGE_HEIGHT};
+use apollo_consensus::metrics::CONSENSUS_DECISIONS_REACHED_BY_CONSENSUS;
 use apollo_infra_utils::run_until::run_until;
 use apollo_infra_utils::tracing::{CustomLogger, TraceLevel};
+use apollo_metrics::metrics::MetricDetails;
 use apollo_monitoring_endpoint::test_utils::MonitoringClient;
 use apollo_state_sync_metrics::metrics::{
     STATE_SYNC_BODY_MARKER,
@@ -26,6 +28,16 @@ pub async fn get_batcher_latest_block_number(
     )
     .prev() // The metric is the height marker so we need to subtract 1 to get the latest.
     .expect("Storage height should be at least 1.")
+}
+
+/// Gets the latest decisions reached by consensus from the consensus metrics.
+pub async fn get_consensus_decisions_reached(
+    consensus_monitoring_client: &MonitoringClient,
+) -> u64 {
+    consensus_monitoring_client
+        .get_metric::<u64>(CONSENSUS_DECISIONS_REACHED_BY_CONSENSUS.get_name())
+        .await
+        .expect("Failed to get consensus proposals sent metric.")
 }
 
 /// Gets the latest block number from the sync's metrics.
@@ -90,9 +102,7 @@ pub async fn await_sync_block(
 
 pub async fn await_block(
     batcher_monitoring_client: &MonitoringClient,
-    batcher_executable_index: usize,
     state_sync_monitoring_client: &MonitoringClient,
-    state_sync_executable_index: usize,
     expected_block_number: BlockNumber,
     node_index: usize,
 ) {
@@ -104,19 +114,15 @@ pub async fn await_block(
         |&latest_block_number: &BlockNumber| latest_block_number >= expected_block_number;
 
     let expected_height = expected_block_number.unchecked_next();
-    let [batcher_logger, sync_logger] =
-        [("Batcher", batcher_executable_index), ("Sync", state_sync_executable_index)].map(
-            |(component_name, executable_index)| {
-                CustomLogger::new(
-                    TraceLevel::Info,
-                    Some(format!(
-                        "Waiting for {component_name} height metric to reach block \
-                         {expected_height} in sequencer {node_index} executable \
-                         {executable_index}.",
-                    )),
-                )
-            },
-        );
+    let [batcher_logger, sync_logger] = ["Batcher", "Sync"].map(|component_name| {
+        CustomLogger::new(
+            TraceLevel::Info,
+            Some(format!(
+                "Waiting for {component_name} height metric to reach block {expected_height} in \
+                 sequencer {node_index}.",
+            )),
+        )
+    });
     // TODO(noamsp): Change this so we get both values with one metrics query.
     try_join!(
         await_batcher_block(5000, condition, 50, batcher_monitoring_client, batcher_logger),
@@ -135,13 +141,15 @@ pub async fn verify_txs_accepted(
     sequencer_idx: usize,
     expected_n_accepted_txs: usize,
 ) {
+    const INTERVAL_MS: u64 = 5_000;
+    const MAX_ATTEMPTS: usize = 20;
+
     info!("Verifying that sequencer {sequencer_idx} accepted {expected_n_accepted_txs} txs.");
-    let n_accepted_txs = sequencer_num_accepted_txs(monitoring_client).await;
-    assert_eq!(
-        n_accepted_txs, expected_n_accepted_txs,
-        "Sequencer {sequencer_idx} accepted an unexpected number of txs. Expected \
-         {expected_n_accepted_txs} got {n_accepted_txs}"
-    );
+    let condition = |num_accpted_tx: &usize| *num_accpted_tx >= expected_n_accepted_txs;
+
+    let n_accepted_txs_closure = || sequencer_num_accepted_txs(monitoring_client);
+
+    run_until(INTERVAL_MS, MAX_ATTEMPTS, n_accepted_txs_closure, condition, None).await;
 }
 
 pub async fn await_txs_accepted(
@@ -184,4 +192,10 @@ pub async fn sequencer_num_accepted_txs(monitoring_client: &MonitoringClient) ->
         .get_metric::<usize>(STATE_SYNC_PROCESSED_TRANSACTIONS.get_name())
         .await
         .unwrap()
+}
+
+pub async fn assert_no_reverted_txs(monitoring_client: &MonitoringClient, sequencer_idx: usize) {
+    let reverted =
+        monitoring_client.get_metric::<usize>(REVERTED_TRANSACTIONS.get_name()).await.unwrap();
+    assert_eq!(reverted, 0, "Sequencer {sequencer_idx} has {reverted} reverted transactions");
 }

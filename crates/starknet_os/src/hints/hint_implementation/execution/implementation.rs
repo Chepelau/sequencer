@@ -23,7 +23,7 @@ use starknet_types_core::felt::Felt;
 
 use crate::hint_processor::snos_hint_processor::SnosHintProcessor;
 use crate::hints::enum_definition::{AllHints, OsHint};
-use crate::hints::error::{OsHintError, OsHintResult};
+use crate::hints::error::{InnerInconsistentStorageValueError, OsHintError, OsHintResult};
 use crate::hints::hint_implementation::execution::utils::{
     assert_retdata_as_expected,
     compare_retdata,
@@ -893,7 +893,7 @@ pub(crate) fn write_old_block_to_storage<S: StateReader>(
     let old_block_hash =
         get_integer_from_var_name(Ids::OldBlockHash.into(), vm, ids_data, ap_tracking)?;
 
-    log::debug!("writing block number: {} -> block hash: {}", old_block_number, old_block_hash);
+    log::debug!("writing block number: {old_block_number} -> block hash: {old_block_hash}");
 
     execution_helper.cached_state.set_storage_at(
         ContractAddress(PatriciaKey::try_from(*block_hash_contract_address)?),
@@ -936,7 +936,14 @@ fn assert_value_cached_by_reading<S: StateReader>(
     let ids_value = get_integer_from_var_name(Ids::Value.into(), vm, ids_data, ap_tracking)?;
 
     if value != ids_value {
-        return Err(OsHintError::InconsistentValue { expected: value, actual: ids_value });
+        return Err(OsHintError::InconsistentStorageValue(Box::new(
+            InnerInconsistentStorageValueError {
+                contract_address,
+                key,
+                expected: value,
+                actual: ids_value,
+            },
+        )));
     }
     Ok(())
 }
@@ -1017,7 +1024,7 @@ pub(crate) fn fetch_result(
     if retdata_size != 1 || result[0] != Some(Cow::Borrowed(&validated)) {
         log::info!("Invalid return value from __validate__:");
         log::info!("  Size: {retdata_size}");
-        log::info!("  Result (at most 100 elements): {:?}", result);
+        log::info!("  Result (at most 100 elements): {result:?}");
     }
     Ok(())
 }

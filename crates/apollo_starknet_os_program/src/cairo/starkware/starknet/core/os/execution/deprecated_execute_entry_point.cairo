@@ -96,7 +96,7 @@ func call_execute_deprecated_syscalls{
     syscall_size,
     syscall_ptr: felt*,
 ) {
-    jmp abs block_context.execute_deprecated_syscalls_ptr;
+    jmp abs block_context.os_global_context.execute_deprecated_syscalls_ptr;
 }
 
 // Executes an entry point in a contract.
@@ -120,10 +120,11 @@ func deprecated_execute_entry_point{
 
     // The key must be at offset 0.
     static_assert DeprecatedCompiledClassFact.hash == 0;
+    let compiled_class_facts_bundle = block_context.os_global_context.compiled_class_facts_bundle;
     let (compiled_class_fact: DeprecatedCompiledClassFact*) = find_element(
-        array_ptr=block_context.deprecated_compiled_class_facts,
+        array_ptr=compiled_class_facts_bundle.deprecated_compiled_class_facts,
         elm_size=DeprecatedCompiledClassFact.SIZE,
-        n_elms=block_context.n_deprecated_compiled_class_facts,
+        n_elms=compiled_class_facts_bundle.n_deprecated_compiled_class_facts,
         key=execution_context.class_hash,
     );
     local compiled_class: DeprecatedCompiledClass* = compiled_class_fact.compiled_class;
@@ -155,7 +156,7 @@ func deprecated_execute_entry_point{
     assert [os_context] = cast(syscall_ptr, felt);
 
     let n_builtins = BuiltinEncodings.SIZE;
-    local builtin_params: BuiltinParams* = block_context.builtin_params;
+    local builtin_params: BuiltinParams* = block_context.os_global_context.builtin_params;
     select_builtins(
         n_builtins=n_builtins,
         all_encodings=builtin_params.builtin_encodings,
@@ -246,27 +247,27 @@ func select_execute_entry_point_func{
     local is_sierra_gas_mode;
     %{ ids.is_sierra_gas_mode = execution_helper.call_info.tracked_resource.is_sierra_gas() %}
     if (is_sierra_gas_mode != FALSE) {
-        tempvar remaining_gas = remaining_gas;
+        tempvar inner_remaining_gas = remaining_gas;
     } else {
         // Run with high enough gas to avoid out-of-gas.
-        tempvar remaining_gas = DEFAULT_INITIAL_GAS_COST;
+        tempvar inner_remaining_gas = DEFAULT_INITIAL_GAS_COST;
     }
     %{
         if execution_helper.debug_mode:
             expected_initial_gas = execution_helper.call_info.call.initial_gas
-            call_initial_gas = ids.remaining_gas
+            call_initial_gas = ids.inner_remaining_gas
             assert expected_initial_gas == call_initial_gas, (
                 f"Expected remaining_gas {expected_initial_gas}. Got: {call_initial_gas}.\n"
                 f"{execution_helper.call_info=}"
             )
     %}
 
-    let (is_reverted, retdata_size, retdata) = execute_entry_point(
-        block_context=block_context, execution_context=execution_context
-    );
+    let (is_reverted, retdata_size, retdata) = execute_entry_point{
+        remaining_gas=inner_remaining_gas
+    }(block_context=block_context, execution_context=execution_context);
 
     if (is_sierra_gas_mode != FALSE) {
-        tempvar remaining_gas = remaining_gas;
+        tempvar remaining_gas = inner_remaining_gas;
     } else {
         // Do not count Sierra gas for the caller in this case.
         tempvar remaining_gas = caller_remaining_gas;

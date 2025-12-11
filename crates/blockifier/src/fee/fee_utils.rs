@@ -79,9 +79,7 @@ pub fn get_vm_resources_cost(
     let known_builtins = HashSet::<&BuiltinName>::from_iter(vm_resource_fee_costs.builtins.keys());
     assert!(
         used_builtins.is_subset(&known_builtins),
-        "{:#?} should contain {:#?}",
-        known_builtins,
-        used_builtins,
+        "{known_builtins:#?} should contain {used_builtins:#?}",
     );
 
     // Convert Cairo resource usage to L1 gas usage.
@@ -123,7 +121,6 @@ pub fn get_fee_by_gas_vector(
 }
 
 /// Returns the current fee balance and a boolean indicating whether the balance covers the fee.
-#[allow(clippy::result_large_err)]
 pub fn get_balance_and_if_covers_fee(
     state: &mut dyn StateReader,
     tx_context: &TransactionContext,
@@ -143,7 +140,6 @@ pub fn get_balance_and_if_covers_fee(
 
 /// Verifies that, given the current state, the account can cover the resource upper bounds.
 /// Error may indicate insufficient balance, or some other error.
-#[allow(clippy::result_large_err)]
 pub fn verify_can_pay_committed_bounds(
     state: &mut dyn StateReader,
     tx_context: &TransactionContext,

@@ -2,15 +2,13 @@
 mod cende_test;
 mod central_objects;
 
-use std::collections::BTreeMap;
-use std::future::ready;
 use std::sync::Arc;
 
 use apollo_class_manager_types::{ClassManagerClientError, SharedClassManagerClient};
-use apollo_config::dumping::{ser_optional_param, ser_param, SerializeConfig};
-use apollo_config::{ParamPath, ParamPrivacyInput, SerializedParam};
+use apollo_consensus_orchestrator_config::config::CendeConfig;
 use apollo_proc_macros::sequencer_latency_histogram;
 use async_trait::async_trait;
+use blockifier::blockifier::transaction_executor::CompiledClassHashesForMigration;
 use blockifier::bouncer::{BouncerWeights, CasmHashComputationData};
 use blockifier::state::cached_state::CommitmentStateDiff;
 use blockifier::transaction::objects::TransactionExecutionInfo;
@@ -20,6 +18,7 @@ use central_objects::{
     CentralBouncerWeights,
     CentralCasmContractClassEntry,
     CentralCasmHashComputationData,
+    CentralCompiledClassHashesForMigration,
     CentralCompressedStateDiff,
     CentralFeeMarketInfo,
     CentralSierraContractClassEntry,
@@ -28,8 +27,11 @@ use central_objects::{
 };
 #[cfg(test)]
 use mockall::automock;
-use reqwest::{Client, RequestBuilder, Response};
-use serde::{Deserialize, Serialize};
+use reqwest::Response;
+use reqwest_middleware::{ClientBuilder, ClientWithMiddleware, RequestBuilder};
+use reqwest_retry::policies::ExponentialBackoff;
+use reqwest_retry::{Jitter, RetryTransientMiddleware};
+use serde::Serialize;
 use shared_execution_objects::central_objects::CentralTransactionExecutionInfo;
 use starknet_api::block::{BlockInfo, BlockNumber, StarknetVersion};
 use starknet_api::consensus_transaction::InternalConsensusTransaction;
@@ -78,6 +80,7 @@ pub(crate) struct AerospikeBlob {
     compiled_classes: Vec<CentralCasmContractClassEntry>,
     casm_hash_computation_data_sierra_gas: CentralCasmHashComputationData,
     casm_hash_computation_data_proving_gas: CentralCasmHashComputationData,
+    compiled_class_hashes_for_migration: CentralCompiledClassHashesForMigration,
 }
 
 #[cfg_attr(test, automock)]
@@ -86,6 +89,7 @@ pub trait CendeContext: Send + Sync {
     /// Write the previous height blob to Aerospike. Returns a cell with an inner boolean indicating
     /// whether the write was successful.
     /// `current_height` is the height of the block that is built when calling this function.
+    /// This function should return false if the previous height blob is not available.
     fn write_prev_height_blob(&self, current_height: BlockNumber) -> JoinHandle<bool>;
 
     // Prepares the previous height blob that will be written in the next height.
@@ -102,8 +106,7 @@ pub struct CendeAmbassador {
     // proposer.
     prev_height_blob: Arc<Mutex<Option<AerospikeBlob>>>,
     url: Url,
-    client: Client,
-    skip_write_height: Option<BlockNumber>,
+    client: ClientWithMiddleware,
     class_manager: SharedClassManagerClient,
 }
 
@@ -112,74 +115,28 @@ pub const RECORDER_WRITE_BLOB_PATH: &str = "/cende_recorder/write_blob";
 
 impl CendeAmbassador {
     pub fn new(cende_config: CendeConfig, class_manager: SharedClassManagerClient) -> Self {
+        let retry_policy = ExponentialBackoff::builder()
+            .retry_bounds(cende_config.min_retry_interval_ms, cende_config.max_retry_interval_ms)
+            .jitter(Jitter::None)
+            .build_with_total_retry_duration(cende_config.max_retry_duration_secs);
         CendeAmbassador {
             prev_height_blob: Arc::new(Mutex::new(None)),
             url: cende_config
                 .recorder_url
                 .join(RECORDER_WRITE_BLOB_PATH)
                 .expect("Failed to join `RECORDER_WRITE_BLOB_PATH` with the Recorder URL"),
-            client: Client::new(),
-            skip_write_height: cende_config.skip_write_height,
+            client: ClientBuilder::new(reqwest::Client::new())
+                .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+                .build(),
             class_manager,
         }
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct CendeConfig {
-    pub recorder_url: Url,
-    pub skip_write_height: Option<BlockNumber>,
-}
-
-impl Default for CendeConfig {
-    fn default() -> Self {
-        CendeConfig {
-            recorder_url: "https://recorder_url"
-                .parse()
-                .expect("recorder_url must be a valid Recorder URL"),
-            skip_write_height: None,
-        }
-    }
-}
-
-impl SerializeConfig for CendeConfig {
-    fn dump(&self) -> BTreeMap<ParamPath, SerializedParam> {
-        let mut config = BTreeMap::from_iter([ser_param(
-            "recorder_url",
-            &self.recorder_url,
-            "The URL of the Pythonic cende_recorder",
-            ParamPrivacyInput::Private,
-        )]);
-        config.extend(ser_optional_param(
-            &self.skip_write_height,
-            BlockNumber(0),
-            "skip_write_height",
-            "A height that the consensus can skip writing to Aerospike. Needed for booting up (no \
-             previous height blob to write) or to handle extreme cases (all the nodes failed).",
-            ParamPrivacyInput::Public,
-        ));
-
-        config
-    }
-}
-
 #[async_trait]
 impl CendeContext for CendeAmbassador {
-    #[sequencer_latency_histogram(CENDE_WRITE_PREV_HEIGHT_BLOB_LATENCY, false)]
     fn write_prev_height_blob(&self, current_height: BlockNumber) -> JoinHandle<bool> {
         info!("Start writing to Aerospike previous height blob for height {current_height}.");
-
-        // TODO(dvir): consider returning a future that will be spawned in the context instead.
-        if self.skip_write_height == Some(current_height) {
-            info!(
-                "Height {current_height} is configured as the `skip_write_height`, meaning \
-                 consensus can send a proposal without writing to Aerospike. The blob that should \
-                 have been written here in a normal flow, should already be written to Aerospike. \
-                 Not writing to Aerospike previous height blob!!!.",
-            );
-            record_write_failure(CendeWriteFailureReason::SkipWriteHeight);
-            return tokio::spawn(ready(true));
-        }
 
         let prev_height_blob = self.prev_height_blob.clone();
         let request_builder = self.client.post(self.url.clone());
@@ -190,7 +147,7 @@ impl CendeContext for CendeAmbassador {
                 let Some(ref blob): Option<AerospikeBlob> = *prev_height_blob.lock().await else {
                     // This case happens when restarting the node, `prev_height_blob` initial value
                     // is `None`.
-                    warn!("No blob to write to Aerospike.");
+                    warn!("CENDE_FAILURE: No blob to write to Aerospike.");
                     record_write_failure(CendeWriteFailureReason::BlobNotAvailable);
                     return false;
                 };
@@ -206,8 +163,8 @@ impl CendeContext for CendeAmbassador {
                 // did not update the cende ambassador in `decision_reached` function.
                 if blob.block_number.0 + 1 != current_height.0 {
                     warn!(
-                        "Mismatch blob block number and height, can't write blob to Aerospike. \
-                         Blob block number {}, height {current_height}",
+                        "CENDE_FAILURE: Mismatch blob block number and height, can't write blob \
+                         to Aerospike. Blob block number {}, height {current_height}",
                         blob.block_number
                     );
                     record_write_failure(CendeWriteFailureReason::HeightMismatch);
@@ -241,6 +198,7 @@ impl CendeContext for CendeAmbassador {
     }
 }
 
+#[sequencer_latency_histogram(CENDE_WRITE_PREV_HEIGHT_BLOB_LATENCY, false)]
 async fn send_write_blob(request_builder: RequestBuilder, blob: &AerospikeBlob) -> bool {
     // TODO(dvir): use compression to reduce the size of the blob in the network.
     match request_builder.json(blob).send().await {
@@ -257,18 +215,19 @@ async fn send_write_blob(request_builder: RequestBuilder, blob: &AerospikeBlob) 
                 true
             } else {
                 warn!(
-                    "The recorder failed to write blob with block number {}. Status code: {}",
+                    "CENDE_FAILURE: The recorder failed to write blob with block number {}. \
+                     Status code: {}. Response: {}",
                     blob.block_number,
                     response.status(),
+                    response.text().await.unwrap_or("Unparsable response".to_owned()),
                 );
-                print_write_blob_response(response).await;
                 record_write_failure(CendeWriteFailureReason::CendeRecorderError);
                 false
             }
         }
         Err(err) => {
             // TODO(dvir): try to test this case.
-            warn!("Failed to send a request to the recorder. Error: {err}");
+            warn!("CENDE_FAILURE: Failed to send a request to the recorder. Error: {err}");
             record_write_failure(CendeWriteFailureReason::CommunicationError);
             false
         }
@@ -284,6 +243,12 @@ async fn print_write_blob_response(response: Response) {
     }
 }
 
+#[derive(Debug)]
+pub struct InternalTransactionWithReceipt {
+    pub transaction: InternalConsensusTransaction,
+    pub execution_info: TransactionExecutionInfo,
+}
+
 #[derive(Debug, Default)]
 pub struct BlobParameters {
     pub(crate) block_info: BlockInfo,
@@ -291,12 +256,12 @@ pub struct BlobParameters {
     pub(crate) compressed_state_diff: Option<CommitmentStateDiff>,
     pub(crate) bouncer_weights: BouncerWeights,
     pub(crate) fee_market_info: FeeMarketInfo,
-    pub(crate) transactions: Vec<InternalConsensusTransaction>,
+    pub(crate) transactions_with_execution_infos: Vec<InternalTransactionWithReceipt>,
     pub(crate) casm_hash_computation_data_sierra_gas: CasmHashComputationData,
     pub(crate) casm_hash_computation_data_proving_gas: CasmHashComputationData,
     // TODO(dvir): consider passing the execution_infos from the batcher as a string that
     // serialized in the correct format from the batcher.
-    pub(crate) execution_infos: Vec<TransactionExecutionInfo>,
+    pub(crate) compiled_class_hashes_for_migration: CompiledClassHashesForMigration,
 }
 
 impl AerospikeBlob {
@@ -315,15 +280,22 @@ impl AerospikeBlob {
                 CentralStateDiff::from((compressed_state_diff, block_info))
             });
 
-        let (central_transactions, contract_classes, compiled_classes) =
-            process_transactions(class_manager, blob_parameters.transactions, block_timestamp)
-                .await?;
-
-        let execution_infos = blob_parameters
-            .execution_infos
+        let (blob_transactions, blob_exec_infos): (
+            Vec<InternalConsensusTransaction>,
+            Vec<TransactionExecutionInfo>,
+        ) = blob_parameters
+            .transactions_with_execution_infos
             .into_iter()
-            .map(CentralTransactionExecutionInfo::from)
-            .collect();
+            .map(|tx_with_exec_info| {
+                (tx_with_exec_info.transaction, tx_with_exec_info.execution_info)
+            })
+            .unzip();
+
+        let (central_transactions, contract_classes, compiled_classes) =
+            process_transactions(class_manager, blob_transactions, block_timestamp).await?;
+
+        let execution_infos =
+            blob_exec_infos.into_iter().map(CentralTransactionExecutionInfo::from).collect();
 
         Ok(AerospikeBlob {
             block_number,
@@ -339,6 +311,8 @@ impl AerospikeBlob {
                 .casm_hash_computation_data_sierra_gas,
             casm_hash_computation_data_proving_gas: blob_parameters
                 .casm_hash_computation_data_proving_gas,
+            compiled_class_hashes_for_migration: blob_parameters
+                .compiled_class_hashes_for_migration,
         })
     }
 }

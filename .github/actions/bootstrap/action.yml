@@ -17,5 +17,6 @@ runs:
       with:
         extra_rust_toolchains: ${{ inputs.extra_rust_toolchains }}
         github_token: ${{ inputs.github_token }}
+
     - name: Install cairo native.
       uses: ./.github/actions/setup_native_deps

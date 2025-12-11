@@ -12,21 +12,25 @@ use crate::gossipsub_impl::Topic;
 use crate::mixed_behaviour::MixedBehaviour;
 use crate::network_manager::{BroadcastTopicClientTrait, GenericNetworkManager};
 use crate::peer_manager::PeerManagerConfig;
-use crate::sqmr;
-use crate::sqmr::Bytes;
+use crate::prune_dead_connections::{DEFAULT_PING_INTERVAL, DEFAULT_PING_TIMEOUT};
+use crate::{sqmr, Bytes};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn create_swarm(bootstrap_peer_multiaddr: Option<Multiaddr>) -> Swarm<MixedBehaviour> {
-    let mut swarm = Swarm::new_ephemeral(|keypair| {
+    let mut swarm = Swarm::new_ephemeral_tokio(|keypair| {
         MixedBehaviour::new(
-            keypair.clone(),
-            bootstrap_peer_multiaddr.map(|multiaddr| vec![multiaddr]),
             sqmr::Config::default(),
-            ChainId::Mainnet,
-            None,
             DiscoveryConfig::default(),
             PeerManagerConfig::default(),
+            None,
+            None,
+            keypair.clone(),
+            bootstrap_peer_multiaddr.map(|multiaddr| vec![multiaddr]),
+            ChainId::Mainnet,
+            None,
+            DEFAULT_PING_INTERVAL,
+            DEFAULT_PING_TIMEOUT,
         )
     });
     // Not using SwarmExt::listen because it panics if the swarm emits other events

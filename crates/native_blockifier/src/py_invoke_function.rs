@@ -10,6 +10,7 @@ use starknet_api::transaction::fields::{
     Calldata,
     Fee,
     PaymasterData,
+    ProofFacts,
     Tip,
     TransactionSignature,
 };
@@ -81,6 +82,7 @@ struct PyInvokeTransactionV3 {
     pub fee_data_availability_mode: PyDataAvailabilityMode,
     pub paymaster_data: Vec<PyFelt>,
     pub account_deployment_data: Vec<PyFelt>,
+    // TODO(AvivG): Add proof facts.
 }
 
 impl TryFrom<PyInvokeTransactionV3> for InvokeTransactionV3 {
@@ -101,11 +103,12 @@ impl TryFrom<PyInvokeTransactionV3> for InvokeTransactionV3 {
             account_deployment_data: AccountDeploymentData(from_py_felts(
                 tx.account_deployment_data,
             )),
+            // TODO(AvivG): Get from PyInvokeTransactionV3 once supported.
+            proof_facts: ProofFacts::default(),
         })
     }
 }
 
-#[allow(clippy::result_large_err)]
 pub fn py_invoke_function(py_tx: &PyAny) -> NativeBlockifierResult<InvokeTransaction> {
     let version = py_attr::<PyFelt>(py_tx, "version")?.0;
     // TODO(Dori): Make TransactionVersion an enum and use match here.

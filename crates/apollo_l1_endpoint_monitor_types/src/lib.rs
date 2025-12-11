@@ -1,12 +1,22 @@
 use std::sync::Arc;
 
 use apollo_infra::component_client::ClientError;
-use apollo_infra::component_definitions::ComponentClient;
-use apollo_infra::impl_debug_for_infra_requests_and_responses;
+use apollo_infra::component_definitions::{ComponentClient, PrioritizedRequest};
+use apollo_infra::metrics::{
+    InfraMetrics,
+    LocalClientMetrics,
+    LocalServerMetrics,
+    RemoteClientMetrics,
+    RemoteServerMetrics,
+};
+use apollo_infra::requests::LABEL_NAME_REQUEST_VARIANT;
+use apollo_infra::{impl_debug_for_infra_requests_and_responses, impl_labeled_request};
+use apollo_metrics::{define_infra_metrics, generate_permutation_labels};
 use apollo_proc_macros::handle_all_response_variants;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use strum_macros::AsRefStr;
+use strum::{EnumVariantNames, VariantNames};
+use strum_macros::{AsRefStr, EnumDiscriminants, EnumIter, IntoStaticStr};
 use thiserror::Error;
 use url::Url;
 
@@ -32,11 +42,24 @@ where
         )
     }
 }
-#[derive(Clone, Serialize, Deserialize, AsRefStr)]
+
+#[derive(Serialize, Deserialize, Clone, AsRefStr, EnumDiscriminants)]
+#[strum_discriminants(
+    name(L1EndpointMonitorRequestLabelValue),
+    derive(IntoStaticStr, EnumIter, EnumVariantNames),
+    strum(serialize_all = "snake_case")
+)]
 pub enum L1EndpointMonitorRequest {
     GetActiveL1Endpoint(),
 }
 impl_debug_for_infra_requests_and_responses!(L1EndpointMonitorRequest);
+impl_labeled_request!(L1EndpointMonitorRequest, L1EndpointMonitorRequestLabelValue);
+impl PrioritizedRequest for L1EndpointMonitorRequest {}
+
+generate_permutation_labels! {
+    L1_ENDPOINT_MONITOR_REQUEST_LABELS,
+    (LABEL_NAME_REQUEST_VARIANT, L1EndpointMonitorRequestLabelValue),
+}
 
 #[derive(Clone, Serialize, Deserialize, AsRefStr)]
 pub enum L1EndpointMonitorResponse {
@@ -65,3 +88,5 @@ pub enum L1EndpointMonitorClientError {
     #[error(transparent)]
     L1EndpointMonitorError(#[from] L1EndpointMonitorError),
 }
+
+define_infra_metrics!(l1_endpoint_monitor);

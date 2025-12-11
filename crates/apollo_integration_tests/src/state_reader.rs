@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use apollo_class_manager::class_storage::{ClassStorage, FsClassStorage};
-use apollo_class_manager::config::FsClassStorageConfig;
 use apollo_class_manager::test_utils::FsClassStorageBuilderForTesting;
+use apollo_class_manager::{ClassStorage, FsClassStorage};
+use apollo_class_manager_config::config::FsClassStorageConfig;
 use apollo_storage::body::BodyStorageWriter;
 use apollo_storage::class::ClassStorageWriter;
 use apollo_storage::compiled_class::CasmStorageWriter;
@@ -17,11 +17,7 @@ use blockifier_test_utils::cairo_versions::{CairoVersion, RunnableCairo1};
 use blockifier_test_utils::contracts::FeatureContract;
 use cairo_lang_starknet_classes::casm_contract_class::CasmContractClass;
 use indexmap::IndexMap;
-use mempool_test_utils::starknet_api_test_utils::{
-    AccountTransactionGenerator,
-    Contract,
-    VALID_ACCOUNT_BALANCE,
-};
+use mempool_test_utils::starknet_api_test_utils::{AccountTransactionGenerator, Contract};
 use starknet_api::abi::abi_utils::get_fee_token_var_address;
 use starknet_api::block::{
     BlockBody,
@@ -32,7 +28,8 @@ use starknet_api::block::{
     FeeType,
     GasPricePerToken,
 };
-use starknet_api::contract_class::{ContractClass, SierraVersion};
+use starknet_api::contract_class::compiled_class_hash::HashVersion;
+use starknet_api::contract_class::ContractClass;
 use starknet_api::core::{ClassHash, ContractAddress, Nonce, SequencerContractAddress};
 use starknet_api::deprecated_contract_class::ContractClass as DeprecatedContractClass;
 use starknet_api::state::{SierraContractClass, StorageKey, ThinStateDiff};
@@ -41,7 +38,9 @@ use starknet_api::test_utils::{
     DEFAULT_ETH_L1_GAS_PRICE,
     DEFAULT_STRK_L1_GAS_PRICE,
     TEST_SEQUENCER_ADDRESS,
+    VALID_ACCOUNT_BALANCE,
 };
+use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
 use starknet_api::{contract_address, felt};
 use starknet_types_core::felt::Felt;
 use strum::IntoEnumIterator;
@@ -60,12 +59,14 @@ pub(crate) const CLASS_MANAGER_DB_PATH_SUFFIX: &str = "class_manager";
 pub(crate) const CLASS_HASH_STORAGE_DB_PATH_SUFFIX: &str = "class_hash_storage";
 pub(crate) const CLASSES_STORAGE_DB_PATH_SUFFIX: &str = "classes";
 pub(crate) const STATE_SYNC_DB_PATH_SUFFIX: &str = "state_sync";
+pub(crate) const CONSENSUS_DB_PATH_SUFFIX: &str = "consensus";
 
 #[derive(Debug, Clone)]
 pub struct StorageTestConfig {
     pub batcher_storage_config: StorageConfig,
     pub state_sync_storage_config: StorageConfig,
     pub class_manager_storage_config: FsClassStorageConfig,
+    pub consensus_storage_config: StorageConfig,
 }
 
 impl StorageTestConfig {
@@ -73,8 +74,14 @@ impl StorageTestConfig {
         batcher_storage_config: StorageConfig,
         state_sync_storage_config: StorageConfig,
         class_manager_storage_config: FsClassStorageConfig,
+        consensus_storage_config: StorageConfig,
     ) -> Self {
-        Self { batcher_storage_config, state_sync_storage_config, class_manager_storage_config }
+        Self {
+            batcher_storage_config,
+            state_sync_storage_config,
+            class_manager_storage_config,
+            consensus_storage_config,
+        }
     }
 }
 
@@ -83,6 +90,7 @@ pub struct StorageTestHandles {
     pub batcher_storage_handle: Option<TempDir>,
     pub state_sync_storage_handle: Option<TempDir>,
     pub class_manager_storage_handles: Option<TempDirHandlePair>,
+    pub consensus_storage_handle: Option<TempDir>,
 }
 
 impl StorageTestHandles {
@@ -90,8 +98,14 @@ impl StorageTestHandles {
         batcher_storage_handle: Option<TempDir>,
         state_sync_storage_handle: Option<TempDir>,
         class_manager_storage_handles: Option<TempDirHandlePair>,
+        consensus_storage_handle: Option<TempDir>,
     ) -> Self {
-        Self { batcher_storage_handle, state_sync_storage_handle, class_manager_storage_handles }
+        Self {
+            batcher_storage_handle,
+            state_sync_storage_handle,
+            class_manager_storage_handles,
+            consensus_storage_handle,
+        }
     }
 }
 
@@ -164,16 +178,26 @@ impl StorageTestSetup {
 
         initialize_class_manager_test_state(&mut class_manager_storage, classes);
 
+        let consensus_db_path =
+            storage_exec_paths.as_ref().map(|p| p.get_consensus_path_with_db_suffix());
+        let (_, consensus_storage_config, consensus_storage_handle) =
+            TestStorageBuilder::new(consensus_db_path)
+                .scope(StorageScope::StateOnly)
+                .chain_id(chain_info.chain_id.clone())
+                .build();
+
         Self {
             storage_config: StorageTestConfig::new(
                 batcher_storage_config,
                 state_sync_storage_config,
                 class_manager_storage_config,
+                consensus_storage_config,
             ),
             storage_handles: StorageTestHandles::new(
                 batcher_storage_handle,
                 state_sync_storage_handle,
                 class_manager_storage_handles,
+                consensus_storage_handle,
             ),
         }
     }
@@ -240,7 +264,7 @@ fn initialize_class_manager_test_state(
         class_manager_storage.set_deprecated_class(class_hash, casm).unwrap();
     }
     for (class_hash, (sierra, casm)) in cairo1_contract_classes {
-        let sierra_version = SierraVersion::extract_from_program(&sierra.sierra_program).unwrap();
+        let sierra_version = sierra.get_sierra_version().unwrap();
         let class = ContractClass::V1((casm, sierra_version));
         class_manager_storage
             .set_class(
@@ -278,10 +302,13 @@ fn prepare_state_diff(
 
     // Setup the common test contracts that are used by default in all test invokes.
     // TODO(batcher): this does nothing until we actually start excuting stuff in the batcher.
-    state_diff_builder.set_contracts(default_test_contracts).declare().deploy();
+    state_diff_builder.set_contracts(default_test_contracts).declare(&HashVersion::V2).deploy();
 
     // Declare and deploy and the ERC20 contract, so that transfers from it can be made.
-    state_diff_builder.set_contracts(std::slice::from_ref(erc20_contract)).declare().deploy();
+    state_diff_builder
+        .set_contracts(std::slice::from_ref(erc20_contract))
+        .declare(&HashVersion::V2)
+        .deploy();
 
     // TODO(deploy_account_support): once we have batcher with execution, replace with:
     // ```
@@ -393,6 +420,7 @@ fn test_block_header(block_number: BlockNumber) -> BlockHeader {
 struct ThinStateDiffBuilder<'a> {
     contracts: &'a [Contract],
     deprecated_declared_classes: Vec<ClassHash>,
+    // TODO(Aviv): Rename it to class_hash_to_compiled_class_hash.
     declared_classes: IndexMap<ClassHash, starknet_api::core::CompiledClassHash>,
     deployed_contracts: IndexMap<ContractAddress, ClassHash>,
     storage_diffs: IndexMap<ContractAddress, IndexMap<StorageKey, Felt>>,
@@ -424,7 +452,7 @@ impl<'a> ThinStateDiffBuilder<'a> {
         self
     }
 
-    fn declare(&mut self) -> &mut Self {
+    fn declare(&mut self, hash_version: &HashVersion) -> &mut Self {
         for contract in self.contracts {
             match contract.cairo_version() {
                 CairoVersion::Cairo0 => {
@@ -433,7 +461,10 @@ impl<'a> ThinStateDiffBuilder<'a> {
                 // todo(rdr): including both Cairo1 and Native versions for now. Temporal solution
                 // to avoid compilation errors when using the "cairo_native" feature
                 _ => {
-                    self.declared_classes.insert(contract.class_hash(), Default::default());
+                    self.declared_classes.insert(
+                        contract.class_hash(),
+                        contract.contract.get_compiled_class_hash(hash_version),
+                    );
                 }
             }
         }
@@ -474,7 +505,10 @@ impl<'a> ThinStateDiffBuilder<'a> {
         &mut self,
         deployed_accounts_defined_in_the_test: &'a [Contract],
     ) {
-        self.set_contracts(deployed_accounts_defined_in_the_test).declare().deploy().fund();
+        self.set_contracts(deployed_accounts_defined_in_the_test)
+            .declare(&HashVersion::V2)
+            .deploy()
+            .fund();
 
         // Set nonces as 1 in the state so that subsequent invokes can pass validation.
         self.nonces = self
@@ -488,14 +522,18 @@ impl<'a> ThinStateDiffBuilder<'a> {
         &mut self,
         undeployed_accounts_defined_in_the_test: &'a [Contract],
     ) {
-        self.set_contracts(undeployed_accounts_defined_in_the_test).declare().fund();
+        // Imitate the behavior of a class that was declared before the migration
+        // with casm v1 (poseidon) to trigger migration in the integration tests.
+        self.set_contracts(undeployed_accounts_defined_in_the_test)
+            .declare(&HashVersion::V1)
+            .fund();
     }
 
     fn build(self) -> ThinStateDiff {
         ThinStateDiff {
             storage_diffs: self.storage_diffs,
             deployed_contracts: self.deployed_contracts,
-            declared_classes: self.declared_classes,
+            class_hash_to_compiled_class_hash: self.declared_classes,
             deprecated_declared_classes: self.deprecated_declared_classes,
             nonces: self.nonces,
         }

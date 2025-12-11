@@ -3,30 +3,46 @@ use std::collections::{HashMap, HashSet};
 use assert_matches::assert_matches;
 use blockifier_test_utils::cairo_versions::{CairoVersion, RunnableCairo1};
 use blockifier_test_utils::contracts::FeatureContract;
+use cairo_vm::types::builtin_name::BuiltinName;
+use cairo_vm::vm::runners::cairo_runner::ExecutionResources;
+use expect_test::expect;
 use rstest::{fixture, rstest};
+use starknet_api::contract_class::compiled_class_hash::HashVersion;
+use starknet_api::core::{ClassHash, CompiledClassHash};
 use starknet_api::execution_resources::GasAmount;
 use starknet_api::transaction::fields::Fee;
-use starknet_api::{class_hash, contract_address, storage_key};
+use starknet_api::{class_hash, contract_address, felt, storage_key};
 
 use super::BouncerConfig;
 use crate::blockifier::transaction_executor::TransactionExecutorError;
 use crate::bouncer::{
+    builtins_to_gas,
+    get_patricia_update_resources,
     get_tx_weights,
+    map_class_hash_to_casm_hash_computation_resources,
     verify_tx_weights_within_max_capacity,
     Bouncer,
     BouncerWeights,
     BuiltinWeights,
     CasmHashComputationData,
+    CasmHashMigrationData,
     TxWeights,
 };
 use crate::context::BlockContext;
 use crate::execution::call_info::{BuiltinCounterMap, ExecutionSummary};
 use crate::fee::resources::{ComputationResources, TransactionResources};
 use crate::state::cached_state::{CachedState, StateChangesKeys, StateMaps, TransactionalState};
+use crate::state::state_api::StateReader;
 use crate::test_utils::contracts::FeatureContractData;
 use crate::test_utils::dict_state_reader::DictStateReader;
 use crate::test_utils::initial_test_state::test_state;
 use crate::transaction::errors::TransactionExecutionError;
+use crate::transaction::objects::ExecutionResourcesTraits;
+use crate::transaction::test_utils::{
+    create_init_data_for_compiled_class_hash_migration_test,
+    TestInitData,
+};
+use crate::utils::{add_maps, u64_from_usize};
 
 #[fixture]
 fn block_context() -> BlockContext {
@@ -53,7 +69,7 @@ fn block_max_capacity() -> BouncerWeights {
 
 #[fixture]
 fn bouncer_config(block_max_capacity: BouncerWeights) -> BouncerConfig {
-    BouncerConfig { block_max_capacity, builtin_weights: BuiltinWeights::default() }
+    BouncerConfig { block_max_capacity, ..Default::default() }
 }
 
 #[rstest]
@@ -81,6 +97,42 @@ fn test_block_weights_has_room_sierra_gas(block_max_capacity: BouncerWeights) {
     };
 
     assert!(!block_max_capacity.has_room(bouncer_weights_exceeds_max));
+}
+
+#[rstest]
+#[case::not_exceeded(BouncerWeights {
+        l1_gas: 7,
+        message_segment_length: 10,
+        n_events: 2,
+        state_diff_size: 7,
+        sierra_gas: GasAmount(7),
+        n_txs: 7,
+        proving_gas: GasAmount(5),
+    }, "")]
+#[case::sierra_gas_exceeded(BouncerWeights {
+        l1_gas: 20,
+        message_segment_length: 10,
+        n_events: 2,
+        state_diff_size: 7,
+        sierra_gas: GasAmount(27),
+        n_txs: 7,
+        proving_gas: GasAmount(5),
+    }, "sierra_gas")]
+#[case::multiple_weights_exceeded(BouncerWeights {
+        l1_gas: 7,
+        message_segment_length: 25,
+        n_events: 2,
+        state_diff_size: 21,
+        sierra_gas: GasAmount(7),
+        n_txs: 7,
+        proving_gas: GasAmount(22),
+    }, "message_segment_length, state_diff_size, proving_gas")]
+fn test_block_weights_exceeded(
+    #[case] accumulated_weight: BouncerWeights,
+    #[case] exceeded_list: String,
+    block_max_capacity: BouncerWeights,
+) {
+    assert_eq!(block_max_capacity.get_exceeded_weights(accumulated_weight), exceeded_list);
 }
 
 #[rstest]
@@ -116,7 +168,10 @@ fn test_block_weights_has_room_n_txs(
         contract_address!(0_u128),
     ])),
     bouncer_config: BouncerConfig::empty(),
-    accumulated_weights: BouncerWeights {
+    accumulated_weights:
+    TxWeights{
+    bouncer_weights:
+    BouncerWeights {
         l1_gas: 10,
         message_segment_length: 10,
         n_events: 10,
@@ -130,7 +185,13 @@ fn test_block_weights_has_room_n_txs(
         (class_hash!(0_u128), GasAmount(5))]),
         gas_without_casm_hash_computation: GasAmount(5),
     },
-    casm_hash_computation_data_proving_gas: CasmHashComputationData::empty(),
+    casm_hash_computation_data_proving_gas: CasmHashComputationData{class_hash_to_casm_hash_computation_gas: HashMap::from([
+        (class_hash!(0_u128), GasAmount(5))]),
+        gas_without_casm_hash_computation: GasAmount(5),},
+    class_hashes_to_migrate: HashMap::from([
+        (class_hash!(0_u128), (CompiledClassHash(felt!(2_u128)), CompiledClassHash(felt!(1_u128)))),
+    ]),
+}
 })]
 fn test_bouncer_update(#[case] initial_bouncer: Bouncer) {
     // TODO(Aviv): Use expect! to avoid magic numbers.
@@ -157,15 +218,24 @@ fn test_bouncer_update(#[case] initial_bouncer: Bouncer) {
         HashMap::from([(class_hash!(1_u128), GasAmount(1)), (class_hash!(2_u128), GasAmount(2))]);
 
     let casm_hash_computation_data_sierra_gas = CasmHashComputationData {
+        class_hash_to_casm_hash_computation_gas: class_hash_to_casm_hash_computation_gas_to_update
+            .clone(),
+        gas_without_casm_hash_computation: GasAmount(6),
+    };
+    let casm_hash_computation_data_proving_gas = CasmHashComputationData {
         class_hash_to_casm_hash_computation_gas: class_hash_to_casm_hash_computation_gas_to_update,
         gas_without_casm_hash_computation: GasAmount(6),
     };
-    let casm_hash_computation_data_proving_gas = CasmHashComputationData::empty();
+    let class_hashes_to_migrate = HashMap::from([
+        (class_hash!(2_u128), (CompiledClassHash(felt!(4_u128)), CompiledClassHash(felt!(3_u128)))),
+        (class_hash!(1_u128), (CompiledClassHash(felt!(6_u128)), CompiledClassHash(felt!(5_u128)))),
+    ]);
 
     let tx_weights = TxWeights {
         bouncer_weights: weights_to_update,
         casm_hash_computation_data_sierra_gas: casm_hash_computation_data_sierra_gas.clone(),
         casm_hash_computation_data_proving_gas: casm_hash_computation_data_proving_gas.clone(),
+        class_hashes_to_migrate: class_hashes_to_migrate.clone(),
     };
 
     let state_changes_keys_to_update =
@@ -179,31 +249,68 @@ fn test_bouncer_update(#[case] initial_bouncer: Bouncer) {
         .visited_storage_entries
         .extend(&execution_summary_to_update.visited_storage_entries);
     expected_bouncer.state_changes_keys.extend(&state_changes_keys_to_update);
-    expected_bouncer.accumulated_weights += weights_to_update;
+    expected_bouncer.accumulated_weights.bouncer_weights += weights_to_update;
     expected_bouncer
+        .accumulated_weights
         .casm_hash_computation_data_sierra_gas
         .extend(casm_hash_computation_data_sierra_gas.clone());
     expected_bouncer
+        .accumulated_weights
         .casm_hash_computation_data_proving_gas
         .extend(casm_hash_computation_data_proving_gas.clone());
+    expected_bouncer
+        .accumulated_weights
+        .class_hashes_to_migrate
+        .extend(class_hashes_to_migrate.clone());
 
     assert_eq!(updated_bouncer, expected_bouncer);
 }
 
-/// This parameterized test verifies `Bouncer::try_update` behavior when varying only `sierra_gas`.
 #[rstest]
-#[case::positive_flow(GasAmount(1), "ok")]
-#[case::block_full(GasAmount(11), "block_full")]
-#[case::transaction_too_large(GasAmount(21), "too_large")]
-fn test_bouncer_try_update_sierra_gas(
-    #[case] added_gas: GasAmount,
-    #[case] scenario: &'static str,
-    block_context: BlockContext,
-    block_max_capacity: BouncerWeights,
-    bouncer_config: BouncerConfig,
-    mut state: CachedState<DictStateReader>,
-) {
-    let accumulated_weights = BouncerWeights {
+#[case::sierra_gas_positive_flow("ok")]
+#[case::sierra_gas_block_full("sierra_gas_block_full")]
+#[case::proving_gas_positive_flow("ok")]
+#[case::proving_gas_block_full("proving_gas_block_full")]
+fn test_bouncer_try_update_gas_based(#[case] scenario: &'static str, block_context: BlockContext) {
+    let state = &mut test_state(&block_context.chain_info, Fee(0), &[]);
+    let mut transactional_state = TransactionalState::create_transactional(state);
+    let builtin_weights = BuiltinWeights::default();
+
+    let range_check_count = 2;
+    let max_capacity_builtin_counters =
+        HashMap::from([(BuiltinName::range_check, range_check_count)]);
+    let builtin_counters = match scenario {
+        "proving_gas_block_full" => max_capacity_builtin_counters.clone(),
+        // Use a minimal or empty map.
+        "ok" | "sierra_gas_block_full" => {
+            HashMap::from([(BuiltinName::range_check, range_check_count - 1)])
+        }
+        _ => panic!("Unexpected scenario: {scenario}"),
+    };
+
+    // Derive sierra_gas from scenario
+    let sierra_gas = match scenario {
+        "sierra_gas_block_full" => GasAmount(11), // Exceeds capacity
+        "ok" | "proving_gas_block_full" => GasAmount(1), // Within capacity
+        _ => panic!("Unexpected scenario: {scenario}"),
+    };
+
+    let proving_gas_max_capacity =
+        builtins_to_gas(&max_capacity_builtin_counters, &builtin_weights.gas_costs);
+
+    let block_max_capacity = BouncerWeights {
+        l1_gas: 20,
+        message_segment_length: 20,
+        n_events: 20,
+        state_diff_size: 20,
+        n_txs: 20,
+        sierra_gas: GasAmount(20),
+        proving_gas: proving_gas_max_capacity,
+    };
+    let bouncer_config =
+        BouncerConfig { block_max_capacity, builtin_weights, ..Default::default() };
+
+    let bouncer_weights = BouncerWeights {
         l1_gas: 10,
         message_segment_length: 10,
         n_events: 10,
@@ -212,59 +319,76 @@ fn test_bouncer_try_update_sierra_gas(
         n_txs: 10,
         proving_gas: GasAmount(10),
     };
+    let accumulated_weights = TxWeights { bouncer_weights, ..Default::default() };
 
     let mut bouncer = Bouncer { accumulated_weights, bouncer_config, ..Bouncer::empty() };
 
     // Prepare the resources to be added to the bouncer.
     let execution_summary = ExecutionSummary::default();
     let tx_resources = TransactionResources {
-        // Only the `sierra_gas` field is varied.
-        computation: ComputationResources { sierra_gas: added_gas, ..Default::default() },
+        computation: ComputationResources { sierra_gas, ..Default::default() },
         ..Default::default()
     };
-    let mut transactional_state = TransactionalState::create_transactional(&mut state);
     let tx_state_changes_keys = transactional_state.to_state_diff().unwrap().state_maps.keys();
 
-    // TODO(Yoni, 1/10/2024): simplify this test and move tx-too-large cases out.
-
-    // Check that the transaction is not too large.
-    let mut result = verify_tx_weights_within_max_capacity(
+    let result = bouncer.try_update(
         &transactional_state,
-        &execution_summary,
-        &tx_resources,
         &tx_state_changes_keys,
-        &bouncer.bouncer_config,
+        &execution_summary,
+        &builtin_counters,
+        &tx_resources,
         &block_context.versioned_constants,
-    )
-    .map_err(TransactionExecutorError::TransactionExecutionError);
-    let expected_weights = BouncerWeights {
-        sierra_gas: added_gas,
-        n_txs: 1,
-        proving_gas: added_gas,
-        ..BouncerWeights::empty()
-    };
-
-    if result.is_ok() {
-        // Try to update the bouncer.
-        result = bouncer.try_update(
-            &transactional_state,
-            &tx_state_changes_keys,
-            &execution_summary,
-            &tx_resources,
-            &block_context.versioned_constants,
-        );
-    }
+    );
 
     match scenario {
         "ok" => assert_matches!(result, Ok(())),
-        "block_full" => assert_matches!(result, Err(TransactionExecutorError::BlockFull)),
-        "too_large" => assert_matches!(result, Err(
-                TransactionExecutorError::TransactionExecutionError(
-                    TransactionExecutionError::TransactionTooLarge { max_capacity, tx_size }
-                )
-            ) if *max_capacity == block_max_capacity && *tx_size == expected_weights),
-        _ => panic!("Unexpected scenario: {}", scenario),
+        "proving_gas_block_full" | "sierra_gas_block_full" => {
+            assert_matches!(result, Err(TransactionExecutorError::BlockFull))
+        }
+        _ => panic!("Unexpected scenario: {scenario}"),
     }
+}
+
+#[rstest]
+fn test_transaction_too_large_sierra_gas_based(block_context: BlockContext) {
+    let mut state = test_state(&block_context.chain_info, Fee(0), &[]);
+    let mut transactional_state = TransactionalState::create_transactional(&mut state);
+    let block_max_capacity = BouncerWeights { sierra_gas: GasAmount(20), ..Default::default() };
+    let bouncer_config = BouncerConfig { block_max_capacity, ..Default::default() };
+
+    // Use gas amount > block_max_capacity's.
+    let exceeding_gas = GasAmount(30);
+    let execution_summary = ExecutionSummary::default();
+    let builtin_counters = BuiltinCounterMap::default();
+    let tx_resources = TransactionResources {
+        computation: ComputationResources { sierra_gas: exceeding_gas, ..Default::default() },
+        ..Default::default()
+    };
+    let tx_state_changes_keys = transactional_state.to_state_diff().unwrap().state_maps.keys();
+
+    let result = verify_tx_weights_within_max_capacity(
+        &transactional_state,
+        &execution_summary,
+        &builtin_counters,
+        &tx_resources,
+        &tx_state_changes_keys,
+        &bouncer_config,
+        &block_context.versioned_constants,
+    )
+    .map_err(TransactionExecutorError::TransactionExecutionError);
+
+    let expected_weights = BouncerWeights {
+        sierra_gas: exceeding_gas,
+        n_txs: 1,
+        proving_gas: exceeding_gas,
+        ..BouncerWeights::empty()
+    };
+
+    assert_matches!(result, Err(
+        TransactionExecutorError::TransactionExecutionError(
+            TransactionExecutionError::TransactionTooLarge { max_capacity, tx_size }
+        )
+    )  if *max_capacity == bouncer_config.block_max_capacity && *tx_size == expected_weights);
 }
 
 #[rstest]
@@ -273,7 +397,7 @@ fn test_bouncer_try_update_n_txs(
     bouncer_config: BouncerConfig,
     mut state: CachedState<DictStateReader>,
 ) {
-    let accumulated_weights = BouncerWeights {
+    let bouncer_weights = BouncerWeights {
         l1_gas: 10,
         message_segment_length: 10,
         n_events: 10,
@@ -283,22 +407,57 @@ fn test_bouncer_try_update_n_txs(
         proving_gas: GasAmount(10),
     };
 
+    let accumulated_weights = TxWeights { bouncer_weights, ..Default::default() };
+
     let mut bouncer = Bouncer { accumulated_weights, bouncer_config, ..Bouncer::empty() };
+    bouncer.bouncer_config.block_max_capacity.sierra_gas = GasAmount::MAX;
+    bouncer.bouncer_config.block_max_capacity.proving_gas = GasAmount::MAX;
 
     // Prepare first tx resources.
     let mut first_transactional_state = TransactionalState::create_transactional(&mut state);
-    let first_tx_state_changes_keys =
-        first_transactional_state.to_state_diff().unwrap().state_maps.keys();
 
+    let first_tx_state_changes_keys = StateChangesKeys {
+        storage_keys: HashSet::from([(contract_address!(1_u128), storage_key!(1_u128))]),
+        modified_contracts: HashSet::from([contract_address!(1_u128)]),
+        ..StateChangesKeys::default()
+    };
+    let first_tx_execution_summary = ExecutionSummary {
+        visited_storage_entries: HashSet::from([
+            (contract_address!(1_u128), storage_key!(1_u128)),
+            (contract_address!(2_u128), storage_key!(2_u128)),
+        ]),
+        ..ExecutionSummary::default()
+    };
     // Try to update the bouncer.
     let mut result = bouncer.try_update(
         &first_transactional_state,
         &first_tx_state_changes_keys,
-        &ExecutionSummary::default(),
+        &first_tx_execution_summary,
+        &BuiltinCounterMap::default(),
         &TransactionResources::default(),
         &block_context.versioned_constants,
     );
     assert_matches!(result, Ok(()));
+
+    // Regression test to cover complicated calculations such as patricia update.
+    expect![
+        r#"
+        BouncerWeights {
+            l1_gas: 10,
+            message_segment_length: 10,
+            n_events: 10,
+            state_diff_size: 14,
+            sierra_gas: GasAmount(
+                406810,
+            ),
+            n_txs: 20,
+            proving_gas: GasAmount(
+                403210,
+            ),
+        }
+    "#
+    ]
+    .assert_debug_eq(&bouncer.accumulated_weights.bouncer_weights);
 
     // Prepare second tx resources.
     let mut second_transactional_state =
@@ -310,6 +469,7 @@ fn test_bouncer_try_update_n_txs(
         &second_transactional_state,
         &second_tx_state_changes_keys,
         &ExecutionSummary::default(),
+        &BuiltinCounterMap::default(),
         &TransactionResources::default(),
         &block_context.versioned_constants,
     );
@@ -326,8 +486,8 @@ fn test_get_tx_weights_with_casm_hash_computation(block_context: BlockContext) {
     let test_contract_v1 =
         FeatureContract::TestContract(CairoVersion::Cairo1(RunnableCairo1::Casm));
 
-    state_reader.add_class(&FeatureContractData::from(test_contract_v0));
-    state_reader.add_class(&FeatureContractData::from(test_contract_v1));
+    state_reader.add_class(&FeatureContractData::from(test_contract_v0), &HashVersion::V2);
+    state_reader.add_class(&FeatureContractData::from(test_contract_v1), &HashVersion::V2);
     let state = CachedState::new(state_reader);
 
     let executed_class_hashes =
@@ -342,7 +502,7 @@ fn test_get_tx_weights_with_casm_hash_computation(block_context: BlockContext) {
         &StateMaps::default().keys(),
         &block_context.versioned_constants,
         &BuiltinCounterMap::default(),
-        &BuiltinWeights::default(),
+        &BouncerConfig::default(),
     );
 
     let tx_weights = result.unwrap();
@@ -406,4 +566,327 @@ fn test_get_tx_weights_with_casm_hash_computation(block_context: BlockContext) {
         bouncer_weights.proving_gas,
         tx_weights.casm_hash_computation_data_proving_gas.total_gas()
     );
+}
+
+/// Verifies that the difference between proving gas and Sierra gas
+/// is fully accounted for by the builtin gas delta (Stone vs Stwo).
+///
+/// Covers combinations of OS computation builtins and CASM hash computation builtins.
+#[rstest]
+#[case::tx_builtins_only(&[], ExecutionResources::default())]
+#[case::tx_builtins_plus_os_tx_builtins(
+    &[],
+    ExecutionResources {
+        builtin_instance_counter: HashMap::from([
+            (BuiltinName::bitwise, 1),
+        ]),
+        ..Default::default()
+    },
+)]
+#[case::tx_builtins_plus_os_additional_cost(
+    &[
+        (FeatureContract::TestContract(CairoVersion::Cairo0), 1),
+        (FeatureContract::TestContract(CairoVersion::Cairo1(RunnableCairo1::Casm)), 1),
+    ],
+    ExecutionResources::default(),
+)]
+#[case::tx_builtins_plus_os_tx_builtins_plus_os_additional_cost(
+    &[
+        (FeatureContract::TestContract(CairoVersion::Cairo0), 1),
+        (FeatureContract::TestContract(CairoVersion::Cairo1(RunnableCairo1::Casm)), 1),
+    ],
+    ExecutionResources {
+        builtin_instance_counter: HashMap::from([
+            (BuiltinName::range_check, 1),
+            (BuiltinName::bitwise, 2),
+        ]),
+        ..Default::default()
+    },
+)]
+fn test_proving_gas_minus_sierra_gas_equals_builtin_gas(
+    #[case] contract_instances: &[(FeatureContract, u16)],
+    #[case] os_vm_resources: ExecutionResources,
+) {
+    let block_context = BlockContext::create_for_account_testing();
+    let state = test_state(&block_context.chain_info, Fee(0), contract_instances);
+
+    // Derive executed_class_hashes from contract_instances
+    let executed_class_hashes: HashSet<ClassHash> =
+        contract_instances.iter().map(|(contract, _)| contract.get_class_hash()).collect();
+
+    // Transaction builtin counters.
+    let mut tx_builtin_counters =
+        HashMap::from([(BuiltinName::range_check, 2), (BuiltinName::pedersen, 1)]);
+
+    let tx_resources = TransactionResources {
+        computation: ComputationResources {
+            sierra_gas: GasAmount::ZERO,
+            tx_vm_resources: ExecutionResources {
+                builtin_instance_counter: tx_builtin_counters.clone(),
+                ..Default::default()
+            },
+            os_vm_resources: os_vm_resources.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    // Create the os additional resources, which contains both patricia updates and CASM hash
+    // computation.
+
+    // Create CASM hash computation builtins only in case CASM computation aren't trivial.
+    let casm_hash_computation_builtins = if contract_instances.is_empty() {
+        HashMap::new()
+    } else {
+        map_class_hash_to_casm_hash_computation_resources(&state, &executed_class_hashes)
+            .unwrap()
+            .iter()
+            .fold(ExecutionResources::default(), |acc, (_class_hash, estimated_resources)| {
+                &acc + estimated_resources.resources_ref()
+            })
+            .prover_builtins()
+    };
+
+    // Create the patricia update builtins.
+    let n_visited_storage_entries = if casm_hash_computation_builtins.is_empty() { 0 } else { 1 };
+
+    let mut additional_os_resources =
+        get_patricia_update_resources(n_visited_storage_entries, 0).prover_builtins();
+    add_maps(&mut additional_os_resources, &casm_hash_computation_builtins);
+
+    let result = get_tx_weights(
+        &state,
+        &executed_class_hashes,
+        n_visited_storage_entries,
+        &tx_resources,
+        &StateMaps::default().keys(), // state changes keys
+        &block_context.versioned_constants,
+        &tx_builtin_counters,
+        &block_context.bouncer_config,
+    )
+    .unwrap();
+
+    // Combine TX + TX overhead (OS) + CASM and patricia builtin usage.
+    add_maps(&mut tx_builtin_counters, &os_vm_resources.builtin_instance_counter);
+    add_maps(&mut tx_builtin_counters, &additional_os_resources);
+
+    // Compute expected gas delta from builtin delta (absolute difference between Stwo and Stone).
+    let (total_stwo_gas, total_stone_gas) = tx_builtin_counters
+        .iter()
+        .map(|(name, count)| {
+            let stwo_gas = block_context
+                .bouncer_config
+                .builtin_weights
+                .gas_costs
+                .get_builtin_gas_cost(name)
+                .unwrap_or_else(|_| panic!("Builtin name {:?} is not supported in the bouncer weights.", name));
+            let stone_gas = block_context
+                .versioned_constants
+                .os_constants
+                .gas_costs
+                .builtins
+                .get_builtin_gas_cost(name)
+                .unwrap();
+
+            let stwo_total = stwo_gas.checked_mul(u64_from_usize(*count)).expect("overflow");
+            let stone_total = u64_from_usize(*count).checked_mul(stone_gas).expect("overflow");
+            (stwo_total, stone_total)
+        })
+        // Sum stwo and stone gas separately.
+        .try_fold((0u64, 0u64), |(acc_stwo, acc_stone), (stwo, stone)| {
+            Some((acc_stwo.checked_add(stwo)?, acc_stone.checked_add(stone)?))
+        })
+        .expect("overflow in sum");
+    let expected_builtin_gas_delta = total_stwo_gas.abs_diff(total_stone_gas);
+
+    assert_eq!(
+        result.bouncer_weights.proving_gas.0.abs_diff(result.bouncer_weights.sierra_gas.0),
+        expected_builtin_gas_delta,
+        "|Proving gas: {} - Sierra gas: {}| ≠ builtins gap: {}",
+        result.bouncer_weights.proving_gas.0,
+        result.bouncer_weights.sierra_gas.0,
+        expected_builtin_gas_delta
+    );
+}
+
+fn build_state_and_executed(
+    block_context: &BlockContext,
+    cairo_version: CairoVersion,
+    declare_with_casm_hash_v1: bool,
+) -> (CachedState<DictStateReader>, HashSet<ClassHash>) {
+    let TestInitData { state, account_address, contract_address, nonce_manager: _ } =
+        create_init_data_for_compiled_class_hash_migration_test(
+            &block_context.chain_info,
+            cairo_version,
+            declare_with_casm_hash_v1,
+        );
+
+    let executed_class_hashes = HashSet::from([
+        state.get_class_hash_at(account_address).unwrap(),
+        state.get_class_hash_at(contract_address).unwrap(),
+    ]);
+
+    (state, executed_class_hashes)
+}
+
+/// Ensures `CasmHashMigrationData::from_state` produces migration data only when migration is
+/// enabled, classes use v1 hashes, and the Cairo version is not Cairo0.
+#[rstest]
+#[cfg_attr(feature = "cairo_native", case(CairoVersion::Cairo1(RunnableCairo1::Native)))]
+#[case(CairoVersion::Cairo1(RunnableCairo1::Casm))]
+fn class_hash_migration_data_from_state(
+    #[case] cairo_version: CairoVersion,
+    #[values(true, false)] enable_casm_hash_migration: bool,
+    #[values(true, false)] declare_with_casm_hash_v1: bool,
+) {
+    let mut block_context = BlockContext::create_for_account_testing();
+    block_context.versioned_constants.enable_casm_hash_migration = enable_casm_hash_migration;
+    let should_migrate =
+        enable_casm_hash_migration && declare_with_casm_hash_v1 && !cairo_version.is_cairo0();
+
+    let (state, executed) =
+        build_state_and_executed(&block_context, cairo_version, declare_with_casm_hash_v1);
+
+    let migration_data =
+        CasmHashMigrationData::from_state(&state, &executed, &block_context.versioned_constants)
+            .unwrap();
+
+    // Assert class-hash mapping.
+    let mut expected = HashMap::new();
+    if should_migrate {
+        for class_hash in &executed {
+            let compiled_class = state.get_compiled_class(*class_hash).unwrap();
+            let v2_hash = state.get_compiled_class_hash_v2(*class_hash, &compiled_class).unwrap();
+            let v1_hash = state.get_compiled_class_hash(*class_hash).unwrap();
+            expected.insert(*class_hash, (v2_hash, v1_hash));
+        }
+    }
+    assert_eq!(migration_data.class_hashes_to_migrate, expected);
+
+    // Assert migration gas.
+    let migration_sierra_gas = migration_data.to_gas(
+        &block_context.versioned_constants.os_constants.gas_costs.builtins,
+        &block_context.versioned_constants,
+        block_context.bouncer_config.blake_weight,
+    );
+    let migration_proving_gas = migration_data.to_gas(
+        &block_context.bouncer_config.builtin_weights.gas_costs,
+        &block_context.versioned_constants,
+        block_context.bouncer_config.blake_weight,
+    );
+
+    if should_migrate {
+        expect![[r#"
+            99939035
+        "#]]
+        .assert_debug_eq(&migration_sierra_gas.0);
+        expect![[r#"
+            260040060
+        "#]]
+        .assert_debug_eq(&migration_proving_gas.0);
+    } else {
+        assert_eq!(migration_sierra_gas, GasAmount::ZERO);
+        assert_eq!(migration_proving_gas, GasAmount::ZERO);
+    }
+}
+
+/// Ensures `get_tx_weights` adds the migration gas when (and only when) migration is applicable.
+#[rstest]
+#[cfg_attr(feature = "cairo_native", case(CairoVersion::Cairo1(RunnableCairo1::Native)))]
+#[case(CairoVersion::Cairo1(RunnableCairo1::Casm))]
+#[case(CairoVersion::Cairo0)]
+fn get_tx_weights_applies_migration_gas_delta(
+    #[case] cairo_version: CairoVersion,
+    #[values(true, false)] declare_with_casm_hash_v1: bool,
+) {
+    let mut bc_migration_enabled = BlockContext::create_for_account_testing();
+    bc_migration_enabled.versioned_constants.enable_casm_hash_migration = true;
+
+    let mut vc_migration_disabled = bc_migration_enabled.versioned_constants.clone();
+    vc_migration_disabled.enable_casm_hash_migration = false;
+
+    let (state, executed) =
+        build_state_and_executed(&bc_migration_enabled, cairo_version, declare_with_casm_hash_v1);
+
+    // Expected migration gas computed directly from state.
+    let migration_data = CasmHashMigrationData::from_state(
+        &state,
+        &executed,
+        &bc_migration_enabled.versioned_constants,
+    )
+    .unwrap();
+
+    let migration_applicable = !cairo_version.is_cairo0() && declare_with_casm_hash_v1;
+
+    // Sanity check - class hashes to migrate empty only when migration is not applicable.
+    if !migration_applicable {
+        assert!(migration_data.class_hashes_to_migrate.is_empty());
+    } else {
+        assert!(!migration_data.class_hashes_to_migrate.is_empty());
+    }
+
+    let expected_migration_sierra_gas = migration_data.to_gas(
+        &bc_migration_enabled.versioned_constants.os_constants.gas_costs.builtins,
+        &bc_migration_enabled.versioned_constants,
+        bc_migration_enabled.bouncer_config.blake_weight,
+    );
+    let expected_migration_proving_gas = migration_data.to_gas(
+        &bc_migration_enabled.bouncer_config.builtin_weights.gas_costs,
+        &bc_migration_enabled.versioned_constants,
+        bc_migration_enabled.bouncer_config.blake_weight,
+    );
+
+    // Sanity check - migration gas is zero only when not applicable.
+    if !migration_applicable {
+        assert_eq!(expected_migration_sierra_gas, GasAmount::ZERO);
+        assert_eq!(expected_migration_proving_gas, GasAmount::ZERO);
+    } else {
+        assert_ne!(expected_migration_sierra_gas, GasAmount::ZERO);
+        assert_ne!(expected_migration_proving_gas, GasAmount::ZERO);
+    }
+
+    // Actual weights - migration disabled.
+    let weights_migration_disabled = get_tx_weights(
+        &state,
+        &executed,
+        0,
+        &TransactionResources::default(),
+        &StateMaps::default().keys(),
+        &vc_migration_disabled,
+        &BuiltinCounterMap::default(),
+        &bc_migration_enabled.bouncer_config,
+    )
+    .unwrap();
+
+    // Sanity check - class hashes to migrate are empty when migration is disabled.
+    assert!(weights_migration_disabled.class_hashes_to_migrate.is_empty());
+
+    // Actual weights - migration enabled.
+    let weights_migration_enabled = get_tx_weights(
+        &state,
+        &executed,
+        0,
+        &TransactionResources::default(),
+        &StateMaps::default().keys(),
+        &bc_migration_enabled.versioned_constants,
+        &BuiltinCounterMap::default(),
+        &bc_migration_enabled.bouncer_config,
+    )
+    .unwrap();
+
+    // Class-hash mapping propagates only when migration is applicable.
+    assert_eq!(
+        weights_migration_enabled.class_hashes_to_migrate,
+        migration_data.class_hashes_to_migrate
+    );
+
+    // Delta(with_migration − without_migration) must equal computed migration gas.
+    let sierra_migration_delta = weights_migration_enabled.bouncer_weights.sierra_gas
+        - weights_migration_disabled.bouncer_weights.sierra_gas;
+
+    let proving_migration_delta = weights_migration_enabled.bouncer_weights.proving_gas
+        - weights_migration_disabled.bouncer_weights.proving_gas;
+
+    assert_eq!(sierra_migration_delta, expected_migration_sierra_gas);
+    assert_eq!(proving_migration_delta, expected_migration_proving_gas);
 }

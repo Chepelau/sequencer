@@ -1,8 +1,8 @@
 use std::sync::LazyLock;
 
+use apollo_sizeof::SizeOf;
 use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
-use size_of::SizeOf;
 use starknet_types_core::felt::Felt;
 
 use crate::block::{BlockHash, BlockNumber};
@@ -26,6 +26,7 @@ use crate::transaction::fields::{
     ContractAddressSalt,
     Fee,
     PaymasterData,
+    ProofFacts,
     Tip,
     TransactionSignature,
     ValidResourceBounds,
@@ -95,6 +96,16 @@ impl Transaction {
             Transaction::DeployAccount(tx) => tx.version(),
             Transaction::Invoke(tx) => tx.version(),
             Transaction::L1Handler(tx) => tx.version,
+        }
+    }
+
+    pub fn resource_bounds(&self) -> Option<ValidResourceBounds> {
+        match self {
+            Transaction::Declare(tx) => Some(tx.resource_bounds()),
+            Transaction::Deploy(_) => None,
+            Transaction::DeployAccount(tx) => Some(tx.resource_bounds()),
+            Transaction::Invoke(tx) => Some(tx.resource_bounds()),
+            Transaction::L1Handler(_) => None,
         }
     }
 
@@ -668,6 +679,8 @@ pub struct InvokeTransactionV3 {
     pub fee_data_availability_mode: DataAvailabilityMode,
     pub paymaster_data: PaymasterData,
     pub account_deployment_data: AccountDeploymentData,
+    #[serde(default)]
+    pub proof_facts: ProofFacts,
 }
 
 impl TransactionHasher for InvokeTransactionV3 {

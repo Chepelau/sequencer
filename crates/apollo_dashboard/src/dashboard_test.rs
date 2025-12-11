@@ -1,30 +1,36 @@
 use apollo_infra_utils::test_utils::assert_json_eq;
+use apollo_metrics::metrics::{MetricCounter, MetricQueryName, MetricScope};
 
 use crate::alerts::{
     Alert,
     AlertComparisonOp,
     AlertCondition,
+    AlertEnvFiltering,
     AlertGroup,
     AlertLogicalOp,
     AlertSeverity,
+    ObserverApplicability,
 };
+use crate::dashboard::{Panel, PanelType, ThresholdMode, ThresholdStep, Thresholds, Unit};
 
 #[test]
 fn serialize_alert() {
-    let alert = Alert {
-        name: "Name",
-        title: "Message",
-        alert_group: AlertGroup::Batcher,
-        expr: "max".to_string(),
-        conditions: &[AlertCondition {
+    let alert = Alert::new(
+        "Name",
+        "Message",
+        AlertGroup::Batcher,
+        "max".to_string(),
+        vec![AlertCondition {
             comparison_op: AlertComparisonOp::GreaterThan,
             comparison_value: 10.0,
             logical_op: AlertLogicalOp::And,
         }],
-        pending_duration: "5m",
-        evaluation_interval_sec: 20,
-        severity: AlertSeverity::Sos,
-    };
+        "5m",
+        20,
+        AlertSeverity::Sos,
+        ObserverApplicability::Applicable,
+        AlertEnvFiltering::All,
+    );
 
     let serialized = serde_json::to_value(&alert).unwrap();
     let expected = serde_json::json!({
@@ -42,7 +48,105 @@ fn serialize_alert() {
         ],
         "for": "5m",
         "intervalSec": 20,
-        "severity": "p1"
+        "severity": "p1",
+        "observer_applicable": "true"
     });
     assert_json_eq(&serialized, &expected, "Json Comparison failed".to_string());
+}
+
+#[test]
+fn test_ratio_time_series() {
+    let duration = "5m";
+    let metric_1 = MetricCounter::new(MetricScope::Batcher, "r", "desc", 0);
+    let metric_2 = MetricCounter::new(MetricScope::Batcher, "p", "desc", 0);
+    let metric_3 = MetricCounter::new(MetricScope::Batcher, "a", "desc", 0);
+
+    let panel =
+        Panel::ratio_time_series("x", "x", &metric_1, &[&metric_1, &metric_2, &metric_3], duration)
+            .with_log_query("Query");
+
+    let expected = format!(
+        "(increase({}[{duration}]) / (increase({}[{duration}]) + increase({}[{duration}]) + \
+         increase({}[{duration}])))",
+        metric_1.get_name_with_filter(),
+        metric_1.get_name_with_filter(),
+        metric_2.get_name_with_filter(),
+        metric_3.get_name_with_filter(),
+    );
+
+    assert_eq!(panel.exprs, vec![expected]);
+    assert_eq!(panel.extra.unit, Some(Unit::PercentUnit));
+    assert_eq!(panel.extra.log_query, Some("\"Query\"".to_string()));
+
+    let expected = format!(
+        "(increase({}[{duration}]) / (increase({}[{duration}])))",
+        metric_1.get_name_with_filter(),
+        metric_2.get_name_with_filter(),
+    );
+    let panel = Panel::ratio_time_series("y", "y", &metric_1, &[&metric_2], duration);
+    assert_eq!(panel.exprs, vec![expected]);
+    assert!(panel.extra.show_percent_change.is_none());
+    assert!(panel.extra.log_query.is_none());
+}
+
+#[test]
+fn test_extra_params() {
+    let panel_with_extra_params = Panel::new("x", "x", "y".to_string(), PanelType::Stat)
+        .with_unit(Unit::Bytes)
+        .show_percent_change()
+        .with_log_query("Query")
+        .with_absolute_thresholds(vec![
+            ("green", None),
+            ("red", Some(80.0)),
+            ("yellow", Some(90.0)),
+        ])
+        .with_legends(vec!["a"]);
+
+    assert_eq!(panel_with_extra_params.extra.unit, Some(Unit::Bytes));
+    assert_eq!(panel_with_extra_params.extra.show_percent_change, Some(true));
+    assert_eq!(panel_with_extra_params.extra.log_query, Some("\"Query\"".to_string()));
+    assert_eq!(
+        panel_with_extra_params.extra.thresholds,
+        Some(Thresholds {
+            mode: ThresholdMode::Absolute,
+            steps: vec![
+                ThresholdStep { color: "green".to_string(), value: None },
+                ThresholdStep { color: "red".to_string(), value: Some(80.0) },
+                ThresholdStep { color: "yellow".to_string(), value: Some(90.0) },
+            ],
+        })
+    );
+    assert_eq!(panel_with_extra_params.extra.legends, Some(vec!["a".to_string()]));
+
+    let panel_without_extra_params = Panel::new("x", "x", "y".to_string(), PanelType::Stat);
+    assert!(panel_without_extra_params.extra.unit.is_none());
+    assert!(panel_without_extra_params.extra.show_percent_change.is_none());
+    assert!(panel_without_extra_params.extra.log_query.is_none());
+    assert!(panel_without_extra_params.extra.thresholds.is_none());
+    assert!(panel_without_extra_params.extra.legends.is_none());
+}
+
+#[test]
+#[should_panic]
+fn thresholds_first_step_must_be_none() {
+    let _ = Panel::new("x", "x", "y", PanelType::Stat).with_absolute_thresholds(vec![
+        ("green", Some(0.0)), // illegal: first step must be None
+        ("red", Some(80.0)),
+    ]);
+}
+
+#[test]
+#[should_panic]
+fn thresholds_must_be_strictly_increasing() {
+    let _ = Panel::new("x", "x", "y", PanelType::Stat).with_absolute_thresholds(vec![
+        ("green", None),
+        ("red", Some(90.0)),
+        ("yellow", Some(80.0)), // illegal: not increasing
+    ]);
+}
+
+#[test]
+#[should_panic]
+fn amount_of_legends_must_match_amount_of_exprs() {
+    let _ = Panel::new("x", "x", "y", PanelType::Stat).with_legends(vec!["a", "b"]);
 }

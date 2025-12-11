@@ -1,9 +1,11 @@
 use cairo_vm::types::builtin_name::BuiltinName;
 use cairo_vm::vm::runners::cairo_runner::ExecutionResources;
 use starknet_api::block::{BlockInfo, FeeType};
+use starknet_api::block_hash::block_hash_calculator::TransactionOutputForHash;
 use starknet_api::core::{ContractAddress, Nonce};
 use starknet_api::data_availability::DataAvailabilityMode;
 use starknet_api::execution_resources::GasVector;
+use starknet_api::transaction::constants::VALIDATE_DEPLOY_ENTRY_POINT_SELECTOR;
 use starknet_api::transaction::fields::{
     AccountDeploymentData,
     Fee,
@@ -15,6 +17,8 @@ use starknet_api::transaction::fields::{
 };
 use starknet_api::transaction::{
     signed_tx_version,
+    RevertedTransactionExecutionStatus,
+    TransactionExecutionStatus,
     TransactionHash,
     TransactionOptions,
     TransactionVersion,
@@ -28,6 +32,7 @@ use crate::fee::fee_checks::FeeCheckError;
 use crate::fee::fee_utils::get_fee_by_gas_vector;
 use crate::fee::receipt::TransactionReceipt;
 use crate::transaction::errors::{TransactionExecutionError, TransactionPreValidationError};
+use crate::utils::add_maps;
 
 #[cfg(test)]
 #[path = "objects_test.rs"]
@@ -52,6 +57,14 @@ macro_rules! implement_getters {
 pub enum TransactionInfo {
     Current(CurrentTransactionInfo),
     Deprecated(DeprecatedTransactionInfo),
+}
+
+impl Default for TransactionInfo {
+    /// Creates a new transaction info with mostly default values, to be used for directly calling
+    /// contract entry points.
+    fn default() -> Self {
+        Self::Current(CurrentTransactionInfo::create_default_unlimited())
+    }
 }
 
 impl TransactionInfo {
@@ -126,18 +139,22 @@ pub struct CurrentTransactionInfo {
     pub account_deployment_data: AccountDeploymentData,
 }
 
-#[cfg(any(test, feature = "testing"))]
 impl CurrentTransactionInfo {
-    pub fn create_for_testing() -> Self {
+    pub fn create_default_unlimited() -> Self {
         Self {
             common_fields: CommonAccountFields::default(),
-            resource_bounds: ValidResourceBounds::create_for_testing_no_fee_enforcement(),
+            resource_bounds: ValidResourceBounds::new_unlimited_gas_no_fee_enforcement(),
             tip: Tip::default(),
             nonce_data_availability_mode: DataAvailabilityMode::L2,
             fee_data_availability_mode: DataAvailabilityMode::L2,
             paymaster_data: PaymasterData::default(),
             account_deployment_data: AccountDeploymentData::default(),
         }
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn create_for_testing() -> Self {
+        Self::create_default_unlimited()
     }
 }
 
@@ -199,13 +216,32 @@ pub struct TransactionExecutionInfo {
 }
 
 impl TransactionExecutionInfo {
-    // TODO(Arni): Add a flag to non_optional_call_infos to indicate the transaction
-    // type. Change the iteration order for `deploy_account` transactions.
     pub fn non_optional_call_infos(&self) -> impl Iterator<Item = &CallInfo> {
-        self.validate_call_info
-            .iter()
-            .chain(self.execute_call_info.iter())
-            .chain(self.fee_transfer_call_info.iter())
+        let execute_call_info = self.execute_call_info.as_ref().into_iter();
+        let validate_call_info = self.validate_call_info.as_ref().into_iter();
+        let fee_transfer_call_info = self.fee_transfer_call_info.as_ref().into_iter();
+
+        if self.is_deploy_account() {
+            // For deploy account transactions, the order is `execute`, `validate`, `fee_transfer`.
+            execute_call_info.chain(validate_call_info).chain(fee_transfer_call_info)
+        } else {
+            // For other transactions, the order is `validate`, `execute`, `fee_transfer`.
+            validate_call_info.chain(execute_call_info).chain(fee_transfer_call_info)
+        }
+    }
+
+    fn is_deploy_account(&self) -> bool {
+        if let Some(call_info) = self.validate_call_info.as_ref() {
+            call_info.call.entry_point_selector == *VALIDATE_DEPLOY_ENTRY_POINT_SELECTOR
+        } else {
+            false
+        }
+    }
+
+    /// Returns call infos excluding fee transfer (to avoid double-counting in bouncer
+    /// calculations).
+    pub fn non_optional_call_infos_without_fee_transfer(&self) -> impl Iterator<Item = &CallInfo> {
+        self.validate_call_info.iter().chain(self.execute_call_info.iter())
     }
 
     pub fn is_reverted(&self) -> bool {
@@ -217,7 +253,46 @@ impl TransactionExecutionInfo {
     pub fn summarize(&self, versioned_constants: &VersionedConstants) -> ExecutionSummary {
         CallInfo::summarize_many(self.non_optional_call_infos(), versioned_constants)
     }
+
+    pub fn summarize_builtins(&self) -> BuiltinCounterMap {
+        let mut builtin_counters = BuiltinCounterMap::new();
+        // Remove fee transfer builtins to avoid double-counting in `get_tx_weights`
+        // in bouncer.rs (already included in os_vm_resources).
+        for call_info_iter in self.non_optional_call_infos_without_fee_transfer() {
+            for call_info in call_info_iter.iter() {
+                add_maps(&mut builtin_counters, &call_info.builtin_counters);
+            }
+        }
+        builtin_counters
+    }
+
+    /// Information needed to compute the block hash of the block that the transaction is part of.
+    pub fn output_for_hashing(&self) -> TransactionOutputForHash {
+        let execution_status = self
+            .revert_error
+            .as_ref()
+            .map(|err| {
+                TransactionExecutionStatus::Reverted(RevertedTransactionExecutionStatus {
+                    revert_reason: err.to_string(),
+                })
+            })
+            .unwrap_or(TransactionExecutionStatus::Succeeded);
+        TransactionOutputForHash {
+            actual_fee: self.receipt.fee,
+            execution_status,
+            gas_consumed: self.receipt.gas,
+            events: self
+                .non_optional_call_infos()
+                .flat_map(|call_info| call_info.get_sorted_events())
+                .collect(),
+            messages_sent: self
+                .non_optional_call_infos()
+                .flat_map(|call_info| call_info.get_sorted_l2_to_l1_messages())
+                .collect(),
+        }
+    }
 }
+
 pub trait ExecutionResourcesTraits {
     fn total_n_steps(&self) -> usize;
     fn prover_builtins(&self) -> BuiltinCounterMap;

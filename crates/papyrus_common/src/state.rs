@@ -21,10 +21,13 @@ pub struct DeployedContract {
 
 /// A mapping from class hash to the compiled class hash.
 #[derive(Debug, Clone, Default, Eq, PartialEq, Deserialize, Serialize)]
-pub struct DeclaredClassHashEntry {
+pub struct ClassHashToCompiledClassHashEntry {
     pub class_hash: ClassHash,
     pub compiled_class_hash: CompiledClassHash,
 }
+
+pub type DeclaredClassHashEntry = ClassHashToCompiledClassHashEntry;
+pub type MigratedCompiledClassHashEntry = ClassHashToCompiledClassHashEntry;
 
 #[derive(Debug, Clone, Default, Eq, PartialEq, Deserialize, Serialize)]
 pub struct ReplacedClass {
@@ -52,7 +55,7 @@ pub fn create_random_state_diff(rng: &mut impl RngCore) -> ThinStateDiff {
                 3u64.into() => Felt::TWO, 4u64.into() => Felt::ONE
             },
         },
-        declared_classes: indexmap! { class_hash => compiled_class_hash },
+        class_hash_to_compiled_class_hash: indexmap! { class_hash => compiled_class_hash },
         deprecated_declared_classes: vec![deprecated_class_hash],
         nonces: indexmap! {
             contract0 => Nonce(Felt::ONE), contract2 => Nonce(Felt::TWO)

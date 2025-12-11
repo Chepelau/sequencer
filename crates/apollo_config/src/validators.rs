@@ -4,6 +4,7 @@ use std::path::Path;
 
 use validator::{Validate, ValidationError, ValidationErrors, ValidationErrorsKind};
 
+use crate::secrets::Sensitive;
 use crate::ConfigError;
 
 /// Custom validation for ASCII string.
@@ -32,6 +33,13 @@ pub fn validate_vec_u256(vec: &[u8]) -> Result<(), ValidationError> {
         return Err(ValidationError::new("The value is not a 32 byte vector"));
     }
     Ok(())
+}
+
+/// Validates a sensitive `Vec<u8>` to ensure it's 32 bytes.
+pub fn validate_optional_sensitive_vec_u256(
+    secret_key: &Sensitive<Vec<u8>>,
+) -> Result<(), ValidationError> {
+    validate_vec_u256(secret_key.as_ref())
 }
 
 /// Struct for parsing a validation error.
@@ -72,7 +80,7 @@ impl std::fmt::Display for ParsedValidationErrors {
             ));
         }
         error_string = error_string.replace('\"', "");
-        write!(f, "{}", error_string)
+        write!(f, "{error_string}")
     }
 }
 
@@ -106,7 +114,7 @@ fn parse_validation_error(
         let new_path = if current_path.is_empty() {
             field.to_string()
         } else {
-            format!("{}.{}", current_path, field)
+            format!("{current_path}.{field}")
         };
 
         match error {
@@ -115,11 +123,7 @@ fn parse_validation_error(
             }
             ValidationErrorsKind::List(errors) => {
                 for (index, error) in errors.iter().enumerate() {
-                    parse_validation_error(
-                        error.1,
-                        format!("{}[{}]", new_path, index),
-                        parsed_errors,
-                    );
+                    parse_validation_error(error.1, format!("{new_path}[{index}]"), parsed_errors);
                 }
             }
             ValidationErrorsKind::Field(errors) => {
@@ -131,8 +135,8 @@ fn parse_validation_error(
                         params: {
                             let params = &error.params;
                             params
-                                .iter()
-                                .map(|(_k, v)| v.to_string().replace('\"', ""))
+                                .values()
+                                .map(|v| v.to_string().replace('\"', ""))
                                 .collect::<Vec<String>>()
                                 .join(", ")
                         }

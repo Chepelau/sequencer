@@ -4,20 +4,27 @@ use std::ops::{Add, AddAssign};
 
 use cairo_vm::types::builtin_name::BuiltinName;
 use cairo_vm::vm::runners::cairo_runner::ExecutionResources;
+use itertools::Itertools;
 use serde::Serialize;
 use starknet_api::block::{BlockHash, BlockNumber};
-use starknet_api::core::{ClassHash, ContractAddress, EthAddress};
+use starknet_api::core::{ClassHash, ContractAddress, L1Address};
 use starknet_api::execution_resources::{GasAmount, GasVector};
 use starknet_api::state::StorageKey;
 use starknet_api::transaction::fields::GasVectorComputationMode;
-use starknet_api::transaction::{EventContent, L2ToL1Payload};
+use starknet_api::transaction::{
+    Event,
+    EventContent,
+    L2ToL1Payload,
+    MessageToL1 as StarknetAPIMessageToL1,
+};
 use starknet_types_core::felt::Felt;
 
 use crate::blockifier_versioned_constants::VersionedConstants;
 use crate::execution::contract_class::TrackedResource;
 use crate::execution::entry_point::CallEntryPoint;
+use crate::execution::syscalls::vm_syscall_utils::SyscallUsageMap;
 use crate::state::cached_state::StorageEntry;
-use crate::utils::{add_maps, u64_from_usize};
+use crate::utils::u64_from_usize;
 
 #[cfg_attr(feature = "transaction_serde", derive(serde::Deserialize))]
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -43,7 +50,7 @@ pub struct OrderedEvent {
 #[cfg_attr(feature = "transaction_serde", derive(serde::Deserialize))]
 #[derive(Debug, Default, Eq, PartialEq, Serialize)]
 pub struct MessageToL1 {
-    pub to_address: EthAddress,
+    pub to_address: L1Address,
     pub payload: L2ToL1Payload,
 }
 
@@ -95,6 +102,12 @@ impl EventSummary {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, derive_more::AddAssign, PartialEq)]
+pub struct CallSummary {
+    pub n_calls: u64,
+    pub n_calls_running_native: u64,
+}
+
 pub type BuiltinCounterMap = HashMap<BuiltinName, usize>;
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -104,7 +117,7 @@ pub struct ExecutionSummary {
     pub visited_storage_entries: HashSet<StorageEntry>,
     pub l2_to_l1_payload_lengths: Vec<usize>,
     pub event_summary: EventSummary,
-    pub builtin_counters: BuiltinCounterMap,
+    pub call_summary: CallSummary,
 }
 
 impl Add for ExecutionSummary {
@@ -115,8 +128,8 @@ impl Add for ExecutionSummary {
         self.executed_class_hashes.extend(other.executed_class_hashes);
         self.visited_storage_entries.extend(other.visited_storage_entries);
         self.l2_to_l1_payload_lengths.extend(other.l2_to_l1_payload_lengths);
-        add_maps(&mut self.builtin_counters, &other.builtin_counters);
         self.event_summary += other.event_summary;
+        self.call_summary += other.call_summary;
         self
     }
 }
@@ -234,6 +247,8 @@ pub struct CallInfo {
     // Tracks how many times each builtin was called during execution (excluding inner calls).
     // Used by the bouncer to decide when to close a block.
     pub builtin_counters: BuiltinCounterMap,
+    // Tracks how many times each syscall was called during execution (excluding inner calls).
+    pub syscalls_usage: SyscallUsageMap,
 }
 
 impl CallInfo {
@@ -257,7 +272,7 @@ impl CallInfo {
         let mut visited_storage_entries: HashSet<StorageEntry> = HashSet::new();
         let mut event_summary = EventSummary::default();
         let mut l2_to_l1_payload_lengths = Vec::new();
-        let mut builtin_counters = BuiltinCounterMap::new();
+        let mut call_summary = CallSummary::default();
 
         for call_info in self.iter() {
             // Class hashes.
@@ -282,11 +297,13 @@ impl CallInfo {
                     .map(|message| message.message.payload.0.len()),
             );
 
-            add_maps(&mut builtin_counters, &call_info.builtin_counters);
-
             // Events: all event resources in the execution tree, unless executing a 0.13.1 block.
             if !versioned_constants.ignore_inner_event_resources {
                 event_summary += call_info.specific_event_summary();
+            }
+            call_summary.n_calls += 1;
+            if call_info.execution.cairo_native {
+                call_summary.n_calls_running_native += 1;
             }
         }
 
@@ -307,7 +324,7 @@ impl CallInfo {
             visited_storage_entries,
             l2_to_l1_payload_lengths,
             event_summary,
-            builtin_counters,
+            call_summary,
         }
     }
 
@@ -327,6 +344,54 @@ impl CallInfo {
             acc += &inner_call.resources;
             acc
         })
+    }
+
+    /// Returns a vector of Starknet Event objects collected during the execution, sorted by the
+    /// order in which they were emitted.
+    pub fn get_sorted_events(&self) -> Vec<Event> {
+        self.iter()
+            .flat_map(|call_info| {
+                call_info.execution.events.iter().map(|OrderedEvent { order, event }| {
+                    (
+                        *order,
+                        Event {
+                            from_address: call_info.call.storage_address,
+                            content: event.clone(),
+                        },
+                    )
+                })
+            })
+            .sorted_by_key(|(order, _)| *order)
+            .map(|(_, event)| event)
+            .collect()
+    }
+
+    /// Returns a vector of Starknet MessageToL1 objects collected during the execution,
+    /// sorted by the order in which they were sent.
+    pub fn get_sorted_l2_to_l1_messages(&self) -> Vec<StarknetAPIMessageToL1> {
+        self.iter()
+            .flat_map(|call_info| {
+                call_info.execution.l2_to_l1_messages.iter().map(
+                    |OrderedL2ToL1Message {
+                         order,
+                         message: MessageToL1 { to_address, payload },
+                     }| {
+                        (
+                            *order,
+                            StarknetAPIMessageToL1 {
+                                from_address: call_info.call.storage_address,
+                                to_address: (*to_address)
+                                    .try_into()
+                                    .expect("Failed to convert L1Address to EthAddress"),
+                                payload: payload.clone(),
+                            },
+                        )
+                    },
+                )
+            })
+            .sorted_by_key(|(order, _)| *order)
+            .map(|(_, message)| message)
+            .collect()
     }
 }
 

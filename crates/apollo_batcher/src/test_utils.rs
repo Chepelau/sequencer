@@ -6,11 +6,12 @@ use blockifier::fee::receipt::TransactionReceipt;
 use blockifier::state::cached_state::CommitmentStateDiff;
 use blockifier::transaction::objects::TransactionExecutionInfo;
 use indexmap::IndexMap;
+use starknet_api::block::BlockInfo;
 use starknet_api::consensus_transaction::InternalConsensusTransaction;
 use starknet_api::execution_resources::GasAmount;
 use starknet_api::test_utils::invoke::{internal_invoke_tx, InvokeTxArgs};
 use starknet_api::test_utils::l1_handler::{executable_l1_handler_tx, L1HandlerTxArgs};
-use starknet_api::transaction::fields::Fee;
+use starknet_api::transaction::fields::{Fee, TransactionSignature};
 use starknet_api::transaction::TransactionHash;
 use starknet_api::{class_hash, contract_address, nonce, tx_hash};
 use tokio::sync::mpsc::UnboundedSender;
@@ -21,7 +22,7 @@ use crate::block_builder::{
     BlockExecutionArtifacts,
     BlockTransactionExecutionData,
 };
-use crate::transaction_provider::TransactionProvider;
+use crate::transaction_provider::{TransactionProvider, TxProviderPhase};
 
 pub const EXECUTION_INFO_LEN: usize = 10;
 pub const DUMMY_FINAL_N_EXECUTED_TXS: usize = 12;
@@ -58,12 +59,19 @@ pub(crate) struct FakeProposeBlockBuilder {
     pub output_content_sender: UnboundedSender<InternalConsensusTransaction>,
     pub output_txs: Vec<InternalConsensusTransaction>,
     pub build_block_result: Option<BlockBuilderResult<BlockExecutionArtifacts>>,
+    pub tx_provider: Box<dyn TransactionProvider>,
 }
 
 #[async_trait]
 impl BlockBuilderTrait for FakeProposeBlockBuilder {
     async fn build_block(&mut self) -> BlockBuilderResult<BlockExecutionArtifacts> {
         for tx in &self.output_txs {
+            // Skip L1 txs if the tx_provider was set to mempool phase.
+            if matches!(tx, InternalConsensusTransaction::L1Handler(_))
+                && self.tx_provider.phase() == TxProviderPhase::Mempool
+            {
+                continue;
+            }
             self.output_content_sender.send(tx.clone()).unwrap();
         }
 
@@ -95,20 +103,24 @@ pub fn test_l1_handler_txs(tx_hash_range: Range<usize>) -> Vec<InternalConsensus
 }
 
 // Create `execution_infos` with an indexed field to enable verification of the order.
-fn indexed_execution_infos() -> IndexMap<TransactionHash, TransactionExecutionInfo> {
+fn indexed_execution_infos_and_signatures()
+-> IndexMap<TransactionHash, (TransactionExecutionInfo, Option<TransactionSignature>)> {
     test_txs(0..EXECUTION_INFO_LEN)
         .iter()
         .enumerate()
         .map(|(i, tx)| {
             (
                 tx.tx_hash(),
-                TransactionExecutionInfo {
-                    receipt: TransactionReceipt {
-                        fee: Fee(i.try_into().unwrap()),
+                (
+                    TransactionExecutionInfo {
+                        receipt: TransactionReceipt {
+                            fee: Fee(i.try_into().unwrap()),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
-                    ..Default::default()
-                },
+                    None,
+                ),
             )
         })
         .collect()
@@ -128,7 +140,7 @@ impl BlockExecutionArtifacts {
         // Use a non-empty commitment_state_diff to get a valuable test verification of the result.
         Self {
             execution_data: BlockTransactionExecutionData {
-                execution_infos: indexed_execution_infos(),
+                execution_infos_and_signatures: indexed_execution_infos_and_signatures(),
                 rejected_tx_hashes: test_txs(10..15).iter().map(|tx| tx.tx_hash()).collect(),
                 consumed_l1_handler_tx_hashes: Default::default(),
             },
@@ -146,7 +158,9 @@ impl BlockExecutionArtifacts {
             l2_gas_used: GasAmount::default(),
             casm_hash_computation_data_sierra_gas: CasmHashComputationData::empty(),
             casm_hash_computation_data_proving_gas: CasmHashComputationData::empty(),
+            compiled_class_hashes_for_migration: vec![],
             final_n_executed_txs: DUMMY_FINAL_N_EXECUTED_TXS,
+            block_info: BlockInfo::create_for_testing(),
         }
     }
 }

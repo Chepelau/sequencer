@@ -23,7 +23,7 @@ pub enum HttpServerRunError {
 #[derive(Error, Debug)]
 pub enum HttpServerError {
     #[error(transparent)]
-    GatewayClientError(#[from] GatewayClientError),
+    GatewayClientError(#[from] Box<GatewayClientError>),
     #[error(transparent)]
     DeserializationError(#[from] serde_json::Error),
     #[error(transparent)]
@@ -33,7 +33,7 @@ pub enum HttpServerError {
 impl IntoResponse for HttpServerError {
     fn into_response(self) -> Response {
         match self {
-            HttpServerError::GatewayClientError(e) => gw_client_err_into_response(e),
+            HttpServerError::GatewayClientError(e) => gw_client_err_into_response(*e),
             HttpServerError::DeserializationError(e) => serde_error_into_response(e),
             HttpServerError::DecompressionError(e) => compression_error_into_response(e),
         }
@@ -70,10 +70,10 @@ fn serde_error_into_response(err: serde_json::Error) -> Response {
 
 fn gw_client_err_into_response(err: GatewayClientError) -> Response {
     let (response_code, deprecated_gateway_error) = match err {
-        GatewayClientError::ClientError(e) => {
-            error!("Encountered a ClientError: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, StarknetError::internal("Internal error"))
-        }
+        GatewayClientError::ClientError(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StarknetError::internal_with_logging("Failed to process client request", e),
+        ),
         GatewayClientError::GatewayError(GatewayError::DeprecatedGatewayError {
             source,
             p2p_message_metadata: _,
@@ -90,14 +90,16 @@ fn gw_client_err_into_response(err: GatewayClientError) -> Response {
 }
 
 /// Serializes a `StarknetError` into an HTTP response, encode the error message
-/// to defend potential Cross-Site risks. We replace all non-alphanumeric except some punctuation
-/// characters with `?`.
+/// to defend potential Cross-Site risks.
 fn serialize_error(error: &StarknetError) -> Response {
-    let re = Regex::new(r"[^a-zA-Z0-9 :.,\[\]]").unwrap();
-    let sanitized_error = StarknetError {
-        code: error.code.clone(),
-        message: format!("{}", re.replace_all(&error.message, "?")),
-    };
+    let quote_re = Regex::new(r#"[\"`]"#).unwrap(); // " and ` => ' (single quote)
+    let sanitize_re = Regex::new(r#"[^a-zA-Z0-9 :.,\[\]\(\)\{\}'_]"#).unwrap(); // All other non-alphanumeric characters except [:.,[](){}]_ => ' ' (space)
+
+    let mut message = error.message.clone();
+    message = quote_re.replace_all(&message, "'").to_string();
+    message = sanitize_re.replace_all(&message, " ").to_string();
+
+    let sanitized_error = StarknetError { code: error.code.clone(), message };
 
     serde_json::to_vec(&sanitized_error)
         .expect("Expecting a serializable StarknetError.")

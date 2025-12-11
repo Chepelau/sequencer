@@ -25,9 +25,10 @@ use futures_util::pin_mut;
 use indexmap::{indexmap, IndexMap};
 use lru::LruCache;
 use mockall::predicate;
+use papyrus_common::state::MigratedCompiledClassHashEntry;
 use pretty_assertions::assert_eq;
 use reqwest::StatusCode;
-use starknet_api::block::{BlockHash, BlockNumber};
+use starknet_api::block::{BlockHash, BlockHashAndNumber, BlockNumber};
 use starknet_api::core::{ClassHash, CompiledClassHash, GlobalRoot, Nonce, SequencerPublicKey};
 use starknet_api::crypto::utils::PublicKey;
 use starknet_api::deprecated_contract_class::ContractClass as DeprecatedContractClass;
@@ -48,11 +49,8 @@ async fn last_block_number() {
 
     // We need to perform all the mocks before moving the mock into central_source.
     const EXPECTED_LAST_BLOCK_NUMBER: BlockNumber = BlockNumber(0);
-    mock.expect_latest_block().times(1).returning(|| {
-        Ok(Some(Block::PostV0_13_1(BlockPostV0_13_1 {
-            block_number: EXPECTED_LAST_BLOCK_NUMBER,
-            ..Default::default()
-        })))
+    mock.expect_latest_block_number_and_hash().times(1).returning(|| {
+        Ok(Some(BlockHashAndNumber { number: EXPECTED_LAST_BLOCK_NUMBER, ..Default::default() }))
     });
 
     let ((reader, _), _temp_dir) = get_test_storage();
@@ -124,7 +122,7 @@ async fn stream_block_headers_some_are_missing() {
         (false, true, "signature missing"),
     ];
     for (block_missing, signature_missing, test_case_description) in test_cases {
-        println!("Test case: {}", test_case_description);
+        println!("Test case: {test_case_description}");
         const START_BLOCK_NUMBER: u64 = 5;
         const END_BLOCK_NUMBER: u64 = 13;
         const MISSING_BLOCK_NUMBER: u64 = 9;
@@ -303,6 +301,8 @@ async fn stream_state_updates() {
     let new_class_hash2 = class_hash!("0x222");
     let compiled_class_hash1 = CompiledClassHash(felt!("0x00111"));
     let compiled_class_hash2 = CompiledClassHash(felt!("0x00222"));
+    let migrated_class_hash = class_hash!("0x333");
+    let migrated_compiled_class_hash = CompiledClassHash(felt!("0x00333"));
     let class_hash_entry1 = DeclaredClassHashEntry {
         class_hash: new_class_hash1,
         compiled_class_hash: compiled_class_hash1,
@@ -320,6 +320,10 @@ async fn stream_state_updates() {
         ],
         old_declared_contracts: vec![class_hash1, class_hash3],
         declared_classes: vec![class_hash_entry1, class_hash_entry2],
+        migrated_compiled_classes: vec![MigratedCompiledClassHashEntry {
+            class_hash: migrated_class_hash,
+            compiled_class_hash: migrated_compiled_class_hash,
+        }],
         nonces: IndexMap::from([(contract_address1, nonce1)]),
         replaced_classes: vec![ReplacedClass {
             address: contract_address3,
@@ -444,6 +448,10 @@ async fn stream_state_updates() {
         state_diff.declared_classes,
     );
     assert_eq!(IndexMap::from([(contract_address1, nonce1)]), state_diff.nonces);
+    assert_eq!(
+        IndexMap::from([(migrated_class_hash, migrated_compiled_class_hash)]),
+        state_diff.migrated_compiled_classes
+    );
 
     let Some(Ok(state_diff_tuple)) = stream.next().await else {
         panic!("Match of streamed state_update failed!");
@@ -468,7 +476,7 @@ async fn stream_compiled_classes() {
             ThinStateDiff {
                 deployed_contracts: indexmap! {},
                 storage_diffs: indexmap! {},
-                declared_classes: indexmap! {
+                class_hash_to_compiled_class_hash: indexmap! {
                     class_hash!("0x0") => CompiledClassHash(felt!("0x0")),
                     class_hash!("0x1") => CompiledClassHash(felt!("0x1")),
                 },
@@ -482,7 +490,7 @@ async fn stream_compiled_classes() {
             ThinStateDiff {
                 deployed_contracts: indexmap! {},
                 storage_diffs: indexmap! {},
-                declared_classes: indexmap! {
+                class_hash_to_compiled_class_hash: indexmap! {
                     class_hash!("0x2") => CompiledClassHash(felt!("0x2")),
                     class_hash!("0x3") => CompiledClassHash(felt!("0x3")),
                 },

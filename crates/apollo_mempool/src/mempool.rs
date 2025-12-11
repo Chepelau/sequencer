@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use apollo_mempool_config::config::{MempoolConfig, MempoolDynamicConfig};
 use apollo_mempool_types::errors::MempoolError;
 use apollo_mempool_types::mempool_types::{
     AccountState,
@@ -9,30 +10,36 @@ use apollo_mempool_types::mempool_types::{
     MempoolResult,
     MempoolSnapshot,
     MempoolStateSnapshot,
+    ValidationArgs,
 };
 use apollo_time::time::{Clock, DateTime};
 use indexmap::IndexSet;
 use rand::{thread_rng, Rng};
 use starknet_api::block::GasPrice;
 use starknet_api::core::{ContractAddress, Nonce};
-use starknet_api::rpc_transaction::{InternalRpcTransaction, InternalRpcTransactionWithoutTxHash};
+use starknet_api::rpc_transaction::{
+    InternalRpcTransaction,
+    InternalRpcTransactionLabelValue,
+    InternalRpcTransactionWithoutTxHash,
+};
 use starknet_api::transaction::fields::Tip;
 use starknet_api::transaction::TransactionHash;
 use tracing::{debug, info, instrument, trace};
 
-use crate::config::MempoolConfig;
 use crate::metrics::{
     metric_count_committed_txs,
+    metric_count_evicted_txs,
     metric_count_expired_txs,
     metric_count_rejected_txs,
     metric_set_get_txs_size,
-    MempoolMetricHandle,
+    LABEL_NAME_TX_TYPE,
     MEMPOOL_DELAYED_DECLARES_SIZE,
-    MEMPOOL_EVICTIONS_COUNT,
     MEMPOOL_PENDING_QUEUE_SIZE,
     MEMPOOL_POOL_SIZE,
     MEMPOOL_PRIORITY_QUEUE_SIZE,
     MEMPOOL_TOTAL_SIZE_BYTES,
+    MEMPOOL_TRANSACTIONS_RECEIVED,
+    TRANSACTION_TIME_SPENT_UNTIL_BATCHED,
 };
 use crate::transaction_pool::TransactionPool;
 use crate::transaction_queue::TransactionQueue;
@@ -256,7 +263,7 @@ impl Mempool {
             tx_pool: TransactionPool::new(clock.clone()),
             tx_queue: TransactionQueue::default(),
             accounts_with_gap: AccountsWithGap::new(),
-            state: MempoolState::new(config.committed_nonce_retention_block_count),
+            state: MempoolState::new(config.static_config.committed_nonce_retention_block_count),
             clock,
         }
     }
@@ -293,16 +300,28 @@ impl Mempool {
             self.state.stage(tx_reference)?;
         }
 
-        info!(
-            "Returned {} out of {n_txs} transactions, ready for sequencing.",
-            eligible_tx_references.len()
-        );
-        debug!(
-            "Returned mempool txs: {:?}",
-            eligible_tx_references.iter().map(|tx| tx.tx_hash).collect::<Vec<_>>()
-        );
+        let n_returned_txs = eligible_tx_references.len();
+        if n_returned_txs != 0 {
+            info!("Returned {n_returned_txs} out of {n_txs} transactions, ready for sequencing.");
+            debug!(
+                "Returned mempool txs: {:?}",
+                eligible_tx_references.iter().map(|tx| tx.tx_hash).collect::<Vec<_>>()
+            );
+            let batched_at = self.clock.now();
+            for tx_ref in &eligible_tx_references {
+                let submission_time = self
+                    .tx_pool
+                    .get_submission_time(tx_ref.tx_hash)
+                    .expect("Transaction must still be in Mempool when recording batched latency");
+                let time_spent = (batched_at - submission_time)
+                    .to_std()
+                    .expect("batched_at must be later than submission_time")
+                    .as_secs_f64();
+                TRANSACTION_TIME_SPENT_UNTIL_BATCHED.record(time_spent);
+            }
+        }
 
-        metric_set_get_txs_size(eligible_tx_references.len());
+        metric_set_get_txs_size(n_returned_txs);
         self.update_state_metrics();
         self.update_accounts_with_gap(account_nonce_updates);
 
@@ -315,6 +334,15 @@ impl Mempool {
             })
             .cloned() // Soft-delete: return without deleting from mempool.
             .collect())
+    }
+
+    /// Perform validation-only of an incoming transaction (without changing the state).
+    pub fn validate_tx(&mut self, args: ValidationArgs) -> MempoolResult<()> {
+        let tx_reference = (&args).into();
+        self.validate_incoming_tx(tx_reference, args.account_nonce)?;
+        self.handle_fee_escalation(tx_reference, true)?;
+
+        Ok(())
     }
 
     /// Adds a new transaction to the mempool.
@@ -330,22 +358,22 @@ impl Mempool {
         err
     )]
     pub fn add_tx(&mut self, args: AddTransactionArgs) -> MempoolResult<()> {
-        let mut metric_handle = MempoolMetricHandle::new(&args.tx.tx);
-        metric_handle.count_transaction_received();
-
         // First remove old transactions from the pool.
         let mut account_nonce_updates = self.remove_expired_txs();
         self.add_ready_declares();
 
         let tx_reference = TransactionReference::new(&args.tx);
         self.validate_incoming_tx(tx_reference, args.account_state.nonce)?;
-        self.handle_fee_escalation(&args.tx)?;
+        self.handle_fee_escalation(tx_reference, false)?;
 
         if self.exceeds_capacity(&args.tx) {
             self.handle_capacity_overflow(&args.tx, args.account_state.nonce)?;
         }
 
-        metric_handle.transaction_inserted();
+        MEMPOOL_TRANSACTIONS_RECEIVED.increment(
+            1,
+            &[(LABEL_NAME_TX_TYPE, InternalRpcTransactionLabelValue::from(&args.tx.tx).into())],
+        );
 
         // May override a removed queued nonce with the received account nonce or the account's
         // state nonce.
@@ -366,7 +394,7 @@ impl Mempool {
     }
 
     fn insert_to_tx_queue(&mut self, tx_reference: TransactionReference) {
-        self.tx_queue.insert(tx_reference, self.config.override_gas_price_threshold_check);
+        self.tx_queue.insert(tx_reference, self.config.static_config.validate_resource_bounds);
     }
 
     fn add_tx_inner(&mut self, args: AddTransactionArgs) {
@@ -394,7 +422,7 @@ impl Mempool {
     fn add_ready_declares(&mut self) {
         let now = self.clock.now();
         while let Some((submission_time, _args)) = self.delayed_declares.front() {
-            if now - self.config.declare_delay < *submission_time {
+            if now - self.config.static_config.declare_delay < *submission_time {
                 break;
             }
             let (_submission_time, args) =
@@ -431,7 +459,7 @@ impl Mempool {
             }
 
             // Remove from pool.
-            let n_removed_txs = self.tx_pool.remove_up_to_nonce(address, next_nonce);
+            let n_removed_txs = self.tx_pool.remove_up_to_nonce_when_committed(address, next_nonce);
             metric_count_committed_txs(n_removed_txs);
 
             // Maybe close nonce gap.
@@ -517,6 +545,10 @@ impl Mempool {
         Ok(())
     }
 
+    pub(crate) fn update_dynamic_config(&mut self, mempool_dynamic_config: MempoolDynamicConfig) {
+        self.config.dynamic_config = mempool_dynamic_config;
+    }
+
     fn validate_commitment(&self, address: ContractAddress, next_nonce: Nonce) {
         self.state.validate_commitment(address, next_nonce);
     }
@@ -541,17 +573,24 @@ impl Mempool {
         Ok(())
     }
 
-    /// If this transaction is already in the pool but the fees have increased beyond the thereshold
-    /// in the config, remove the existing transaction from the queue and the pool.
+    /// This method checks if an incoming transaction with the same (address, nonce) already exists
+    /// in the pool and determines whether the incoming transaction should replace it based on fee
+    /// escalation rules.
+    /// If `validation_only` is `true`, only validates whether replacement would be allowed without
+    /// actually removing the existing transaction. If `false`, removes the existing transaction
+    /// when replacement is valid.
     /// Note: This method will **not** add the new incoming transaction.
-    #[instrument(level = "debug", skip(self, incoming_tx), err)]
-    fn handle_fee_escalation(&mut self, incoming_tx: &InternalRpcTransaction) -> MempoolResult<()> {
-        let incoming_tx_reference = TransactionReference::new(incoming_tx);
+    #[instrument(level = "debug", skip(self), err)]
+    fn handle_fee_escalation(
+        &mut self,
+        incoming_tx_reference: TransactionReference,
+        validation_only: bool,
+    ) -> MempoolResult<()> {
         let TransactionReference { address, nonce, .. } = incoming_tx_reference;
 
         self.validate_no_delayed_declare_front_run(incoming_tx_reference)?;
 
-        if !self.config.enable_fee_escalation {
+        if !self.config.static_config.enable_fee_escalation {
             if self.tx_pool.get_by_address_and_nonce(address, nonce).is_some() {
                 return Err(MempoolError::DuplicateNonce { address, nonce });
             };
@@ -566,12 +605,16 @@ impl Mempool {
         };
 
         if !self.should_replace_tx(&existing_tx_reference, &incoming_tx_reference) {
-            debug!(
-                "{existing_tx_reference} was not replaced by {incoming_tx_reference} due to
-                insufficient fee escalation."
+            info!(
+                "{existing_tx_reference} was not replaced by {incoming_tx_reference} due to \
+                 insufficient fee escalation."
             );
             // TODO(Elin): consider adding a more specific error type / message.
             return Err(MempoolError::DuplicateNonce { address, nonce });
+        }
+
+        if validation_only {
+            return Ok(());
         }
 
         debug!("{existing_tx_reference} will be replaced by {incoming_tx_reference}.");
@@ -599,7 +642,7 @@ impl Mempool {
     }
 
     fn increased_enough(&self, existing_value: u128, incoming_value: u128) -> bool {
-        let percentage = u128::from(self.config.fee_escalation_percentage);
+        let percentage = u128::from(self.config.static_config.fee_escalation_percentage);
 
         // Note: To reduce precision loss, we first multiply by the percentage and then divide by
         // 100. This could cause an overflow and an automatic rejection of the transaction, but the
@@ -616,12 +659,24 @@ impl Mempool {
         incoming_value >= escalation_qualified_value
     }
 
+    #[instrument(skip_all, parent = None)]
+    fn log_and_count_expired_txs(&self, expired_txs: &[TransactionReference]) {
+        if !expired_txs.is_empty() {
+            metric_count_expired_txs(expired_txs.len());
+            info!(
+                "Removed expired transactions: {:?}",
+                expired_txs.iter().map(|tx| tx.tx_hash).collect::<Vec<_>>()
+            );
+        }
+    }
+
     fn remove_expired_txs(&mut self) -> AddressToNonce {
-        let removed_txs =
-            self.tx_pool.remove_txs_older_than(self.config.transaction_ttl, &self.state.staged);
+        let removed_txs = self
+            .tx_pool
+            .remove_txs_older_than(self.config.dynamic_config.transaction_ttl, &self.state.staged);
         let queued_txs = self.tx_queue.remove_txs(&removed_txs);
 
-        metric_count_expired_txs(removed_txs.len());
+        self.log_and_count_expired_txs(&removed_txs);
         self.update_state_metrics();
         queued_txs
             .into_iter()
@@ -638,7 +693,7 @@ impl Mempool {
     ) -> (Vec<TransactionReference>, AddressToNonce) {
         // Divide the chunk into transactions that are old and no longer valid and those that
         // remain valid.
-        let submission_cutoff_time = self.clock.now() - self.config.transaction_ttl;
+        let submission_cutoff_time = self.clock.now() - self.config.dynamic_config.transaction_ttl;
         let (old_txs, valid_txs): (Vec<_>, Vec<_>) = txs.into_iter().partition(|tx| {
             let tx_submission_time = self
                 .tx_pool
@@ -648,7 +703,7 @@ impl Mempool {
         });
 
         // Remove old transactions from the pool.
-        metric_count_expired_txs(old_txs.len());
+        self.log_and_count_expired_txs(&old_txs);
         let account_nonce_updates: AddressToNonce = old_txs
             .into_iter()
             .map(|tx| {
@@ -682,7 +737,7 @@ impl Mempool {
 
     // Returns true if the mempool will exceeds its capacity by adding the given transaction.
     fn exceeds_capacity(&self, tx: &InternalRpcTransaction) -> bool {
-        self.size_in_bytes() + tx.total_bytes() > self.config.capacity_in_bytes
+        self.size_in_bytes() + tx.total_bytes() > self.config.static_config.capacity_in_bytes
     }
 
     fn update_accounts_with_gap(&mut self, address_to_nonce: AddressToNonce) {
@@ -735,7 +790,7 @@ impl Mempool {
                     .remove(tx_ref.tx_hash)
                     .expect("Transaction must exist in the pool.");
                 total_space_freed += tx.total_bytes();
-                MEMPOOL_EVICTIONS_COUNT.increment(1);
+                metric_count_evicted_txs(1);
                 if total_space_freed >= required_space {
                     break;
                 }
@@ -825,13 +880,25 @@ impl TransactionReference {
     }
 }
 
+impl From<&ValidationArgs> for TransactionReference {
+    fn from(args: &ValidationArgs) -> Self {
+        TransactionReference {
+            address: args.address,
+            nonce: args.tx_nonce,
+            tx_hash: args.tx_hash,
+            tip: args.tip,
+            max_l2_gas_price: args.max_l2_gas_price,
+        }
+    }
+}
+
 impl std::fmt::Display for TransactionReference {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let TransactionReference { address, nonce, tx_hash, tip, max_l2_gas_price } = self;
         write!(
             f,
-            "TransactionReference {{ address: {address}, nonce: {nonce}, tx_hash: {tx_hash},
-            tip: {tip}, max_l2_gas_price: {max_l2_gas_price} }}"
+            "TransactionReference {{ address: {address}, nonce: {nonce}, tx_hash: {tx_hash}, tip: \
+             {tip}, max_l2_gas_price: {max_l2_gas_price} }}"
         )
     }
 }

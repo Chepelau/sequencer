@@ -5,7 +5,8 @@ use std::time::Instant;
 use apollo_infra_utils::tracing::LogCompatibleToStringExt;
 use itertools::FoldWhile::{Continue, Done};
 use itertools::Itertools;
-use starknet_api::block::BlockHashAndNumber;
+use starknet_api::block::{BlockHashAndNumber, BlockInfo};
+use starknet_api::core::CompiledClassHash;
 use thiserror::Error;
 
 use crate::blockifier::block::pre_process_block;
@@ -15,6 +16,7 @@ use crate::concurrency::worker_logic::WorkerExecutor;
 use crate::concurrency::worker_pool::WorkerPool;
 use crate::context::BlockContext;
 use crate::state::cached_state::{CachedState, CommitmentStateDiff, StateMaps, TransactionalState};
+use crate::state::compiled_class_hash_migration::CompiledClassHashMigrationUpdater;
 use crate::state::errors::StateError;
 use crate::state::state_api::{StateReader, StateResult};
 use crate::state::stateful_compression::{allocate_aliases_in_storage, compress, CompressionError};
@@ -22,7 +24,6 @@ use crate::transaction::errors::TransactionExecutionError;
 use crate::transaction::objects::TransactionExecutionInfo;
 use crate::transaction::transaction_execution::Transaction;
 use crate::transaction::transactions::ExecutableTransaction;
-
 #[cfg(test)]
 #[path = "transaction_executor_test.rs"]
 pub mod transaction_executor_test;
@@ -47,6 +48,8 @@ pub enum TransactionExecutorError {
 impl LogCompatibleToStringExt for TransactionExecutorError {}
 
 pub type TransactionExecutorResult<T> = Result<T, TransactionExecutorError>;
+pub type CompiledClassHashV2ToV1 = (CompiledClassHash, CompiledClassHash);
+pub type CompiledClassHashesForMigration = Vec<CompiledClassHashV2ToV1>;
 
 #[cfg_attr(test, derive(PartialEq))]
 #[derive(Debug)]
@@ -56,6 +59,8 @@ pub struct BlockExecutionSummary {
     pub bouncer_weights: BouncerWeights,
     pub casm_hash_computation_data_sierra_gas: CasmHashComputationData,
     pub casm_hash_computation_data_proving_gas: CasmHashComputationData,
+    pub compiled_class_hashes_for_migration: CompiledClassHashesForMigration,
+    pub block_info: BlockInfo,
 }
 
 /// A transaction executor, used for building a single block.
@@ -140,7 +145,6 @@ impl<S: StateReader> TransactionExecutor<S> {
     /// Executes the given transaction on the state maintained by the executor.
     /// Returns the execution result (info or error) if there is room for the transaction;
     /// Otherwise, returns BlockFull error.
-    #[allow(clippy::result_large_err)]
     pub fn execute(
         &mut self,
         tx: &Transaction,
@@ -161,6 +165,7 @@ impl<S: StateReader> TransactionExecutor<S> {
                     &transactional_state,
                     &tx_state_changes_keys,
                     &tx_execution_info.summarize(&self.block_context.versioned_constants),
+                    &tx_execution_info.summarize_builtins(),
                     &tx_execution_info.receipt.resources,
                     &self.block_context.versioned_constants,
                 )?;
@@ -201,7 +206,6 @@ impl<S: StateReader> TransactionExecutor<S> {
 
     /// Returns the state diff and the block weights.
     // TODO(Aner): Consume "self", i.e., remove the reference, after removing the native blockifier.
-    #[allow(clippy::result_large_err)]
     pub fn finalize(&mut self) -> TransactionExecutorResult<BlockExecutionSummary> {
         finalize_block(
             &self.bouncer,
@@ -211,7 +215,6 @@ impl<S: StateReader> TransactionExecutor<S> {
     }
 
     #[cfg(feature = "reexecution")]
-    #[allow(clippy::result_large_err)]
     pub fn non_consuming_finalize(&mut self) -> TransactionExecutorResult<BlockExecutionSummary> {
         finalize_block(
             &self.bouncer,
@@ -227,13 +230,18 @@ fn lock_bouncer(bouncer: &Arc<Mutex<Bouncer>>) -> MutexGuard<'_, Bouncer> {
 
 /// Finalizes the creation of a block.
 /// Returns the state diff and the block weights.
-#[allow(clippy::result_large_err)]
 pub(crate) fn finalize_block<S: StateReader>(
     bouncer: &Arc<Mutex<Bouncer>>,
     block_state: &mut CachedState<S>,
     block_context: &BlockContext,
 ) -> TransactionExecutorResult<BlockExecutionSummary> {
-    log::debug!("Final block weights: {:?}.", lock_bouncer(bouncer).get_accumulated_weights());
+    let bouncer = lock_bouncer(bouncer);
+    log::info!(
+        "Block {} final weights: {:?}.",
+        block_context.block_info.block_number,
+        bouncer.get_bouncer_weights()
+    );
+
     let alias_contract_address = block_context
         .versioned_constants
         .os_constants
@@ -242,7 +250,27 @@ pub(crate) fn finalize_block<S: StateReader>(
     if block_context.versioned_constants.enable_stateful_compression {
         allocate_aliases_in_storage(block_state, alias_contract_address)?;
     }
+
+    let mut bouncer = bouncer;
+    let class_hashes_to_migrate = mem::take(bouncer.get_mut_class_hashes_to_migrate());
+    #[cfg(any(test, feature = "testing"))]
+    if !class_hashes_to_migrate.is_empty() {
+        log::info!(
+            "Class hashes to migrate (key = class_hash, value = (compiled_class_hash_v2, \
+             compiled_class_hash_v1)): {class_hashes_to_migrate:#?}"
+        );
+    }
+
+    if !block_context.versioned_constants.enable_casm_hash_migration {
+        assert!(
+            class_hashes_to_migrate.is_empty(),
+            "Class hashes to migrate should be empty when migration is disabled"
+        );
+    }
+    block_state.set_compiled_class_hash_migration(&class_hashes_to_migrate)?;
+
     let state_diff = block_state.to_state_diff()?.state_maps;
+
     let compressed_state_diff = if block_context.versioned_constants.enable_stateful_compression {
         Some(compress(&state_diff, block_state, alias_contract_address)?.into())
     } else {
@@ -251,11 +279,11 @@ pub(crate) fn finalize_block<S: StateReader>(
 
     // Take CasmHashComputationData from bouncer,
     // and verify that class hashes are the same.
-    let mut bouncer = lock_bouncer(bouncer);
     let casm_hash_computation_data_sierra_gas =
-        mem::take(&mut bouncer.casm_hash_computation_data_sierra_gas);
+        mem::take(bouncer.get_mut_casm_hash_computation_data_sierra_gas());
     let casm_hash_computation_data_proving_gas =
-        mem::take(&mut bouncer.casm_hash_computation_data_proving_gas);
+        mem::take(bouncer.get_mut_casm_hash_computation_data_proving_gas());
+
     assert_eq!(
         casm_hash_computation_data_sierra_gas
             .class_hash_to_casm_hash_computation_gas
@@ -270,9 +298,11 @@ pub(crate) fn finalize_block<S: StateReader>(
     Ok(BlockExecutionSummary {
         state_diff: state_diff.into(),
         compressed_state_diff,
-        bouncer_weights: *bouncer.get_accumulated_weights(),
+        bouncer_weights: *bouncer.get_bouncer_weights(),
         casm_hash_computation_data_sierra_gas,
         casm_hash_computation_data_proving_gas,
+        compiled_class_hashes_for_migration: class_hashes_to_migrate.into_values().collect(),
+        block_info: block_context.block_info.clone(),
     })
 }
 
@@ -304,14 +334,12 @@ impl<S: StateReader + Send + Sync> TransactionExecutor<S> {
             assert!(
                 chunk_size > 0,
                 "When running transactions concurrently the chunk size must be greater than 0. It \
-                 equals {:?} ",
-                chunk_size
+                 equals {chunk_size:?} "
             );
             assert!(
                 n_workers > 0,
                 "When running transactions concurrently the number of workers must be greater \
-                 than 0. It equals {:?} ",
-                n_workers
+                 than 0. It equals {n_workers:?} "
             );
             txs.chunks(chunk_size)
                 .fold_while(Vec::new(), |mut results, chunk| {

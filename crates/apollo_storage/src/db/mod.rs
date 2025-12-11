@@ -43,7 +43,7 @@ use self::table_types::{DbCursor, DbCursorTrait};
 use crate::db::table_types::TableType;
 
 // Maximum number of Sub-Databases.
-const MAX_DBS: usize = 20;
+const MAX_DBS: usize = 25;
 
 // Note that NO_TLS mode is used by default.
 type EnvironmentKind = WriteMap;
@@ -59,7 +59,7 @@ pub struct DbConfig {
     /// chain id.
     pub path_prefix: PathBuf,
     /// The [chain id](https://docs.rs/starknet_api/latest/starknet_api/core/struct.ChainId.html) of the Starknet network.
-    #[validate(custom = "validate_ascii")]
+    #[validate(custom(function = "validate_ascii"))]
     pub chain_id: ChainId,
     /// Whether to enforce that the path exists. If true, `open_env` fails when the mdbx.dat file
     /// does not exist.
@@ -70,6 +70,8 @@ pub struct DbConfig {
     pub max_size: usize,
     /// The growth step of the database.
     pub growth_step: isize,
+    /// The maximum number of readers used by the database.
+    pub max_readers: u32,
 }
 
 impl Default for DbConfig {
@@ -82,6 +84,7 @@ impl Default for DbConfig {
             min_size: 1 << 20,    // 1MB
             max_size: 1 << 40,    // 1TB
             growth_step: 1 << 32, // 4GB
+            max_readers: 1 << 13, // 8K readers
         }
     }
 }
@@ -126,6 +129,12 @@ impl SerializeConfig for DbConfig {
                 &self.growth_step,
                 "The growth step in bytes, must be greater than zero to allow the database to \
                  grow.",
+                ParamPrivacyInput::Public,
+            ),
+            ser_param(
+                "max_readers",
+                &self.max_readers,
+                "The maximum number of readers used by the database.",
                 ParamPrivacyInput::Public,
             ),
         ])
@@ -183,7 +192,7 @@ pub struct KeyAlreadyExistsError {
 impl KeyAlreadyExistsError {
     /// Creates a new KeyAlreadyExistsError.
     pub fn new(table_name: &'static str, key: &impl Debug, value: &impl Debug) -> Self {
-        Self { table_name, key: format!("{:?}", key), value: format!("{:?}", value) }
+        Self { table_name, key: format!("{key:?}"), value: format!("{value:?}") }
     }
 }
 
@@ -196,7 +205,7 @@ pub(crate) fn open_env(config: &DbConfig) -> DbResult<(DbReader, DbWriter)> {
     if config.enforce_file_exists && !db_file_path.exists() {
         return Err(DbError::FileDoesNotExist(db_file_path));
     }
-    const MAX_READERS: u32 = 1 << 13; // 8K readers
+
     let env = Arc::new(
         Environment::new()
             .set_geometry(Geometry {
@@ -206,13 +215,15 @@ pub(crate) fn open_env(config: &DbConfig) -> DbResult<(DbReader, DbWriter)> {
                 ..Default::default()
             })
             .set_max_tables(MAX_DBS)
-            .set_max_readers(MAX_READERS)
+            .set_max_readers(config.max_readers)
             .set_flags(DatabaseFlags {
                 // There is no locality of pages in the database almost at all, so readahead will
                 // fill the RAM with garbage.
                 no_rdahead: true,
                 // LIFO policy for recycling a Garbage Collection items should be faster.
                 liforeclaim: true,
+                // Exclusive access - prevent other processes from opening the same database.
+                exclusive: true,
                 ..Default::default()
             })
             .open(&config.path())?,

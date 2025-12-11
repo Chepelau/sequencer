@@ -261,6 +261,7 @@ fn client_to_central_state_update(
                 old_declared_contracts: old_declared_contract_hashes,
                 nonces,
                 replaced_classes,
+                migrated_compiled_classes,
             } = state_update.state_diff;
 
             // Separate the declared classes to new classes, old classes and classes of deployed
@@ -297,6 +298,10 @@ fn client_to_central_state_update(
                     .map(|((class_hash, class), compiled_class_hash)| {
                         (class_hash, (compiled_class_hash, class))
                     })
+                    .collect(),
+                migrated_compiled_classes: migrated_compiled_classes
+                    .into_iter()
+                    .map(|entry| (entry.class_hash, entry.compiled_class_hash))
                     .collect(),
                 deprecated_declared_classes: deprecated_classes
                     .into_iter()
@@ -358,7 +363,7 @@ async fn download_class_if_necessary<TStarknetClient: StarknetReader>(
 
     // Check declared classes.
     if let Ok(Some(class)) = state_reader.get_class_definition_at(state_number, &class_hash) {
-        trace!("Class {:?} retrieved from storage.", class_hash);
+        trace!("Class {class_hash:?} retrieved from storage.");
         {
             let mut cache = cache.lock().expect("Failed to lock class cache.");
             cache.put(class_hash, ApiContractClass::ContractClass(class.clone()));
@@ -370,16 +375,17 @@ async fn download_class_if_necessary<TStarknetClient: StarknetReader>(
     if let Ok(Some(class)) =
         state_reader.get_deprecated_class_definition_at(state_number, &class_hash)
     {
-        trace!("Deprecated class {:?} retrieved from storage.", class_hash);
+        trace!("Deprecated class {class_hash:?} retrieved from storage.");
         {
             let mut cache = cache.lock().expect("Failed to lock class cache.");
             cache.put(class_hash, ApiContractClass::DeprecatedContractClass(class.clone()));
         }
         return Ok(Some(ApiContractClass::DeprecatedContractClass(class)));
     }
+    drop(txn); // Drop txn so we don't unnecessarily hold it open while awaiting below.
 
     // Class not found in storage - download.
-    trace!("Downloading class {:?}.", class_hash);
+    trace!("Downloading class {class_hash:?}.");
     let client_class = apollo_starknet_client.class_by_hash(class_hash).await.map_err(Arc::new)?;
     match client_class {
         None => Ok(None),

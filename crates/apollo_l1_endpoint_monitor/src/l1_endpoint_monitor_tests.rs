@@ -1,12 +1,11 @@
+use std::time::Duration;
+
+use apollo_l1_endpoint_monitor_config::config::L1EndpointMonitorConfig;
+use apollo_l1_endpoint_monitor_types::L1EndpointMonitorError;
 use mockito::{Matcher, Server, ServerGuard};
 use url::Url;
 
-use crate::monitor::{
-    L1EndpointMonitor,
-    L1EndpointMonitorConfig,
-    L1EndpointMonitorError,
-    HEALTH_CHECK_RPC_METHOD,
-};
+use crate::monitor::{L1EndpointMonitor, HEALTH_CHECK_RPC_METHOD};
 
 // Unreachable localhost endpoints for simulating failures.
 // Using localhost to prevent IO (so don't switch to example.com in order to avoid port issues).
@@ -30,6 +29,10 @@ fn url(url: &str) -> Url {
     Url::parse(url).unwrap()
 }
 
+fn l1_endpoint_monitor_config(ordered_l1_endpoint_urls: Vec<Url>) -> L1EndpointMonitorConfig {
+    L1EndpointMonitorConfig { ordered_l1_endpoint_urls, timeout_millis: Duration::from_millis(100) }
+}
+
 /// Used to mock an L1 endpoint, like infura.
 /// This can be replaced by Anvil, but for unit tests it isn't worth the large overhead Anvil
 /// entails, given that we only need a valid HTTP response from the given url to test the API.
@@ -47,8 +50,7 @@ async fn mock_working_l1_endpoint() -> MockL1Endpoint {
         .mock("POST", "/")
         // Catch this specific RPC method.
         .match_body(Matcher::PartialJsonString(format!(
-            r#"{{ "method": "{}"}}"#,
-            HEALTH_CHECK_RPC_METHOD
+            r#"{{ "method": "{HEALTH_CHECK_RPC_METHOD}"}}"#
         )))
         .with_status(200)
         // Return 2_u64 as a valid response for the method.
@@ -68,9 +70,7 @@ async fn non_responsive_skips_to_next() {
 
     let mut monitor = L1EndpointMonitor {
         current_l1_endpoint_index: 0,
-        config: L1EndpointMonitorConfig {
-            ordered_l1_endpoint_urls: vec![url(BAD_ENDPOINT_1), good_endpoint.clone()],
-        },
+        config: l1_endpoint_monitor_config(vec![url(BAD_ENDPOINT_1), good_endpoint.clone()]),
     };
 
     // Test.
@@ -85,13 +85,11 @@ async fn current_endpoint_still_works() {
 
     let mut monitor = L1EndpointMonitor {
         current_l1_endpoint_index: 1,
-        config: L1EndpointMonitorConfig {
-            ordered_l1_endpoint_urls: vec![
-                url(BAD_ENDPOINT_1),
-                good_endpoint.clone(),
-                url(BAD_ENDPOINT_2),
-            ],
-        },
+        config: l1_endpoint_monitor_config(vec![
+            url(BAD_ENDPOINT_1),
+            good_endpoint.clone(),
+            url(BAD_ENDPOINT_2),
+        ]),
     };
 
     // Test.
@@ -106,13 +104,11 @@ async fn wrap_around_success() {
 
     let mut monitor = L1EndpointMonitor {
         current_l1_endpoint_index: 2,
-        config: L1EndpointMonitorConfig {
-            ordered_l1_endpoint_urls: vec![
-                url(BAD_ENDPOINT_1),
-                good_url.clone(),
-                url(BAD_ENDPOINT_2),
-            ],
-        },
+        config: l1_endpoint_monitor_config(vec![
+            url(BAD_ENDPOINT_1),
+            good_url.clone(),
+            url(BAD_ENDPOINT_2),
+        ]),
     };
 
     // Test.
@@ -124,23 +120,11 @@ async fn all_down_fails() {
     // Setup.
     let mut monitor = L1EndpointMonitor {
         current_l1_endpoint_index: 0,
-        config: L1EndpointMonitorConfig {
-            ordered_l1_endpoint_urls: vec![url(BAD_ENDPOINT_1), url(BAD_ENDPOINT_2)],
-        },
+        config: l1_endpoint_monitor_config(vec![url(BAD_ENDPOINT_1), url(BAD_ENDPOINT_2)]),
     };
 
     // Test.
     let result = monitor.get_active_l1_endpoint().await;
     assert_eq!(result, Err(L1EndpointMonitorError::NoActiveL1Endpoint));
     assert_eq!(monitor.current_l1_endpoint_index, 0);
-}
-
-#[tokio::test]
-async fn initialized_with_unknown_url_returns_error() {
-    let some_valid_endpoint = mock_working_l1_endpoint().await;
-    let config =
-        L1EndpointMonitorConfig { ordered_l1_endpoint_urls: vec![some_valid_endpoint.url] };
-    let unknown_url = url(BAD_ENDPOINT_1);
-    let result = L1EndpointMonitor::new(config.clone(), &unknown_url);
-    assert_eq!(result, Err(L1EndpointMonitorError::InitializationError { unknown_url }));
 }

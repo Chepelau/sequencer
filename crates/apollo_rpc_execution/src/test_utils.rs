@@ -21,15 +21,9 @@ use starknet_api::block::{
     GasPrice,
     GasPricePerToken,
 };
+use starknet_api::contract_class::compiled_class_hash::{HashVersion, HashableCompiledClass};
 use starknet_api::contract_class::SierraVersion;
-use starknet_api::core::{
-    ChainId,
-    ClassHash,
-    CompiledClassHash,
-    ContractAddress,
-    Nonce,
-    SequencerContractAddress,
-};
+use starknet_api::core::{ChainId, ClassHash, ContractAddress, Nonce, SequencerContractAddress};
 use starknet_api::deprecated_contract_class::ContractClass as DeprecatedContractClass;
 use starknet_api::state::{SierraContractClass, StateNumber, ThinStateDiff};
 use starknet_api::test_utils::read_json_file;
@@ -43,7 +37,7 @@ use starknet_api::transaction::{
     InvokeTransactionV1,
     TransactionHash,
 };
-use starknet_api::{calldata, class_hash, contract_address, felt, nonce};
+use starknet_api::{calldata, class_hash, compiled_class_hash, contract_address, felt, nonce};
 use starknet_types_core::felt::Felt;
 
 use crate::execution_utils::selector_from_name;
@@ -78,7 +72,7 @@ lazy_static! {
 const DUMMY_SIERRA_SIZE: SierraSize = 1;
 
 fn get_test_instance<T: DeserializeOwned>(path_in_resource_dir: &str) -> T {
-    serde_json::from_value(read_json_file(path_in_resource_dir)).unwrap()
+    read_json_file(path_in_resource_dir)
 }
 
 // A deprecated class for testing, taken from get_deprecated_contract_class of Blockifier.
@@ -143,9 +137,9 @@ pub fn prepare_storage(mut storage_writer: StorageWriter) {
                         minter_var_address => *ACCOUNT_ADDRESS.0.key()
                     ),
                 ),
-                declared_classes: indexmap!(
+                class_hash_to_compiled_class_hash: indexmap!(
                     // The class is not used in the execution, so it can be default.
-                    class_hash0 => CompiledClassHash::default()
+                    class_hash0 => compiled_class_hash!(1_u8)
                 ),
                 deprecated_declared_classes: vec![
                     *TEST_ERC20_CONTRACT_CLASS_HASH,
@@ -301,12 +295,14 @@ impl TxsScenarioBuilder {
     }
 
     pub fn declare_class(mut self, sender_address: ContractAddress) -> TxsScenarioBuilder {
+        let casm = get_test_casm();
         let tx = ExecutableTransactionInput::DeclareV2(
             DeclareTransactionV2 {
                 max_fee: *MAX_FEE,
                 sender_address,
                 nonce: self.next_nonce(sender_address),
                 class_hash: self.next_class_hash(),
+                compiled_class_hash: casm.hash(&HashVersion::V2),
                 ..Default::default()
             },
             get_test_casm(),

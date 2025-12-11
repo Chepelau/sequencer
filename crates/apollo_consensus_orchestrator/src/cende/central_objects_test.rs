@@ -5,8 +5,8 @@ use std::vec;
 use apollo_batcher::cende_client_types::{
     Builtin,
     CendeBlockMetadata,
-    CendePreConfirmedBlock,
-    CendePreConfirmedTransaction,
+    CendePreconfirmedBlock,
+    CendePreconfirmedTransaction,
     ExecutionResources as CendeClientExecutionResources,
     IntermediateInvokeTransaction,
     StarknetClientTransactionReceipt,
@@ -14,6 +14,7 @@ use apollo_batcher::cende_client_types::{
 };
 use apollo_class_manager_types::MockClassManagerClient;
 use apollo_infra_utils::test_utils::assert_json_eq;
+use apollo_sizeof::SizeOf;
 use apollo_starknet_client::reader::objects::state::StateDiff;
 use apollo_starknet_client::reader::objects::transaction::ReservedDataAvailabilityMode;
 use apollo_starknet_client::reader::StorageEntry;
@@ -28,6 +29,7 @@ use blockifier::execution::call_info::{
 };
 use blockifier::execution::contract_class::TrackedResource;
 use blockifier::execution::entry_point::{CallEntryPoint, CallType};
+use blockifier::execution::syscalls::vm_syscall_utils::{SyscallSelector, SyscallUsage};
 use blockifier::fee::fee_checks::FeeCheckError;
 use blockifier::fee::receipt::TransactionReceipt;
 use blockifier::fee::resources::{
@@ -79,7 +81,7 @@ use starknet_api::block::{
 };
 use starknet_api::consensus_transaction::InternalConsensusTransaction;
 use starknet_api::contract_class::{ContractClass, EntryPointType, SierraVersion};
-use starknet_api::core::{ClassHash, CompiledClassHash, EntryPointSelector, EthAddress};
+use starknet_api::core::{ClassHash, CompiledClassHash, EntryPointSelector, L1Address};
 use starknet_api::data_availability::{DataAvailabilityMode, L1DataAvailabilityMode};
 use starknet_api::executable_transaction::L1HandlerTransaction;
 use starknet_api::execution_resources::{GasAmount, GasVector};
@@ -129,6 +131,7 @@ use starknet_types_core::felt::Felt;
 use super::{
     CentralBouncerWeights,
     CentralCasmHashComputationData,
+    CentralCompiledClassHashesForMigration,
     CentralCompressedStateDiff,
     CentralDeclareTransaction,
     CentralDeployAccountTransaction,
@@ -140,7 +143,7 @@ use super::{
     CentralTransactionWritten,
 };
 use crate::cende::central_objects::CentralCasmContractClass;
-use crate::cende::{AerospikeBlob, BlobParameters};
+use crate::cende::{AerospikeBlob, BlobParameters, InternalTransactionWithReceipt};
 
 // TODO(yael, dvir): add default object serialization tests.
 
@@ -192,7 +195,7 @@ fn thin_state_diff() -> ThinStateDiff {
                 contract_address!(5_u8)=> ClassHash(felt!(5_u8)),
         },
         storage_diffs: indexmap!(contract_address!(3_u8) => indexmap!(storage_key!(3_u8) => felt!(3_u8))),
-        declared_classes: indexmap!(ClassHash(felt!(4_u8))=> CompiledClassHash(felt!(4_u8))),
+        class_hash_to_compiled_class_hash: indexmap!(ClassHash(felt!(4_u8))=> CompiledClassHash(felt!(4_u8))),
         nonces: indexmap!(contract_address!(2_u8)=> nonce!(2)),
         ..Default::default()
     }
@@ -216,13 +219,14 @@ fn block_info() -> BlockInfo {
             },
         },
         use_kzg_da: true,
+        starknet_version: StarknetVersion::LATEST,
     }
 }
 
 fn central_state_diff() -> CentralStateDiff {
     let state_diff = thin_state_diff();
     let block_info = block_info();
-    let starknet_version = StarknetVersion::V0_14_0;
+    let starknet_version = StarknetVersion::LATEST;
 
     (state_diff, (block_info, starknet_version).into()).into()
 }
@@ -242,7 +246,7 @@ fn commitment_state_diff() -> CommitmentStateDiff {
 fn central_compressed_state_diff() -> CentralCompressedStateDiff {
     let state_diff = commitment_state_diff();
     let block_info = block_info();
-    let starknet_version = StarknetVersion::V0_14_0;
+    let starknet_version = StarknetVersion::LATEST;
 
     (state_diff, (block_info, starknet_version).into()).into()
 }
@@ -410,6 +414,13 @@ fn central_casm_hash_computation_data() -> CentralCasmHashComputationData {
     }
 }
 
+fn central_compiled_class_hashes_for_migration() -> CentralCompiledClassHashesForMigration {
+    CentralCompiledClassHashesForMigration::from([
+        (CompiledClassHash(felt!("0x2")), CompiledClassHash(felt!("0x1"))),
+        (CompiledClassHash(felt!("0x4")), CompiledClassHash(felt!("0x3"))),
+    ])
+}
+
 fn central_sierra_contract_class() -> CentralSierraContractClass {
     CentralSierraContractClass { contract_class: sierra_contract_class() }
 }
@@ -502,7 +513,7 @@ fn call_info() -> CallInfo {
             l2_to_l1_messages: vec![OrderedL2ToL1Message {
                 order: 1,
                 message: MessageToL1 {
-                    to_address: EthAddress::try_from(felt!(1_u8)).unwrap(),
+                    to_address: L1Address::from(felt!(1_u8)),
                     payload: L2ToL1Payload(felt_vector()),
                 },
             }],
@@ -521,8 +532,13 @@ fn call_info() -> CallInfo {
             read_block_hash_values: vec![BlockHash(felt!("0xdeafbee"))],
             accessed_blocks: HashSet::from([BlockNumber(100)]),
         },
-        // TODO(Meshi): insert relevant values.
         builtin_counters: execution_resources().prover_builtins(),
+        syscalls_usage: HashMap::from([
+            (SyscallSelector::CallContract, SyscallUsage { call_count: 7, linear_factor: 0 }),
+            (SyscallSelector::StorageRead, SyscallUsage { call_count: 4, linear_factor: 0 }),
+            (SyscallSelector::StorageWrite, SyscallUsage { call_count: 4, linear_factor: 0 }),
+            (SyscallSelector::EmitEvent, SyscallUsage { call_count: 2, linear_factor: 0 }),
+        ]),
     }
 }
 
@@ -641,16 +657,25 @@ fn input_txs_and_mock_class_manager() -> (Vec<InternalConsensusTransaction>, Moc
 // TODO(dvir): use real blob when possible.
 fn central_blob() -> AerospikeBlob {
     let (input_txs, mock_class_manager) = input_txs_and_mock_class_manager();
+
+    let transactions_with_execution_infos = input_txs
+        .iter()
+        .map(|tx| InternalTransactionWithReceipt {
+            transaction: tx.clone(),
+            execution_info: transaction_execution_info(),
+        })
+        .collect::<Vec<_>>();
+
     let blob_parameters = BlobParameters {
         block_info: block_info(),
         state_diff: thin_state_diff(),
         compressed_state_diff: Some(commitment_state_diff()),
-        transactions: input_txs,
+        transactions_with_execution_infos,
         bouncer_weights: central_bouncer_weights(),
         fee_market_info: central_fee_market_info(),
-        execution_infos: vec![transaction_execution_info()],
         casm_hash_computation_data_sierra_gas: central_casm_hash_computation_data(),
         casm_hash_computation_data_proving_gas: central_casm_hash_computation_data(),
+        compiled_class_hashes_for_migration: central_compiled_class_hashes_for_migration(),
     };
 
     // This is to make the function sync (not async) so that it can be used as a case in the
@@ -674,7 +699,7 @@ fn event_from_serialized_fields(from_address: &str, keys: Vec<&str>, data: Vec<&
     }
 }
 
-fn starknet_preconfiremd_block() -> CendePreConfirmedBlock {
+fn starknet_preconfiremd_block() -> CendePreconfirmedBlock {
     let metadata = CendeBlockMetadata {
         status: "PRE_CONFIRMED",
         starknet_version: StarknetVersion::V0_14_0,
@@ -698,7 +723,7 @@ fn starknet_preconfiremd_block() -> CendePreConfirmedBlock {
     };
 
     let transactions = vec![
-        CendePreConfirmedTransaction::Invoke(IntermediateInvokeTransaction {
+        CendePreconfirmedTransaction::Invoke(IntermediateInvokeTransaction {
             resource_bounds: Some(
                 AllResourceBounds {
                     l1_gas: ResourceBounds {
@@ -755,7 +780,7 @@ fn starknet_preconfiremd_block() -> CendePreConfirmedBlock {
             entry_point_selector: None,
             max_fee: None,
         }),
-        CendePreConfirmedTransaction::Invoke(IntermediateInvokeTransaction {
+        CendePreconfirmedTransaction::Invoke(IntermediateInvokeTransaction {
             resource_bounds: Some(
                 AllResourceBounds {
                     l1_gas: ResourceBounds {
@@ -924,7 +949,7 @@ fn starknet_preconfiremd_block() -> CendePreConfirmedBlock {
         ..Default::default()
     })];
 
-    CendePreConfirmedBlock { metadata, transactions, transaction_receipts, transaction_state_diffs }
+    CendePreconfirmedBlock { metadata, transactions, transaction_receipts, transaction_state_diffs }
 }
 
 #[rstest]
@@ -963,8 +988,77 @@ fn starknet_preconfiremd_block() -> CendePreConfirmedBlock {
     CENTRAL_PRECONFIRMED_BLOCK_JSON_PATH
 )]
 fn serialize_central_objects(#[case] rust_obj: impl Serialize, #[case] python_json_path: &str) {
-    let python_json = read_json_file(python_json_path);
+    let python_json: serde_json::Value = read_json_file(python_json_path);
     let rust_json = serde_json::to_value(rust_obj).unwrap();
 
     assert_json_eq(&rust_json, &python_json, "Json Comparison failed".to_string());
+}
+
+// Check size of internal transactions.
+#[test]
+fn test_deploy_account_tx_size_of() {
+    let deploy_account_tx = deploy_account_tx();
+
+    // hardcoded number was generated using:
+    //
+    // let RpcDeployAccountTransaction::V3(internal_deploy_account_tx) = &deploy_account_tx.tx;
+    //
+    // let expected_size = std::mem::size_of::<InternalRpcDeployAccountTransaction>()
+    // + internal_deploy_account_tx.class_hash.dynamic_size()
+    // + internal_deploy_account_tx.constructor_calldata.dynamic_size()
+    // + internal_deploy_account_tx.contract_address_salt.dynamic_size()
+    // + internal_deploy_account_tx.fee_data_availability_mode.dynamic_size()
+    // + internal_deploy_account_tx.nonce.dynamic_size()
+    // + internal_deploy_account_tx.nonce_data_availability_mode.dynamic_size()
+    // + internal_deploy_account_tx.paymaster_data.dynamic_size()
+    // + internal_deploy_account_tx.resource_bounds.dynamic_size()
+    // + internal_deploy_account_tx.signature.dynamic_size()
+    // + internal_deploy_account_tx.tip.dynamic_size()
+    // + deploy_account_tx.contract_address.dynamic_size();
+
+    assert_eq!(deploy_account_tx.size_bytes(), 528);
+}
+
+#[test]
+fn test_declare_account_tx_size_of() {
+    let declare_tx = declare_transaction();
+
+    // hardcoded number was generated using:
+    //
+    // let expected_size = std::mem::size_of::<InternalRpcDeclareTransactionV3>()
+    // + declare_tx.class_hash.dynamic_size()
+    // + declare_tx.compiled_class_hash.dynamic_size()
+    // + declare_tx.fee_data_availability_mode.dynamic_size()
+    // + declare_tx.nonce.dynamic_size()
+    // + declare_tx.nonce_data_availability_mode.dynamic_size()
+    // + declare_tx.paymaster_data.dynamic_size()
+    // + declare_tx.resource_bounds.dynamic_size()
+    // + declare_tx.sender_address.dynamic_size()
+    // + declare_tx.signature.dynamic_size()
+    // + declare_tx.tip.dynamic_size();
+
+    assert_eq!(declare_tx.size_bytes(), 424);
+}
+
+#[test]
+fn test_invoke_tx_size_of() {
+    let invoke_tx = invoke_transaction();
+
+    // hardcoded number was generated using:
+    //
+    // let RpcInvokeTransaction::V3(internal_invoke_tx) = &invoke_tx;
+    //
+    // let expected_size = std::mem::size_of::<RpcInvokeTransaction>()
+    // + internal_invoke_tx.account_deployment_data.dynamic_size()
+    // + internal_invoke_tx.calldata.dynamic_size()
+    // + internal_invoke_tx.fee_data_availability_mode.dynamic_size()
+    // + internal_invoke_tx.nonce.dynamic_size()
+    // + internal_invoke_tx.nonce_data_availability_mode.dynamic_size()
+    // + internal_invoke_tx.paymaster_data.dynamic_size()
+    // + internal_invoke_tx.resource_bounds.dynamic_size()
+    // + internal_invoke_tx.sender_address.dynamic_size()
+    // + internal_invoke_tx.signature.dynamic_size()
+    // + internal_invoke_tx.tip.dynamic_size();
+
+    assert_eq!(invoke_tx.size_bytes(), 448);
 }

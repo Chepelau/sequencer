@@ -7,11 +7,10 @@ on:
       - opened
       - reopened
       - synchronize
-      - auto_merge_enabled
       - edited
 
 env:
-  RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=lld"
+  RUSTFLAGS: "-D warnings"
 
 # On PR events, cancel existing CI runs on this same PR for this workflow.
 # Also, create different concurrency groups for different pushed commits, on push events.
@@ -24,7 +23,7 @@ concurrency:
 
 jobs:
   commitlint:
-    runs-on: starkware-ubuntu-24.04-small
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,13 +32,6 @@ jobs:
       - name: Install commitlint
         run: npm install --global @commitlint/cli @commitlint/config-conventional
 
-      - name: Validate PR commits with commitlint
-        if: github.event_name == 'pull_request' && !(contains(github.event.pull_request.title, 'merge-main') || contains(github.event.pull_request.title, 'merge main'))
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: commitlint --from "$BASE_SHA" --to "$HEAD_SHA" --verbose
-
       - name: Validate PR title with commitlint
         if: github.event_name != 'merge_group' && github.event_name != 'push' && !(contains(github.event.pull_request.title, 'merge-main') || contains(github.event.pull_request.title, 'merge main'))
         env:
@@ -47,7 +39,7 @@ jobs:
         run: echo "$TITLE" | commitlint --verbose
 
   merge-gatekeeper:
-    runs-on: starkware-ubuntu-24.04-small
+    runs-on: ubuntu-24.04
     # Restrict permissions of the GITHUB_TOKEN.
     # Docs: https://docs.github.com/en/actions/using-jobs/assigning-permissions-to-jobs
     permissions:
@@ -61,7 +53,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           timeout: 3600
           interval: 30
-          ignored: "code-review/reviewable"
+          ignored: code-review/reviewable,build_docker_images
 
       - name: Run Merge Gatekeeper on Merge Queue || push
         if: github.event_name == 'merge_group' || github.event_name == 'push'

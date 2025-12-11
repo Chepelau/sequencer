@@ -11,8 +11,6 @@ pub fn install_compiler_binary(
     out_dir: &std::path::Path,
 ) {
     let binary_path = binary_path(out_dir, binary_name);
-    println!("cargo:rerun-if-changed={}", binary_path.to_str().unwrap());
-
     match Command::new(&binary_path).args(["--version"]).output() {
         Ok(binary_version) => {
             let binary_version = String::from_utf8(binary_version.stdout)
@@ -47,7 +45,7 @@ pub fn install_compiler_binary(
         .unwrap_or_else(|_| panic!("Failed to install {binary_name}"));
 
     if !install_command_status.success() {
-        panic!("Failed to install {}", binary_name);
+        panic!("Failed to install {binary_name}");
     }
 
     // Move the '{binary_name}' executable to a shared location.
@@ -59,7 +57,7 @@ pub fn install_compiler_binary(
         .expect("Failed to perform mv command.");
 
     if !move_command_status.success() {
-        panic!("Failed to move the {} binary to the shared folder.", binary_name);
+        panic!("Failed to move the {binary_name} binary to the shared folder.");
     }
 
     std::fs::remove_dir_all(temp_cargo_path).expect("Failed to remove the cargo directory.");

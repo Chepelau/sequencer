@@ -3,6 +3,8 @@ pub mod starknet_api_test_utils;
 pub const TEST_FILES_FOLDER: &str = "crates/mempool_test_utils/resources";
 pub const CONTRACT_CLASS_FILE: &str = "contract_class.json";
 pub const COMPILED_CLASS_HASH_OF_CONTRACT_CLASS: &str =
-    "0x01e4f1248860f32c336f93f2595099aaa4959be515e40b75472709ef5243ae17";
+    "0x24d8d75cba029fa1896dd4d9424df66f8b279b058b4c6f3245b369c78c5d156";
+pub const EMPTY_CONTRACT_CAIRO1_COMPILED_CLASS_HASH: &str =
+    "0x6EE46561691E785D643A8296B9BF08008E432DF405A1A4BEB6ED784541B571C";
 // TODO(Arni): Move this file to 'apollo_sierra_multicompile' crate.
 pub const FAULTY_ACCOUNT_CLASS_FILE: &str = "faulty_account.sierra.json";

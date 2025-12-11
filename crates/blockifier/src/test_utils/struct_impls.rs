@@ -22,12 +22,13 @@ use starknet_api::test_utils::{
     TEST_ERC20_CONTRACT_ADDRESS,
     TEST_ERC20_CONTRACT_ADDRESS2,
 };
+use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
 
 use crate::blockifier::config::{CairoNativeRunConfig, ContractClassManagerConfig};
 use crate::blockifier_versioned_constants::VersionedConstants;
 use crate::bouncer::{BouncerConfig, BouncerWeights};
 use crate::context::{BlockContext, ChainInfo, FeeTokenAddresses, TransactionContext};
-use crate::execution::call_info::{BuiltinCounterMap, CallExecution, CallInfo, Retdata};
+use crate::execution::call_info::{CallExecution, CallInfo, Retdata};
 use crate::execution::common_hints::ExecutionMode;
 #[cfg(feature = "cairo_native")]
 use crate::execution::contract_class::CompiledClassV1;
@@ -51,7 +52,6 @@ use crate::transaction::objects::{
 impl CallEntryPoint {
     /// Executes the call directly, without account context. Limits the number of steps by resource
     /// bounds.
-    #[allow(clippy::result_large_err)]
     pub fn execute_directly(self, state: &mut dyn State) -> EntryPointExecutionResult<CallInfo> {
         // Do not limit steps by resources as we use default resources.
         let limit_steps_by_resources = false;
@@ -64,7 +64,6 @@ impl CallEntryPoint {
         )
     }
 
-    #[allow(clippy::result_large_err)]
     pub fn execute_directly_given_block_context(
         self,
         state: &mut dyn State,
@@ -87,7 +86,6 @@ impl CallEntryPoint {
         self.execute(state, &mut context, &mut remaining_gas)
     }
 
-    #[allow(clippy::result_large_err)]
     pub fn execute_directly_given_tx_info(
         self,
         state: &mut dyn State,
@@ -111,7 +109,6 @@ impl CallEntryPoint {
 
     /// Executes the call directly in validate mode, without account context. Limits the number of
     /// steps by resource bounds.
-    #[allow(clippy::result_large_err)]
     pub fn execute_directly_in_validate_mode(
         self,
         state: &mut dyn State,
@@ -138,8 +135,17 @@ impl CallInfo {
         for inner_call in self.inner_calls.iter_mut() {
             inner_call.clear_nonessential_fields_for_comparison();
         }
-        self.builtin_counters = BuiltinCounterMap::new();
         self.execution.cairo_native = false;
+    }
+
+    pub fn check_native_execution(&self, cairo_native: bool) {
+        assert_eq!(
+            self.execution.cairo_native, cairo_native,
+            "CallInfo execution mode does not match expected native execution mode."
+        );
+        for inner_call in self.inner_calls.iter() {
+            inner_call.check_native_execution(cairo_native);
+        }
     }
 }
 
@@ -154,6 +160,13 @@ impl TransactionExecutionInfo {
         }
         if let Some(call_info) = &mut self.fee_transfer_call_info {
             call_info.clear_nonessential_fields_for_comparison();
+        }
+    }
+
+    pub fn check_call_infos_native_execution(&self, cairo_native: bool) {
+        // Check that the call infos are executed with cairo native.
+        for call_info in self.non_optional_call_infos() {
+            call_info.check_native_execution(cairo_native);
         }
     }
 }
@@ -172,6 +185,7 @@ impl ChainInfo {
                 eth_fee_token_address: contract_address!(TEST_ERC20_CONTRACT_ADDRESS),
                 strk_fee_token_address: contract_address!(TEST_ERC20_CONTRACT_ADDRESS2),
             },
+            is_l3: false,
         }
     }
 }
@@ -202,7 +216,6 @@ impl BlockContext {
                     n_events: max_n_events_in_block,
                     ..BouncerWeights::max()
                 },
-                // TODO(Meshi): Check what should be the values here.
                 ..BouncerConfig::max()
             },
             ..Self::create_for_account_testing()

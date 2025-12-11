@@ -1,22 +1,27 @@
 use std::sync::Arc;
 
+use apollo_class_manager_config::config::{CachedClassStorageConfig, ClassManagerConfig};
 use apollo_class_manager_types::{ClassHashes, ClassManagerError};
 use apollo_compile_to_casm_types::{MockSierraCompilerClient, RawClass, RawExecutableClass};
 use assert_matches::assert_matches;
 use mockall::predicate::eq;
 use starknet_api::contract_class::ContractClass;
 use starknet_api::core::{ClassHash, CompiledClassHash};
+use starknet_api::deprecated_contract_class::ContractClass as DeprecatedContractClass;
 use starknet_api::felt;
 use starknet_api::state::SierraContractClass;
 
 use crate::class_manager::ClassManager;
-use crate::class_storage::{create_tmp_dir, CachedClassStorageConfig, FsClassStorage};
-use crate::config::ClassManagerConfig;
+use crate::class_storage::FsClassStorage;
 
 impl ClassManager<FsClassStorage> {
     fn new_for_testing(compiler: MockSierraCompilerClient, config: ClassManagerConfig) -> Self {
+        let persistent_root = tempfile::tempdir().unwrap();
+        let class_hash_storage_path_prefix = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(persistent_root.path()).unwrap();
+        std::fs::create_dir_all(class_hash_storage_path_prefix.path()).unwrap();
         let storage =
-            FsClassStorage::new_for_testing(&create_tmp_dir().unwrap(), &create_tmp_dir().unwrap());
+            FsClassStorage::new_for_testing(&persistent_root, &class_hash_storage_path_prefix);
 
         ClassManager::new(config, Arc::new(compiler), storage)
     }
@@ -26,10 +31,8 @@ fn mock_compile_expectations(
     compiler: &mut MockSierraCompilerClient,
     class: RawClass,
 ) -> (RawExecutableClass, CompiledClassHash) {
-    let compile_output = (
-        RawExecutableClass::try_from(ContractClass::test_casm_contract_class()).unwrap(),
-        CompiledClassHash(felt!("0x5678")),
-    );
+    let compile_output =
+        (RawExecutableClass::test_casm_contract_class(), CompiledClassHash(felt!("0x5678")));
     let cloned_compiled_output = compile_output.clone();
 
     compiler
@@ -51,7 +54,7 @@ async fn class_manager() {
     // Prepare mock compiler.
     let mut compiler = MockSierraCompilerClient::new();
     let class = RawClass::try_from(SierraContractClass::default()).unwrap();
-    let (expected_executable_class, expected_executable_class_hash) =
+    let (expected_executable_class, expected_executable_class_hash_v2) =
         mock_compile_expectations(&mut compiler, class.clone());
 
     // Prepare class manager.
@@ -71,8 +74,10 @@ async fn class_manager() {
 
     // Add new class.
     let class_hashes = class_manager.add_class(class.clone()).await.unwrap();
-    let expected_class_hashes =
-        ClassHashes { class_hash: class_id, executable_class_hash: expected_executable_class_hash };
+    let expected_class_hashes = ClassHashes {
+        class_hash: class_id,
+        executable_class_hash_v2: expected_executable_class_hash_v2,
+    };
     assert_eq!(class_hashes, expected_class_hashes);
 
     // Get class.
@@ -110,11 +115,13 @@ async fn class_manager_get_executable() {
     // Test.
 
     // Add classes: deprecated and non-deprecated, under different hashes.
-    let ClassHashes { class_hash, executable_class_hash: _ } =
+    let ClassHashes { class_hash, executable_class_hash_v2 } =
         class_manager.add_class(class.clone()).await.unwrap();
 
     let deprecated_class_hash = ClassHash(felt!("0x1806"));
-    let deprecated_executable_class = RawExecutableClass::new_unchecked(vec![1, 2, 3].into());
+    let deprecated_executable_class =
+        RawExecutableClass::try_from(ContractClass::V0(DeprecatedContractClass::default()))
+            .unwrap();
     class_manager
         .add_deprecated_class(deprecated_class_hash, deprecated_executable_class.clone())
         .unwrap();
@@ -124,6 +131,10 @@ async fn class_manager_get_executable() {
     assert_eq!(
         class_manager.get_executable(deprecated_class_hash).unwrap(),
         Some(deprecated_executable_class)
+    );
+    assert_eq!(
+        class_manager.get_executable_class_hash_v2(class_hash).unwrap(),
+        Some(executable_class_hash_v2)
     );
 }
 

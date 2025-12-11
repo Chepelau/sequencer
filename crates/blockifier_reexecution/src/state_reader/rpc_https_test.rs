@@ -12,9 +12,9 @@
 use std::env;
 use std::sync::{Arc, Mutex};
 
-use apollo_gateway::config::RpcStateReaderConfig;
 use apollo_gateway::rpc_objects::BlockId;
 use apollo_gateway::rpc_state_reader::RpcStateReader;
+use apollo_gateway_config::config::RpcStateReaderConfig;
 use assert_matches::assert_matches;
 use rstest::{fixture, rstest};
 use starknet_api::block::{BlockInfo, BlockNumber};
@@ -30,10 +30,10 @@ use starknet_core::types::ContractClass::{Legacy, Sierra};
 
 use super::test_state_reader::RetryConfig;
 use super::utils::RPC_NODE_URL;
+use crate::state_reader::cli::guess_chain_id_from_node_url;
 use crate::state_reader::compile::legacy_to_contract_class_v0;
 use crate::state_reader::reexecution_state_reader::ReexecutionStateReader;
 use crate::state_reader::test_state_reader::{ConsecutiveTestStateReaders, TestStateReader};
-use crate::state_reader::utils::guess_chain_id_from_node_url;
 
 const EXAMPLE_INVOKE_TX_HASH: &str =
     "0xa7c7db686c7f756ceb7ca85a759caef879d425d156da83d6a836f86851983";
@@ -142,9 +142,9 @@ pub fn test_get_contract_class(test_state_reader: TestStateReader, test_block_nu
     let deprecated_contract_class =
         test_state_reader.get_contract_class(&class_hash).unwrap_or_else(|err| {
             panic!(
-                "Error retrieving deprecated contract class for class hash {}: {}
-            This class hash exist in Mainnet Block Number: {}",
-                class_hash, test_block_number, err
+                "Error retrieving deprecated contract class for class hash {class_hash}: \
+                 {test_block_number}
+            This class hash exist in Mainnet Block Number: {err}"
             );
         });
 
@@ -162,7 +162,7 @@ pub fn test_get_contract_class(test_state_reader: TestStateReader, test_block_nu
 #[rstest]
 pub fn test_get_tx_hashes(test_state_reader: TestStateReader) {
     test_state_reader.get_tx_hashes().unwrap_or_else(|err| {
-        panic!("Error retrieving txs hash: {}", err);
+        panic!("Error retrieving txs hash: {err}");
     });
 }
 

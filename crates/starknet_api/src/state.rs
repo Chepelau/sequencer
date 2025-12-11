@@ -3,7 +3,6 @@
 mod state_test;
 
 use std::fmt::Debug;
-use std::sync::LazyLock;
 
 use cairo_lang_starknet_classes::contract_class::ContractEntryPoint as CairoLangContractEntryPoint;
 use indexmap::IndexMap;
@@ -13,7 +12,7 @@ use starknet_types_core::felt::Felt;
 use starknet_types_core::hash::{Poseidon, StarkHash as SNTypsCoreStarkHash};
 
 use crate::block::{BlockHash, BlockNumber};
-use crate::contract_class::EntryPointType;
+use crate::contract_class::{EntryPointType, SierraVersion};
 use crate::core::{
     ClassHash,
     CompiledClassHash,
@@ -26,13 +25,15 @@ use crate::core::{
 use crate::deprecated_contract_class::ContractClass as DeprecatedContractClass;
 use crate::hash::{PoseidonHash, StarkHash};
 use crate::rpc_transaction::EntryPointByType;
-use crate::{impl_from_through_intermediate, StarknetApiError};
+#[cfg(any(test, feature = "testing"))]
+use crate::test_utils::py_json_dumps;
+use crate::{impl_from_through_intermediate, StarknetApiError, StarknetApiResult};
 
 pub type DeclaredClasses = IndexMap<ClassHash, SierraContractClass>;
 pub type DeprecatedDeclaredClasses = IndexMap<ClassHash, DeprecatedContractClass>;
 
-static API_VERSION: LazyLock<Felt> =
-    LazyLock::new(|| Felt::from_bytes_be_slice(b"CONTRACT_CLASS_V0.1.0"));
+pub const CONTRACT_CLASS_VERSION: &str = "0.1.0";
+pub const CONTRACT_CLASS_VERSION_PREFIX: &str = "CONTRACT_CLASS_V";
 
 /// The differences between two states before and after a block with hash block_hash
 /// and their respective roots.
@@ -53,6 +54,7 @@ pub struct StateDiff {
     pub deployed_contracts: IndexMap<ContractAddress, ClassHash>,
     pub storage_diffs: IndexMap<ContractAddress, IndexMap<StorageKey, Felt>>,
     pub declared_classes: IndexMap<ClassHash, (CompiledClassHash, SierraContractClass)>,
+    pub migrated_compiled_classes: IndexMap<ClassHash, CompiledClassHash>,
     pub deprecated_declared_classes: IndexMap<ClassHash, DeprecatedContractClass>,
     pub nonces: IndexMap<ContractAddress, Nonce>,
 }
@@ -64,7 +66,9 @@ pub struct StateDiff {
 pub struct ThinStateDiff {
     pub deployed_contracts: IndexMap<ContractAddress, ClassHash>,
     pub storage_diffs: IndexMap<ContractAddress, IndexMap<StorageKey, Felt>>,
-    pub declared_classes: IndexMap<ClassHash, CompiledClassHash>,
+    // class hash to compiled class hash is affected by both declared_classes and
+    // migrated_compiled_classes.
+    pub class_hash_to_compiled_class_hash: IndexMap<ClassHash, CompiledClassHash>,
     pub deprecated_declared_classes: Vec<ClassHash>,
     pub nonces: IndexMap<ContractAddress, Nonce>,
 }
@@ -76,10 +80,15 @@ impl ThinStateDiff {
             Self {
                 deployed_contracts: diff.deployed_contracts,
                 storage_diffs: diff.storage_diffs,
-                declared_classes: diff
+                class_hash_to_compiled_class_hash: diff
                     .declared_classes
                     .iter()
                     .map(|(class_hash, (compiled_hash, _class))| (*class_hash, *compiled_hash))
+                    .chain(
+                        diff.migrated_compiled_classes
+                            .iter()
+                            .map(|(class_hash, compiled_hash)| (*class_hash, *compiled_hash)),
+                    )
                     .collect(),
                 deprecated_declared_classes: diff
                     .deprecated_declared_classes
@@ -100,7 +109,7 @@ impl ThinStateDiff {
     pub fn len(&self) -> usize {
         let mut result = 0usize;
         result += self.deployed_contracts.len();
-        result += self.declared_classes.len();
+        result += self.class_hash_to_compiled_class_hash.len();
         result += self.deprecated_declared_classes.len();
         result += self.nonces.len();
 
@@ -112,7 +121,7 @@ impl ThinStateDiff {
 
     pub fn is_empty(&self) -> bool {
         self.deployed_contracts.is_empty()
-            && self.declared_classes.is_empty()
+            && self.class_hash_to_compiled_class_hash.is_empty()
             && self.deprecated_declared_classes.is_empty()
             && self.nonces.is_empty()
             && self
@@ -224,7 +233,7 @@ impl Default for SierraContractClass {
     fn default() -> Self {
         Self {
             sierra_program: [Felt::ONE, Felt::TWO, Felt::THREE].to_vec(),
-            contract_class_version: Default::default(),
+            contract_class_version: CONTRACT_CLASS_VERSION.to_string(),
             entry_points_by_type: Default::default(),
             abi: Default::default(),
         }
@@ -233,22 +242,61 @@ impl Default for SierraContractClass {
 
 impl SierraContractClass {
     pub fn calculate_class_hash(&self) -> ClassHash {
-        let external_entry_points_hash = entry_points_hash(self, &EntryPointType::External);
-        let l1_handler_entry_points_hash = entry_points_hash(self, &EntryPointType::L1Handler);
-        let constructor_entry_points_hash = entry_points_hash(self, &EntryPointType::Constructor);
+        let class_hash = Poseidon::hash_array(&self.get_component_hashes().flatten());
+        ClassHash(class_hash)
+    }
+
+    pub fn get_component_hashes(&self) -> ContractClassComponentHashes {
+        let external_functions_hash = entry_points_hash(self, &EntryPointType::External);
+        let l1_handlers_hash = entry_points_hash(self, &EntryPointType::L1Handler);
+        let constructors_hash = entry_points_hash(self, &EntryPointType::Constructor);
         let abi_keccak = sha3::Keccak256::default().chain_update(self.abi.as_bytes()).finalize();
         let abi_hash = truncated_keccak(abi_keccak.into());
-        let program_hash = Poseidon::hash_array(self.sierra_program.as_slice());
-
-        let class_hash = Poseidon::hash_array(&[
-            *API_VERSION,
-            external_entry_points_hash.0,
-            l1_handler_entry_points_hash.0,
-            constructor_entry_points_hash.0,
+        let sierra_program_hash = Poseidon::hash_array(self.sierra_program.as_slice());
+        let contract_class_version = self.contract_class_version();
+        ContractClassComponentHashes {
+            contract_class_version,
+            external_functions_hash,
+            l1_handlers_hash,
+            constructors_hash,
             abi_hash,
-            program_hash,
-        ]);
-        ClassHash(class_hash)
+            sierra_program_hash,
+        }
+    }
+
+    pub fn contract_class_version(&self) -> Felt {
+        Self::create_contract_class_version(&self.contract_class_version)
+    }
+
+    pub fn create_contract_class_version(suffix: &str) -> Felt {
+        Felt::from_bytes_be_slice(format!("{CONTRACT_CLASS_VERSION_PREFIX}{suffix}").as_bytes())
+    }
+
+    pub fn get_sierra_version(&self) -> StarknetApiResult<SierraVersion> {
+        SierraVersion::extract_from_program(&self.sierra_program)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ContractClassComponentHashes {
+    pub contract_class_version: Felt,
+    pub external_functions_hash: PoseidonHash,
+    pub l1_handlers_hash: PoseidonHash,
+    pub constructors_hash: PoseidonHash,
+    pub abi_hash: Felt,
+    pub sierra_program_hash: Felt,
+}
+
+impl ContractClassComponentHashes {
+    pub fn flatten(&self) -> Vec<Felt> {
+        vec![
+            self.contract_class_version,
+            self.external_functions_hash.0,
+            self.l1_handlers_hash.0,
+            self.constructors_hash.0,
+            self.abi_hash,
+            self.sierra_program_hash,
+        ]
     }
 }
 
@@ -265,7 +313,10 @@ impl From<cairo_lang_starknet_classes::contract_class::ContractClass> for Sierra
                 .collect(),
             contract_class_version: cairo_lang_contract_class.contract_class_version,
             entry_points_by_type: cairo_lang_contract_class.entry_points_by_type.into(),
-            abi: cairo_lang_contract_class.abi.map(|abi| abi.json()).unwrap_or_default(),
+            abi: cairo_lang_contract_class
+                .abi
+                .map(|abi| py_json_dumps(&abi).expect("ABI is valid JSON"))
+                .unwrap_or_default(),
         }
     }
 }

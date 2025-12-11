@@ -43,7 +43,7 @@ fn thin_state_diff_len() {
                 0u64.into() => 0u64.into(),
             },
         },
-        declared_classes: indexmap! {
+        class_hash_to_compiled_class_hash: indexmap! {
             ClassHash(4u64.into()) => CompiledClassHash(9u64.into()),
             ClassHash(5u64.into()) => CompiledClassHash(10u64.into()),
         },
@@ -87,7 +87,7 @@ fn thin_state_diff_is_empty() {
     );
     assert!(
         !ThinStateDiff {
-            declared_classes: indexmap! { Default::default() => Default::default() },
+            class_hash_to_compiled_class_hash: indexmap! { Default::default() => Default::default() },
             ..Default::default()
         }
         .is_empty()
@@ -110,7 +110,7 @@ fn thin_state_diff_is_empty() {
 
 #[test]
 fn calc_class_hash() {
-    let class: SierraContractClass = serde_json::from_value(read_json_file("class.json")).unwrap();
+    let class: SierraContractClass = read_json_file("class.json");
     let expected_class_hash =
         class_hash!("0x29927c8af6bccf3f6fda035981e765a7bdbf18a2dc0d630494f8758aa908e2b");
     let calculated_class_hash = class.calculate_class_hash();

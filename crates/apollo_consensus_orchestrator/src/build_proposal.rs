@@ -2,6 +2,7 @@
 #[path = "build_proposal_test.rs"]
 mod build_proposal_test;
 
+use std::borrow::BorrowMut;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -11,11 +12,8 @@ use apollo_batcher_types::batcher_types::{
     ProposalId,
     ProposeBlockInput,
 };
-use apollo_batcher_types::communication::{BatcherClient, BatcherClientError};
-use apollo_class_manager_types::transaction_converter::{
-    TransactionConverterError,
-    TransactionConverterTrait,
-};
+use apollo_batcher_types::communication::BatcherClientError;
+use apollo_class_manager_types::transaction_converter::TransactionConverterError;
 use apollo_consensus::types::{ProposalCommitment, Round};
 use apollo_l1_gas_price_types::errors::{EthToStrkOracleClientError, L1GasPriceClientError};
 use apollo_protobuf::consensus::{
@@ -25,14 +23,14 @@ use apollo_protobuf::consensus::{
     ProposalPart,
     TransactionBatch,
 };
-use apollo_state_sync_types::communication::StateSyncClientError;
-use apollo_time::time::{Clock, DateTime};
-use starknet_api::block::{BlockHash, GasPrice};
+use apollo_time::time::DateTime;
+use starknet_api::block::{BlockNumber, GasPrice};
 use starknet_api::consensus_transaction::InternalConsensusTransaction;
 use starknet_api::core::ContractAddress;
 use starknet_api::data_availability::L1DataAvailabilityMode;
 use starknet_api::transaction::TransactionHash;
 use starknet_api::StarknetApiError;
+use strum::{EnumDiscriminants, EnumIter, EnumVariantNames, IntoStaticStr};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, trace, warn};
@@ -41,15 +39,17 @@ use crate::sequencer_consensus_context::{BuiltProposals, SequencerConsensusConte
 use crate::utils::{
     convert_to_sn_api_block_info,
     get_oracle_rate_and_prices,
-    retrospective_block_hash,
     truncate_to_executed_txs,
+    wait_for_retrospective_block_hash,
     GasPriceParams,
     StreamSender,
 };
 
+// Minimal wait time that avoids an immediate timeout.
+const MIN_WAIT_DURATION: Duration = Duration::from_millis(1);
 pub(crate) struct ProposalBuildArguments {
     pub deps: SequencerConsensusContextDeps,
-    pub batcher_timeout: Duration,
+    pub batcher_deadline: DateTime,
     pub proposal_init: ProposalInit,
     pub l1_da_mode: L1DataAvailabilityMode,
     pub stream_sender: StreamSender,
@@ -62,18 +62,25 @@ pub(crate) struct ProposalBuildArguments {
     pub cancel_token: CancellationToken,
     pub previous_block_info: Option<ConsensusBlockInfo>,
     pub proposal_round: Round,
+    pub retrospective_block_hash_deadline: DateTime,
+    pub retrospective_block_hash_retry_interval_millis: Duration,
 }
 
 type BuildProposalResult<T> = Result<T, BuildProposalError>;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, EnumDiscriminants)]
+#[strum_discriminants(
+    name(BuildProposalFailureReasonLabelValue),
+    derive(IntoStaticStr, EnumIter, EnumVariantNames),
+    strum(serialize_all = "snake_case")
+)]
 pub(crate) enum BuildProposalError {
     #[error("Batcher error: {0}")]
     Batcher(String, BatcherClientError),
     #[error("State sync client error: {0}")]
-    StateSyncClientError(#[from] StateSyncClientError),
-    #[error("State sync is not ready: {0}")]
-    StateSyncNotReady(String),
+    StateSyncClientError(String),
+    #[error("State sync is not ready: block number {0} not found")]
+    StateSyncNotReady(BlockNumber),
     // Consensus may exit early (e.g. sync).
     #[error("Failed to send commitment to consensus: {0}")]
     SendError(ProposalCommitment),
@@ -83,7 +90,10 @@ pub(crate) enum BuildProposalError {
     L1GasPriceProvider(#[from] L1GasPriceClientError),
     #[error("Proposal interrupted.")]
     Interrupted,
-    #[error("Writing blob to Aerospike failed. {0}")]
+    // TODO(shahak): Add the CENDE_FAILURE warn logs into the error and erase them.
+    #[error(
+        "Writing blob to Aerospike failed. {0}. For more info search CENDE_FAILURE in the logs"
+    )]
     CendeWriteError(String),
     #[error("Failed to convert transactions: {0}")]
     TransactionConverterError(#[from] TransactionConverterError),
@@ -95,7 +105,6 @@ pub(crate) enum BuildProposalError {
 pub(crate) async fn build_proposal(
     mut args: ProposalBuildArguments,
 ) -> BuildProposalResult<ProposalCommitment> {
-    let batcher_deadline = args.deps.clock.now() + args.batcher_timeout;
     let block_info = initiate_build(&args).await?;
     args.stream_sender
         .send(ProposalPart::Init(args.proposal_init))
@@ -106,17 +115,7 @@ pub(crate) async fn build_proposal(
         .await
         .expect("Failed to send block info");
 
-    let (proposal_commitment, content) = get_proposal_content(
-        args.proposal_id,
-        args.deps.batcher.as_ref(),
-        args.stream_sender,
-        args.cende_write_success,
-        args.deps.transaction_converter,
-        args.cancel_token,
-        args.deps.clock,
-        batcher_deadline,
-    )
-    .await?;
+    let (proposal_commitment, content) = get_proposal_content(&mut args).await?;
 
     // Update valid_proposals before sending fin to avoid a race condition
     // with `repropose` being called before `valid_proposals` is updated.
@@ -132,11 +131,8 @@ pub(crate) async fn build_proposal(
 }
 
 async fn initiate_build(args: &ProposalBuildArguments) -> BuildProposalResult<ConsensusBlockInfo> {
-    let batcher_timeout = chrono::Duration::from_std(args.batcher_timeout)
-        .expect("Can't convert timeout to chrono::Duration");
     let timestamp = args.deps.clock.unix_now();
     let (eth_to_fri_rate, l1_prices) = get_oracle_rate_and_prices(
-        args.deps.eth_to_strk_oracle_client.clone(),
         args.deps.l1_gas_price_provider.clone(),
         timestamp,
         args.previous_block_info.as_ref(),
@@ -155,11 +151,19 @@ async fn initiate_build(args: &ProposalBuildArguments) -> BuildProposalResult<Co
         eth_to_fri_rate,
     };
 
-    let retrospective_block_hash =
-        retrospective_block_hash(args.deps.state_sync_client.clone(), &block_info).await?;
+    let retrospective_block_hash = wait_for_retrospective_block_hash(
+        args.deps.state_sync_client.clone(),
+        &block_info,
+        args.deps.clock.as_ref(),
+        args.retrospective_block_hash_deadline,
+        args.retrospective_block_hash_retry_interval_millis,
+    )
+    .await
+    .map_err(BuildProposalError::from)?;
+
     let build_proposal_input = ProposeBlockInput {
         proposal_id: args.proposal_id,
-        deadline: args.deps.clock.now() + batcher_timeout,
+        deadline: args.batcher_deadline,
         retrospective_block_hash,
         block_info: convert_to_sn_api_block_info(&block_info)?,
         proposal_round: args.proposal_round,
@@ -176,33 +180,25 @@ async fn initiate_build(args: &ProposalBuildArguments) -> BuildProposalResult<Co
 /// 1. Receive chunks of content from the batcher.
 /// 2. Forward these to the stream handler to be streamed out to the network.
 /// 3. Once finished, receive the commitment from the batcher.
-// TODO(guyn): consider passing a ref to BuildProposalArguments instead of all the fields
-// separately.
-#[allow(clippy::too_many_arguments)]
 async fn get_proposal_content(
-    proposal_id: ProposalId,
-    batcher: &dyn BatcherClient,
-    mut stream_sender: StreamSender,
-    cende_write_success: AbortOnDropHandle<bool>,
-    transaction_converter: Arc<dyn TransactionConverterTrait>,
-    cancel_token: CancellationToken,
-    clock: Arc<dyn Clock>,
-    batcher_deadline: DateTime,
+    args: &mut ProposalBuildArguments,
 ) -> BuildProposalResult<(ProposalCommitment, Vec<Vec<InternalConsensusTransaction>>)> {
     let mut content = Vec::new();
     loop {
-        if cancel_token.is_cancelled() {
+        if args.cancel_token.is_cancelled() {
             return Err(BuildProposalError::Interrupted);
         }
         // We currently want one part of the node failing to cause all components to fail. If this
         // changes, we can simply return None and consider this as a failed proposal which consensus
         // should support.
-        let response = batcher
-            .get_proposal_content(GetProposalContentInput { proposal_id })
+        let response = args
+            .deps
+            .batcher
+            .get_proposal_content(GetProposalContentInput { proposal_id: args.proposal_id })
             .await
             .map_err(|err| {
                 BuildProposalError::Batcher(
-                    format!("Failed to get proposal content for proposal_id {proposal_id}."),
+                    format!("Failed to get proposal content for proposal_id {}.", args.proposal_id),
                     err,
                 )
             })?;
@@ -217,20 +213,22 @@ async fn get_proposal_content(
                     txs.len()
                 );
                 let transactions = futures::future::join_all(txs.into_iter().map(|tx| {
-                    transaction_converter.convert_internal_consensus_tx_to_consensus_tx(tx)
+                    args.deps
+                        .transaction_converter
+                        .convert_internal_consensus_tx_to_consensus_tx(tx)
                 }))
                 .await
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
 
                 trace!(?transactions, "Sending transaction batch with {} txs.", transactions.len());
-                stream_sender
+                args.stream_sender
                     .send(ProposalPart::Transactions(TransactionBatch { transactions }))
                     .await
                     .expect("Failed to broadcast proposal content");
             }
             GetProposalContent::Finished { id, final_n_executed_txs } => {
-                let proposal_commitment = BlockHash(id.state_diff_commitment.0.0);
+                let proposal_commitment = ProposalCommitment(id.state_diff_commitment.0.0);
                 content = truncate_to_executed_txs(&mut content, final_n_executed_txs);
 
                 info!(
@@ -245,11 +243,11 @@ async fn get_proposal_content(
                 // If the blob writing operation to Aerospike doesn't return a success status, we
                 // can't finish the proposal. Must wait for it at least until batcher_timeout is
                 // reached.
-                let remaining = (batcher_deadline - clock.now())
+                let remaining = (args.batcher_deadline - args.deps.clock.now())
                     .to_std()
                     .unwrap_or_default()
-                    .max(Duration::from_millis(1)); // Ensure we wait at least 1 ms to avoid immediate timeout. 
-                match tokio::time::timeout(remaining, cende_write_success).await {
+                    .max(MIN_WAIT_DURATION); // Ensure we wait at least 1 ms to avoid immediate timeout. 
+                match tokio::time::timeout(remaining, args.cende_write_success.borrow_mut()).await {
                     Err(_) => {
                         return Err(BuildProposalError::CendeWriteError(
                             "Writing blob to Aerospike didn't return in time.".to_string(),
@@ -271,13 +269,13 @@ async fn get_proposal_content(
                 let final_n_executed_txs_u64 = final_n_executed_txs
                     .try_into()
                     .expect("Number of executed transactions should fit in u64");
-                stream_sender
+                args.stream_sender
                     .send(ProposalPart::ExecutedTransactionCount(final_n_executed_txs_u64))
                     .await
                     .expect("Failed to broadcast executed transaction count");
                 let fin = ProposalFin { proposal_commitment };
                 info!("Sending fin={fin:?}");
-                stream_sender
+                args.stream_sender
                     .send(ProposalPart::Fin(fin))
                     .await
                     .expect("Failed to broadcast proposal fin");

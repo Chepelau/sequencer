@@ -1,4 +1,3 @@
-pub mod metrics;
 mod swarm_trait;
 #[cfg(test)]
 mod test;
@@ -6,8 +5,8 @@ mod test;
 pub mod test_utils;
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::Ipv4Addr;
 use std::pin::Pin;
-use std::str::FromStr;
 use std::task::{Context, Poll};
 
 use apollo_network_types::network_types::{BroadcastedMessageMetadata, OpaquePeerId};
@@ -22,26 +21,68 @@ use libp2p::gossipsub::{SubscriptionError, TopicHash};
 use libp2p::identity::Keypair;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{noise, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder};
-use metrics::NetworkMetrics;
-use sqmr::Bytes;
 use tracing::{debug, error, trace, warn};
 
 use self::swarm_trait::SwarmTrait;
 use crate::gossipsub_impl::Topic;
+use crate::metrics::{BroadcastNetworkMetrics, NetworkMetrics};
 use crate::misconduct_score::MisconductScore;
 use crate::mixed_behaviour::{self, BridgedBehaviour};
 use crate::sqmr::behaviour::SessionError;
 use crate::sqmr::{self, InboundSessionId, OutboundSessionId, SessionId};
-use crate::utils::{is_localhost, StreamMap};
-use crate::{gossipsub_impl, NetworkConfig};
+use crate::utils::{is_localhost, make_multiaddr, StreamMap};
+use crate::{gossipsub_impl, Bytes, NetworkConfig};
 
+/// Errors that can occur during network operations.
+///
+/// This enum represents all possible error conditions that may arise
+/// during networking operations, from connection failures to protocol-specific
+/// errors.
 #[derive(thiserror::Error, Debug)]
 pub enum NetworkError {
+    /// Error occurred while attempting to dial a peer.
+    ///
+    /// This can happen when trying to establish outbound connections to other peers.
+    /// Common causes include network connectivity issues, invalid addresses,
+    /// or the target peer being unavailable.
     #[error(transparent)]
     DialError(#[from] libp2p::swarm::DialError),
+
+    /// Broadcast channels for a specific topic were dropped.
+    ///
+    /// This indicates that the receiving end of broadcast channels has been
+    /// dropped, which typically happens when the subscriber to a topic
+    /// stops listening or encounters an error.
+    ///
+    /// The `topic_hash` identifies which specific topic was affected.
     #[error("Channels for broadcast topic with hash {topic_hash:?} were dropped.")]
     BroadcastChannelsDropped { topic_hash: TopicHash },
 }
+
+/// Generic network manager that handles all networking operations.
+///
+/// This is the core networking component that manages connections, protocols,
+/// and message routing. It's generic over the swarm type to allow for testing
+/// with mock swarms.
+///
+/// The network manager operates in an event-driven manner, continuously processing:
+/// - Swarm events (connections, disconnections, protocol events)
+/// - SQMR protocol sessions (queries and responses)
+/// - Broadcast message propagation
+/// - Peer reputation reports
+///
+/// # Type Parameters
+///
+/// * `SwarmT` - The underlying swarm implementation (typically `libp2p::Swarm`)
+///
+/// # Lifecycle
+///
+/// 1. **Initialization**: Create with [`NetworkManager::new`] or
+///    `GenericNetworkManager::generic_new`
+/// 2. **Protocol Registration**: Register SQMR protocols and broadcast topics
+/// 3. **Execution**: Run the event loop with [`GenericNetworkManager::run`]
+///
+/// The event loop will continue running until an unrecoverable error occurs.
 pub struct GenericNetworkManager<SwarmT: SwarmTrait> {
     swarm: SwarmT,
     inbound_protocol_to_buffer_size: HashMap<StreamProtocol, usize>,
@@ -65,6 +106,44 @@ pub struct GenericNetworkManager<SwarmT: SwarmTrait> {
 }
 
 impl<SwarmT: SwarmTrait> GenericNetworkManager<SwarmT> {
+    /// Runs the network manager's main event loop.
+    ///
+    /// This is the primary entry point for operating the network manager. It runs
+    /// an infinite event loop that processes all networking events including:
+    ///
+    /// - **Swarm Events**: Connection establishment/termination, protocol events
+    /// - **SQMR Sessions**: Inbound/outbound query-response sessions
+    /// - **Broadcast Messages**: GossipSub message broadcasting and reception
+    /// - **Peer Reports**: Handling malicious peer reports and reputation updates
+    ///
+    /// The loop continues until an unrecoverable error occurs or the application
+    /// is terminated.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - Never returned under normal operation (infinite loop)
+    /// * `Err(NetworkError)` - When an unrecoverable network error occurs
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use apollo_network::network_manager::NetworkManager;
+    /// use apollo_network::NetworkConfig;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = NetworkConfig::default();
+    /// let network_manager = NetworkManager::new(config, None, None);
+    ///
+    /// // This will run indefinitely, processing network events
+    /// network_manager.run().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Event Processing
+    ///
+    /// The event loop uses `tokio::select!` to concurrently handle multiple types
+    /// of events with proper prioritization and fairness.
     pub async fn run(mut self) -> Result<(), NetworkError> {
         if let Some(metrics) = self.metrics.as_ref() {
             metrics.register();
@@ -132,8 +211,117 @@ impl<SwarmT: SwarmTrait> GenericNetworkManager<SwarmT> {
         }
     }
 
-    // TODO(Shahak): Support multiple protocols where they're all different versions of the same
-    // protocol
+    /// Registers this node as a server for an SQMR protocol.
+    ///
+    /// This method sets up the node to accept inbound queries for a specific protocol
+    /// and enables sending multiple responses back to the querying peer. The protocol
+    /// follows the Single Query Multiple Response (SQMR) pattern.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `Query` - The type of queries this server will receive
+    /// * `Response` - The type of responses this server will send back
+    ///
+    /// # Arguments
+    ///
+    /// * `protocol` - The protocol identifier (e.g., "/starknet/blocks/1.0.0")
+    /// * `buffer_size` - Size of the internal buffer for incoming queries
+    ///
+    /// # Returns
+    ///
+    /// An [`SqmrServerReceiver`] that will yield incoming queries for processing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the protocol has already been registered as a server.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use apollo_network::network_manager::NetworkManager;
+    /// use apollo_network::NetworkConfig;
+    /// use futures::StreamExt;
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// // Example types for demonstration
+    /// #[derive(Serialize, Deserialize, Clone)]
+    /// struct BlockQuery {
+    ///     start_height: u64,
+    ///     end_height: u64,
+    /// }
+    /// #[derive(Serialize, Deserialize, Clone)]
+    /// struct Block {
+    ///     height: u64,
+    ///     hash: String,
+    /// }
+    ///
+    /// #[derive(Debug, Clone)]
+    /// struct ParseError(String);
+    /// impl std::fmt::Display for ParseError {
+    ///     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    ///         write!(f, "{}", self.0)
+    ///     }
+    /// }
+    /// impl std::error::Error for ParseError {}
+    ///
+    /// impl TryFrom<Vec<u8>> for BlockQuery {
+    ///     type Error = ParseError;
+    ///     fn try_from(bytes: Vec<u8>) -> Result<Self, Self::Error> {
+    ///         Ok(BlockQuery { start_height: 1000, end_height: 1010 })
+    ///     }
+    /// }
+    /// impl From<Block> for Vec<u8> {
+    ///     fn from(block: Block) -> Vec<u8> {
+    ///         block.hash.into_bytes()
+    ///     }
+    /// }
+    ///
+    /// // Helper function
+    /// fn get_blocks_for_query(query: &BlockQuery) -> Vec<Block> {
+    ///     (query.start_height..=query.end_height)
+    ///         .map(|h| Block { height: h, hash: format!("hash_{}", h) })
+    ///         .collect()
+    /// }
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut network_manager = NetworkManager::new(NetworkConfig::default(), None, None);
+    ///
+    /// // Register as a server for block requests
+    /// let mut server = network_manager.register_sqmr_protocol_server::<BlockQuery, Block>(
+    ///     "/starknet/blocks/1.0.0".to_string(),
+    ///     100, // buffer size
+    /// );
+    ///
+    /// // Process incoming queries
+    /// while let Some(mut query_manager) = server.next().await {
+    ///     match query_manager.query() {
+    ///         Ok(query) => {
+    ///             // Process query and send responses
+    ///             for block in get_blocks_for_query(query) {
+    ///                 query_manager.send_response(block).await?;
+    ///             }
+    ///         }
+    ///         Err(_) => {
+    ///             // Report malicious peer for invalid query
+    ///             query_manager.report_peer();
+    ///         }
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Protocol Registration
+    ///
+    /// Once registered, the protocol is added to the node's supported inbound protocols,
+    /// and peers can send queries to this protocol. Each query creates a new session
+    /// that can handle multiple responses.
+    ///
+    /// # Buffer Management
+    ///
+    /// The `buffer_size` parameter controls how many concurrent queries can be buffered
+    /// before backpressure is applied. A larger buffer allows handling more concurrent
+    /// queries but uses more memory.
     pub fn register_sqmr_protocol_server<Query, Response>(
         &mut self,
         protocol: String,
@@ -151,7 +339,7 @@ impl<SwarmT: SwarmTrait> GenericNetworkManager<SwarmT> {
         if let Some(_old_buffer_size) =
             self.inbound_protocol_to_buffer_size.insert(protocol.clone(), buffer_size)
         {
-            panic!("Protocol '{}' has already been registered as a server.", protocol);
+            panic!("Protocol '{protocol}' has already been registered as a server.");
         }
         let (inbound_payload_sender, inbound_payload_receiver) =
             futures::channel::mpsc::channel(buffer_size);
@@ -159,7 +347,7 @@ impl<SwarmT: SwarmTrait> GenericNetworkManager<SwarmT> {
             .sqmr_inbound_payload_senders
             .insert(protocol.clone(), Box::new(inbound_payload_sender));
         if insert_result.is_some() {
-            panic!("Protocol '{}' has already been registered as a server.", protocol);
+            panic!("Protocol '{protocol}' has already been registered as a server.");
         }
 
         let inbound_payload_receiver = inbound_payload_receiver
@@ -167,11 +355,108 @@ impl<SwarmT: SwarmTrait> GenericNetworkManager<SwarmT> {
         SqmrServerReceiver { receiver: Box::new(inbound_payload_receiver) }
     }
 
-    /// Register a new subscriber for sending a single query and receiving multiple responses.
-    /// Panics if the given protocol is already subscribed.
-    // TODO(Shahak): Support multiple protocols where they're all different versions of the same
-    // protocol.
-    // TODO(Shahak): Seperate query and response buffer sizes.
+    /// Registers this node as a client for an SQMR protocol.
+    ///
+    /// This method sets up the node to send queries to other peers for a specific protocol
+    /// and receive multiple responses back. The protocol follows the Single Query Multiple
+    /// Response (SQMR) pattern.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `Query` - The type of queries this client will send
+    /// * `Response` - The type of responses this client expects to receive
+    ///
+    /// # Arguments
+    ///
+    /// * `protocol` - The protocol identifier (e.g., "/starknet/blocks/1.0.0")
+    /// * `buffer_size` - Size of the internal buffer for responses
+    ///
+    /// # Returns
+    ///
+    /// An [`SqmrClientSender`] that can be used to send queries and receive responses.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the protocol has already been registered as a client.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use apollo_network::network_manager::NetworkManager;
+    /// use apollo_network::NetworkConfig;
+    /// use futures::StreamExt;
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// // Example types for demonstration
+    /// #[derive(Serialize, Deserialize, Clone)]
+    /// struct BlockQuery {
+    ///     start_height: u64,
+    ///     end_height: u64,
+    /// }
+    /// #[derive(Serialize, Deserialize, Clone)]
+    /// struct Block {
+    ///     height: u64,
+    ///     hash: String,
+    /// }
+    ///
+    /// impl From<BlockQuery> for Vec<u8> {
+    ///     fn from(query: BlockQuery) -> Vec<u8> {
+    ///         query.start_height.to_string().into_bytes()
+    ///     }
+    /// }
+    /// impl TryFrom<Vec<u8>> for Block {
+    ///     type Error = Box<dyn std::error::Error + Send + Sync>;
+    ///     fn try_from(bytes: Vec<u8>) -> Result<Self, Self::Error> {
+    ///         Ok(Block { height: 1000, hash: String::from_utf8(bytes)? })
+    ///     }
+    /// }
+    ///
+    /// // Helper function
+    /// fn process_block(block: Block) {
+    ///     println!("Processing block {}", block.height);
+    /// }
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut network_manager = NetworkManager::new(NetworkConfig::default(), None, None);
+    ///
+    /// // Register as a client for block requests
+    /// let mut client = network_manager.register_sqmr_protocol_client::<BlockQuery, Block>(
+    ///     "/starknet/blocks/1.0.0".to_string(),
+    ///     100, // buffer size
+    /// );
+    ///
+    /// // Send a query and process responses
+    /// let query = BlockQuery { start_height: 1000, end_height: 1010 };
+    /// let mut response_manager = client.send_new_query(query).await?;
+    ///
+    /// while let Some(response_result) = response_manager.next().await {
+    ///     match response_result {
+    ///         Ok(block) => {
+    ///             // Process received block
+    ///             process_block(block);
+    ///         }
+    ///         Err(e) => {
+    ///             // Handle error, optionally report peer
+    ///             eprintln!("Invalid response: {}", e);
+    ///             response_manager.report_peer();
+    ///             break;
+    ///         }
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Protocol Registration
+    ///
+    /// Once registered, the client can send queries to any peer that supports this protocol.
+    /// Each query creates a new session that can receive multiple responses from the target peer.
+    ///
+    /// # Buffer Management
+    ///
+    /// The `buffer_size` parameter controls how many responses can be buffered per query
+    /// before backpressure is applied. This should be sized according to the expected
+    /// number of responses per query for the specific protocol.
     pub fn register_sqmr_protocol_client<Query, Response>(
         &mut self,
         protocol: String,
@@ -192,16 +477,126 @@ impl<SwarmT: SwarmTrait> GenericNetworkManager<SwarmT> {
             .sqmr_outbound_payload_receivers
             .insert(protocol.clone().as_ref().to_string(), Box::new(payload_receiver));
         if insert_result.is_some() {
-            panic!("Protocol '{}' has already been registered as a client.", protocol);
+            panic!("Protocol '{protocol}' has already been registered as a client.");
         };
 
         SqmrClientSender::new(Box::new(payload_sender), buffer_size)
     }
 
-    /// Register a new subscriber for broadcasting and receiving broadcasts for a given topic.
-    /// Panics if this topic is already subscribed.
-    // TODO(Shahak): consider splitting into register_broadcast_topic_client and
-    // register_broadcast_topic_server
+    /// Registers for broadcasting and receiving messages on a GossipSub topic.
+    ///
+    /// This method sets up bidirectional communication for a specific topic using the
+    /// GossipSub protocol. The node can both broadcast messages to the network and
+    /// receive messages broadcast by other peers.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `T` - The message type for this topic (must implement serialization traits)
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The GossipSub topic to subscribe to
+    /// * `buffer_size` - Size of the internal buffers for messages
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(BroadcastTopicChannels<T>)` - Channels for sending and receiving messages
+    /// * `Err(SubscriptionError)` - If subscription to the topic fails
+    ///
+    /// # Panics
+    ///
+    /// Panics if this topic has already been registered.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use apollo_network::gossipsub_impl::Topic;
+    /// use apollo_network::network_manager::{BroadcastTopicClientTrait, NetworkManager};
+    /// use apollo_network::NetworkConfig;
+    /// use futures::StreamExt;
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// // Example transaction type for demonstration
+    /// #[derive(Serialize, Deserialize, Clone)]
+    /// struct Transaction {
+    ///     hash: String,
+    ///     amount: u64,
+    /// }
+    ///
+    /// impl TryFrom<Vec<u8>> for Transaction {
+    ///     type Error = Box<dyn std::error::Error + Send + Sync>;
+    ///     fn try_from(bytes: Vec<u8>) -> Result<Self, Self::Error> {
+    ///         Ok(Transaction { hash: String::from_utf8(bytes)?, amount: 100 })
+    ///     }
+    /// }
+    /// impl From<Transaction> for Vec<u8> {
+    ///     fn from(tx: Transaction) -> Vec<u8> {
+    ///         tx.hash.into_bytes()
+    ///     }
+    /// }
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut network_manager = NetworkManager::new(NetworkConfig::default(), None, None);
+    ///
+    /// // Register for transaction broadcasting
+    /// let topic = Topic::new("transactions");
+    /// let mut channels = network_manager.register_broadcast_topic::<Transaction>(
+    ///     topic, 1000, // buffer size
+    /// )?;
+    ///
+    /// // Broadcast a transaction
+    /// let transaction = Transaction { hash: "tx123".to_string(), amount: 100 };
+    /// channels.broadcast_topic_client.broadcast_message(transaction).await?;
+    ///
+    /// // Helper functions for the example
+    /// fn validate_transaction(tx: &Transaction) -> bool {
+    ///     !tx.hash.is_empty()
+    /// }
+    /// fn process_transaction(tx: Transaction) {
+    ///     println!("Processing {}", tx.hash);
+    /// }
+    ///
+    /// // Receive and process broadcasted transactions
+    /// while let Some((result, metadata)) = channels.broadcasted_messages_receiver.next().await {
+    ///     match result {
+    ///         Ok(transaction) => {
+    ///             if validate_transaction(&transaction) {
+    ///                 // Valid transaction - continue propagation
+    ///                 channels.broadcast_topic_client.continue_propagation(&metadata).await?;
+    ///                 process_transaction(transaction);
+    ///             } else {
+    ///                 // Invalid transaction - report the originator
+    ///                 channels.broadcast_topic_client.report_peer(metadata).await?;
+    ///             }
+    ///         }
+    ///         Err(e) => {
+    ///             // Malformed message - report the originator
+    ///             eprintln!("Failed to deserialize transaction: {}", e);
+    ///             channels.broadcast_topic_client.report_peer(metadata).await?;
+    ///         }
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Topic Subscription
+    ///
+    /// Once registered, the node joins the GossipSub mesh for the topic and will:
+    /// - Receive all messages broadcast on this topic by other peers
+    /// - Participate in message propagation according to GossipSub rules
+    /// - Maintain mesh connections with other peers interested in this topic
+    ///
+    /// # Message Validation
+    ///
+    /// Received messages should be validated before propagation. Use:
+    /// - [`BroadcastTopicClient::continue_propagation`] for valid messages
+    /// - [`BroadcastTopicClient::report_peer`] for invalid messages
+    ///
+    /// # Buffer Management
+    ///
+    /// The `buffer_size` parameter controls buffering for both outbound and inbound
+    /// messages. Larger buffers can handle traffic bursts but use more memory.
     pub fn register_broadcast_topic<T>(
         &mut self,
         topic: Topic,
@@ -224,21 +619,25 @@ impl<SwarmT: SwarmTrait> GenericNetworkManager<SwarmT> {
             .messages_to_broadcast_receivers
             .insert(topic_hash.clone(), messages_to_broadcast_receiver);
         if insert_result.is_some() {
-            panic!("Topic '{}' has already been registered.", topic);
+            panic!("Topic '{topic}' has already been registered.");
         }
 
         let insert_result = self
             .broadcasted_messages_senders
             .insert(topic_hash.clone(), broadcasted_messages_sender.clone());
         if insert_result.is_some() {
-            panic!("Topic '{}' has already been registered.", topic);
+            panic!("Topic '{topic}' has already been registered.");
         }
 
+        // TODO(AndrewL): this line might be problematic in high throughput cases since this forces
+        // parsing to be done in sequence
         let broadcasted_messages_fn: BroadcastReceivedMessagesConverterFn<T> =
             |(x, broadcasted_message_metadata)| (T::try_from(x), broadcasted_message_metadata);
         let broadcasted_messages_receiver =
             broadcasted_messages_receiver.map(broadcasted_messages_fn);
 
+        // TODO(AndrewL): this line might be problematic in high throughput cases since this forces
+        // parsing to be done in sequence
         let messages_to_broadcast_fn: fn(T) -> Ready<Result<Bytes, SendError>> =
             |x| ready(Ok(Bytes::from(x)));
         let messages_to_broadcast_sender =
@@ -313,6 +712,7 @@ impl<SwarmT: SwarmTrait> GenericNetworkManager<SwarmT> {
                 local_addr,
                 send_back_addr,
                 error,
+                peer_id: _,
             } => {
                 // No need to panic here since this is a result of another peer trying to dial to us
                 // and failing. Other peers are welcome to retry.
@@ -530,19 +930,13 @@ impl<SwarmT: SwarmTrait> GenericNetworkManager<SwarmT> {
         &mut self,
         event: gossipsub_impl::ExternalEvent,
     ) -> Result<(), NetworkError> {
-        if let Some(broadcast_metrics_by_topic) =
-            self.metrics.as_ref().and_then(|metrics| metrics.broadcast_metrics_by_topic.as_ref())
-        {
-            let gossipsub_impl::ExternalEvent::Received { ref topic_hash, .. } = event;
-            match broadcast_metrics_by_topic.get(topic_hash) {
-                Some(broadcast_metrics) => {
-                    broadcast_metrics.num_received_broadcast_messages.increment(1)
-                }
-                None => error!("Attempted to update topic metric with unregistered topic_hash"),
-            }
-        }
         let gossipsub_impl::ExternalEvent::Received { originated_peer_id, message, topic_hash } =
             event;
+
+        self.update_broadcast_metric(&topic_hash, |broadcast_metrics| {
+            broadcast_metrics.num_received_broadcast_messages.increment(1);
+        });
+
         trace!("Received broadcast message with topic hash: {topic_hash:?}");
         let broadcasted_message_metadata = BroadcastedMessageMetadata {
             originator_id: OpaquePeerId::private_new(originated_peer_id),
@@ -615,19 +1009,34 @@ impl<SwarmT: SwarmTrait> GenericNetworkManager<SwarmT> {
             .insert(outbound_session_id, report_receiver);
     }
 
-    fn broadcast_message(&mut self, message: Bytes, topic_hash: TopicHash) {
+    fn update_broadcast_metric<'a, F>(&'a self, topic_hash: &TopicHash, f: F)
+    where
+        F: FnOnce(&'a BroadcastNetworkMetrics),
+    {
         if let Some(broadcast_metrics_by_topic) =
             self.metrics.as_ref().and_then(|metrics| metrics.broadcast_metrics_by_topic.as_ref())
         {
-            match broadcast_metrics_by_topic.get(&topic_hash) {
+            match broadcast_metrics_by_topic.get(topic_hash) {
                 Some(broadcast_metrics) => {
-                    broadcast_metrics.num_sent_broadcast_messages.increment(1)
+                    f(broadcast_metrics);
                 }
                 None => error!("Attempted to update topic metric with unregistered topic_hash"),
             }
         }
+    }
+
+    fn broadcast_message(&mut self, message: Bytes, topic_hash: TopicHash) {
+        self.update_broadcast_metric(&topic_hash, |broadcast_metrics| {
+            broadcast_metrics.num_sent_broadcast_messages.increment(1)
+        });
+
         trace!("Sending broadcast message with topic hash: {topic_hash:?}");
-        self.swarm.broadcast_message(message, topic_hash);
+        let result = self.swarm.broadcast_message(message, topic_hash.clone());
+        if let Err(err) = result {
+            self.update_broadcast_metric(&topic_hash, |broadcast_metrics| {
+                broadcast_metrics.increment_publish_error(&err);
+            });
+        }
     }
 
     fn report_session_removed_to_metrics(&mut self, session_id: SessionId) {
@@ -671,7 +1080,7 @@ fn send_now<Item>(
         Some(Ok(())) => {}
         Some(Err(error)) => {
             if should_panic_upon_disconnect || !error.is_disconnected() {
-                panic!("Received error while sending message: {:?}", error);
+                panic!("Received error while sending message: {error:?}");
             }
         }
         None => {
@@ -680,13 +1089,73 @@ fn send_now<Item>(
     }
 }
 
+/// Concrete network manager implementation using libp2p Swarm.
+///
+/// This is the main network manager type used in production. It wraps
+/// [`GenericNetworkManager`] with a concrete libp2p swarm implementation.
 pub type NetworkManager = GenericNetworkManager<Swarm<mixed_behaviour::MixedBehaviour>>;
 
 impl NetworkManager {
+    /// Creates a new network manager with the specified configuration.
+    ///
+    /// This method initializes all networking components including:
+    /// - libp2p swarm with TCP transport, DNS resolution, and security protocols
+    /// - SQMR protocol for query-response communication
+    /// - GossipSub for message broadcasting
+    /// - Kademlia DHT for peer discovery
+    /// - Peer management and reputation systems
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Network configuration parameters
+    /// * `node_version` - Optional version string for identification (e.g., "apollo-node/1.0.0")
+    /// * `metrics` - Optional metrics collection instance
+    ///
+    /// # Returns
+    ///
+    /// A configured [`NetworkManager`] ready to run.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use apollo_network::metrics::NetworkMetrics;
+    /// use apollo_network::network_manager::NetworkManager;
+    /// use apollo_network::NetworkConfig;
+    /// use starknet_api::core::ChainId;
+    ///
+    /// let config = NetworkConfig { port: 10000, chain_id: ChainId::Mainnet, ..Default::default() };
+    ///
+    /// let network_manager = NetworkManager::new(
+    ///     config,
+    ///     Some("my-starknet-node/1.0.0".to_string()),
+    ///     None, // metrics
+    /// );
+    /// ```
+    ///
+    /// # Transport Configuration
+    ///
+    /// The network manager is configured with:
+    /// - **TCP Transport**: Primary transport protocol
+    /// - **DNS Resolution**: For resolving domain names in multiaddresses
+    /// - **Noise Protocol**: For connection encryption and authentication
+    /// - **Yamux**: For connection multiplexing
+    ///
+    /// # Identity Generation
+    ///
+    /// If a secret key is provided in the config, it's used to deterministically
+    /// generate the peer ID. Otherwise, a random Ed25519 keypair is generated.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - The provided secret key is invalid
+    /// - Failed to bind to the specified port
+    /// - Transport configuration fails
+    /// - The advertised multiaddress contains a different peer ID than generated
     pub fn new(
         config: NetworkConfig,
         node_version: Option<String>,
-        metrics: Option<NetworkMetrics>,
+        mut metrics: Option<NetworkMetrics>,
     ) -> Self {
         let NetworkConfig {
             port,
@@ -700,36 +1169,41 @@ impl NetworkManager {
             peer_manager_config,
             broadcasted_message_metadata_buffer_size,
             reported_peer_ids_buffer_size,
+            prune_dead_connections_ping_interval,
+            prune_dead_connections_ping_timeout,
         } = config;
 
-        // TODO(shahak): Add quic transport.
-        let listen_address_str = format!("/ip4/0.0.0.0/tcp/{port}");
-        let listen_address = Multiaddr::from_str(&listen_address_str)
-            .unwrap_or_else(|_| panic!("Unable to parse address {}", listen_address_str));
-        debug!("Creating swarm with listen address: {:?}", listen_address);
+        let listen_address = make_multiaddr(Ipv4Addr::UNSPECIFIED, port, None);
+        debug!("Creating swarm with listen address: {listen_address:?}");
 
         let key_pair = match secret_key {
-            Some(secret_key) => {
-                Keypair::ed25519_from_bytes(secret_key).expect("Error while parsing secret key")
-            }
+            Some(secret_key) => Keypair::ed25519_from_bytes(secret_key.as_ref().clone())
+                .expect("Error while parsing secret key"), // TODO(victork): make sure we're
+            // allowed to expose the secret key
+            // here
             None => Keypair::generate_ed25519(),
         };
         let mut swarm = SwarmBuilder::with_existing_identity(key_pair)
         .with_tokio()
+        // TODO(AndrewL): .with_quic()
         .with_tcp(Default::default(), noise::Config::new, yamux::Config::default)
         .expect("Error building TCP transport")
         .with_dns()
         .expect("Error building DNS transport")
-        // TODO(Shahak): quic transpot does not work (failure appears in the command line when running in debug mode)
-        // .with_quic()
         .with_behaviour(|key| mixed_behaviour::MixedBehaviour::new(
-                key.clone(),
-                bootstrap_peer_multiaddr,
                 sqmr::Config { session_timeout },
-                chain_id,
-                node_version,
                 discovery_config,
                 peer_manager_config,
+                metrics.as_mut()
+                    .and_then(|m| m.event_metrics.take()),
+                metrics.as_mut()
+                    .and_then(|m| m.latency_metrics.take()),
+                key.clone(),
+                bootstrap_peer_multiaddr,
+                chain_id,
+                node_version,
+                prune_dead_connections_ping_interval,
+                prune_dead_connections_ping_timeout,
             ))
         .expect("Error while building the swarm")
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(idle_connection_timeout))
@@ -737,7 +1211,7 @@ impl NetworkManager {
 
         swarm
             .listen_on(listen_address.clone())
-            .unwrap_or_else(|_| panic!("Error while binding to {}", listen_address));
+            .unwrap_or_else(|_| panic!("Error while binding to {listen_address}"));
 
         let advertised_multiaddr = advertised_multiaddr.map(|address| {
             address
@@ -753,6 +1227,28 @@ impl NetworkManager {
         )
     }
 
+    /// Returns the local peer ID as a string.
+    ///
+    /// The peer ID is derived from the node's cryptographic identity and serves
+    /// as a unique identifier in the network. Other nodes use this ID to
+    /// establish connections and route messages.
+    ///
+    /// # Returns
+    ///
+    /// A string representation of the local peer ID in the format expected
+    /// by libp2p multiaddresses (e.g., "12D3KooWQYHvEJzuBP...").
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use apollo_network::network_manager::NetworkManager;
+    /// use apollo_network::NetworkConfig;
+    ///
+    /// let network_manager = NetworkManager::new(NetworkConfig::default(), None, None);
+    ///
+    /// let peer_id = network_manager.get_local_peer_id();
+    /// println!("Local peer ID: {}", peer_id);
+    /// ```
     pub fn get_local_peer_id(&self) -> String {
         self.swarm.local_peer_id().to_string()
     }

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use starknet_api::core::{ClassHash, ContractAddress, Nonce};
+use starknet_api::hash::HashOutput;
 use starknet_committer::block_committer::input::{
     ConfigImpl,
     Input,
@@ -9,8 +10,8 @@ use starknet_committer::block_committer::input::{
     StateDiff,
 };
 use starknet_committer::patricia_merkle_tree::types::CompiledClassHash;
-use starknet_patricia::hash::hash_trait::HashOutput;
 use starknet_patricia_storage::errors::DeserializationError;
+use starknet_patricia_storage::map_storage::MapStorage;
 use starknet_patricia_storage::storage_trait::{DbKey, DbValue};
 use starknet_types_core::felt::Felt;
 
@@ -18,12 +19,18 @@ use crate::committer_cli::parse_input::raw_input::RawInput;
 
 pub type InputImpl = Input<ConfigImpl>;
 
-impl TryFrom<RawInput> for InputImpl {
+#[derive(Debug, PartialEq)]
+pub struct CommitterInputImpl {
+    pub input: InputImpl,
+    pub storage: MapStorage,
+}
+
+impl TryFrom<RawInput> for CommitterInputImpl {
     type Error = DeserializationError;
     fn try_from(raw_input: RawInput) -> Result<Self, Self::Error> {
-        let mut storage = HashMap::new();
+        let mut storage = MapStorage::default();
         for entry in raw_input.storage {
-            add_unique(&mut storage, "storage", DbKey(entry.key), DbValue(entry.value))?;
+            add_unique(&mut storage.0, "storage", DbKey(entry.key), DbValue(entry.value))?;
         }
 
         let mut address_to_class_hash = HashMap::new();
@@ -58,16 +65,16 @@ impl TryFrom<RawInput> for InputImpl {
 
         let mut storage_updates = HashMap::new();
         for outer_entry in raw_input.state_diff.storage_updates {
-            let inner_map = outer_entry
+            let inner_map: HashMap<StarknetStorageKey, StarknetStorageValue> = outer_entry
                 .storage_updates
                 .iter()
                 .map(|inner_entry| {
-                    (
-                        StarknetStorageKey(Felt::from_bytes_be_slice(&inner_entry.key)),
+                    Ok((
+                        StarknetStorageKey(Felt::from_bytes_be_slice(&inner_entry.key).try_into()?),
                         StarknetStorageValue(Felt::from_bytes_be_slice(&inner_entry.value)),
-                    )
+                    ))
                 })
-                .collect();
+                .collect::<Result<_, Self::Error>>()?;
             add_unique(
                 &mut storage_updates,
                 "starknet storage updates",
@@ -75,9 +82,7 @@ impl TryFrom<RawInput> for InputImpl {
                 inner_map,
             )?;
         }
-
-        Ok(Input {
-            storage,
+        let input = Input {
             state_diff: StateDiff {
                 address_to_class_hash,
                 address_to_nonce,
@@ -91,7 +96,8 @@ impl TryFrom<RawInput> for InputImpl {
                 &raw_input.classes_trie_root_hash,
             )),
             config: raw_input.config.into(),
-        })
+        };
+        Ok(Self { input, storage })
     }
 }
 

@@ -21,15 +21,16 @@ use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use tokio::time::MissedTickBehavior::Delay;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 pub struct MempoolP2pRunner {
     network_future: BoxFuture<'static, Result<(), NetworkError>>,
     broadcasted_topic_server: BroadcastTopicServer<RpcTransactionBatch>,
     broadcast_topic_client: BroadcastTopicClient<RpcTransactionBatch>,
     gateway_client: SharedGatewayClient,
-    _mempool_p2p_propagator_client: SharedMempoolP2pPropagatorClient,
+    mempool_p2p_propagator_client: SharedMempoolP2pPropagatorClient,
     transaction_batch_rate_millis: Duration,
+    max_concurrent_gateway_requests: usize,
 }
 
 impl MempoolP2pRunner {
@@ -40,14 +41,16 @@ impl MempoolP2pRunner {
         gateway_client: SharedGatewayClient,
         mempool_p2p_propagator_client: SharedMempoolP2pPropagatorClient,
         transaction_batch_rate_millis: Duration,
+        max_concurrent_gateway_requests: usize,
     ) -> Self {
         Self {
             network_future,
             broadcasted_topic_server,
             broadcast_topic_client,
             gateway_client,
-            _mempool_p2p_propagator_client: mempool_p2p_propagator_client,
+            mempool_p2p_propagator_client,
             transaction_batch_rate_millis,
+            max_concurrent_gateway_requests,
         }
     }
 }
@@ -56,6 +59,7 @@ impl MempoolP2pRunner {
 impl ComponentStarter for MempoolP2pRunner {
     async fn start(&mut self) {
         let mut gateway_futures = FuturesUnordered::new();
+        let mut concurrent_gateway_requests = 0;
         let mut transaction_batch_broadcast_interval =
             tokio::time::interval(self.transaction_batch_rate_millis);
         transaction_batch_broadcast_interval.set_missed_tick_behavior(Delay);
@@ -66,11 +70,13 @@ impl ComponentStarter for MempoolP2pRunner {
                     panic!("MempoolP2pRunner failed - network stopped unexpectedly");
                 }
                 _ = transaction_batch_broadcast_interval.tick() => {
-                    if (self._mempool_p2p_propagator_client.broadcast_queued_transactions().await).is_err() {
-                        warn!("MempoolP2pPropagatorClient denied BroadcastQueuedTransactions request");
+                    let result = self.mempool_p2p_propagator_client.broadcast_queued_transactions().await;
+                    if result.is_err() {
+                        warn!("MempoolP2pPropagatorClient denied BroadcastQueuedTransactions request: {result:?}");
                     };
                 }
                 Some(result) = gateway_futures.next() => {
+                    concurrent_gateway_requests -= 1;
                     match result {
                         Ok(_) => {}
                         Err(gateway_client_error) => {
@@ -80,7 +86,7 @@ impl ComponentStarter for MempoolP2pRunner {
                                 GatewayError::DeprecatedGatewayError{p2p_message_metadata: Some(p2p_message_metadata), ..}
                             ) = gateway_client_error {
                                 warn!(
-                                    "Gateway rejected transaction we received from another peer. Reporting peer."
+                                    "Gateway rejected transaction we received from another peer. Reporting peer: {:?}.", p2p_message_metadata
                                 );
                                 if let Err(e) = self.broadcast_topic_client.report_peer(p2p_message_metadata.clone()).await {
                                     warn!("Failed to report peer: {:?}", e);
@@ -97,17 +103,22 @@ impl ComponentStarter for MempoolP2pRunner {
                 Some((message_result, broadcasted_message_metadata)) = self.broadcasted_topic_server.next() => {
                     match message_result {
                         Ok(message) => {
-                            // TODO(alonl): consider calculating the tx_hash and pringing it instead of the entire tx.
-                            info!("Received transaction from network, forwarding to gateway");
-                            debug!("received transaction: {:?}", message.0);
+                            // TODO(alonl): consider calculating the tx_hash and printing it instead of the entire tx.
+                            debug!("Received transaction batch from network, forwarding to gateway. Batch: {:?}", message.0);
                             for rpc_tx in message.0 {
+                                if concurrent_gateway_requests == self.max_concurrent_gateway_requests {
+                                    warn!("Rejecting transaction due to backpressure. Transaction: {:?}", rpc_tx);
+                                    continue;
+                                }
+
                                 gateway_futures.push(self.gateway_client.add_tx(
                                     GatewayInput { rpc_tx, message_metadata: Some(broadcasted_message_metadata.clone()) }
                                 ));
+                                concurrent_gateway_requests += 1;
                             }
                         }
                         Err(e) => {
-                            warn!("Received a faulty transaction from network: {:?}. Attempting to report the sending peer", e);
+                            warn!("Received a faulty transaction from network: {:?}. Attempting to report the sending peer {:?}", e, broadcasted_message_metadata);
                             if let Err(e) = self.broadcast_topic_client.report_peer(broadcasted_message_metadata).await {
                                 warn!("Failed to report peer: {:?}", e);
                             }

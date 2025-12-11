@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "validate_proposal_test.rs"]
+mod validate_proposal_test;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -9,28 +13,34 @@ use apollo_batcher_types::batcher_types::{
     ValidateBlockInput,
 };
 use apollo_batcher_types::communication::{BatcherClient, BatcherClientError};
+use apollo_batcher_types::errors::BatcherError;
 use apollo_class_manager_types::transaction_converter::TransactionConverterTrait;
 use apollo_consensus::types::ProposalCommitment;
 use apollo_l1_gas_price_types::errors::{EthToStrkOracleClientError, L1GasPriceClientError};
-use apollo_l1_gas_price_types::{EthToStrkOracleClientTrait, L1GasPriceProviderClient};
+use apollo_l1_gas_price_types::L1GasPriceProviderClient;
 use apollo_protobuf::consensus::{ConsensusBlockInfo, ProposalFin, ProposalPart, TransactionBatch};
-use apollo_state_sync_types::communication::{StateSyncClient, StateSyncClientError};
-use apollo_time::time::{sleep_until, Clock, DateTime};
-use futures::channel::{mpsc, oneshot};
+use apollo_state_sync_types::communication::StateSyncClient;
+use apollo_time::time::{Clock, ClockExt, DateTime};
+use futures::channel::mpsc;
 use futures::StreamExt;
-use starknet_api::block::{BlockHash, BlockNumber, GasPrice};
+use starknet_api::block::{BlockNumber, GasPrice};
 use starknet_api::consensus_transaction::InternalConsensusTransaction;
 use starknet_api::data_availability::L1DataAvailabilityMode;
 use starknet_api::transaction::TransactionHash;
+use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
 use starknet_api::StarknetApiError;
+use strum::EnumVariantNames;
+use strum_macros::{EnumDiscriminants, EnumIter, IntoStaticStr};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::metrics::{
+    CONSENSUS_ETH_TO_FRI_RATE_MISMATCH,
     CONSENSUS_L1_DATA_GAS_MISMATCH,
     CONSENSUS_L1_GAS_MISMATCH,
     CONSENSUS_NUM_BATCHES_IN_PROPOSAL,
     CONSENSUS_NUM_TXS_IN_PROPOSAL,
+    CONSENSUS_PROPOSAL_FIN_MISMATCH,
 };
 use crate::orchestrator_versioned_constants::VersionedConstants;
 use crate::sequencer_consensus_context::{BuiltProposals, SequencerConsensusContextDeps};
@@ -42,6 +52,8 @@ use crate::utils::{
     GasPriceParams,
 };
 
+const GAS_PRICE_ABS_DIFF_MARGIN: u128 = 1;
+
 pub(crate) struct ProposalValidateArguments {
     pub deps: SequencerConsensusContextDeps,
     pub block_info_validation: BlockInfoValidation,
@@ -50,7 +62,6 @@ pub(crate) struct ProposalValidateArguments {
     pub batcher_timeout_margin: Duration,
     pub valid_proposals: Arc<Mutex<BuiltProposals>>,
     pub content_receiver: mpsc::Receiver<ProposalPart>,
-    pub fin_sender: oneshot::Sender<ProposalCommitment>,
     pub gas_price_params: GasPriceParams,
     pub cancel_token: CancellationToken,
 }
@@ -67,7 +78,7 @@ pub(crate) struct BlockInfoValidation {
 
 enum HandledProposalPart {
     Continue,
-    Invalid,
+    Invalid(String),
     Finished(ProposalCommitment, ProposalFin),
     Failed(String),
 }
@@ -79,37 +90,56 @@ enum SecondProposalPart {
 
 type ValidateProposalResult<T> = Result<T, ValidateProposalError>;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, EnumDiscriminants)]
+#[strum_discriminants(
+    name(ValidateProposalFailureReasonLabelValue),
+    derive(IntoStaticStr, EnumIter, EnumVariantNames),
+    strum(serialize_all = "snake_case")
+)]
 pub(crate) enum ValidateProposalError {
     #[error("Batcher error: {0}")]
-    Batcher(#[from] BatcherClientError),
+    Batcher(String, BatcherClientError),
     #[error("State sync client error: {0}")]
-    StateSyncClientError(#[from] StateSyncClientError),
-    #[error("State sync is not ready: {0}")]
-    StateSyncNotReady(String),
+    StateSyncClientError(String),
+    #[error("State sync is not ready: block number {0} not found")]
+    StateSyncNotReady(BlockNumber),
+    // Consensus may exit early (e.g. sync).
+    #[error("Failed to send commitment to consensus: {0}")]
+    SendError(ProposalCommitment),
     #[error("EthToStrkOracle error: {0}")]
     EthToStrkOracle(#[from] EthToStrkOracleClientError),
     #[error("L1GasPriceProvider error: {0}")]
     L1GasPriceProvider(#[from] L1GasPriceClientError),
     #[error("Block info conversion error: {0}")]
     BlockInfoConversion(#[from] StarknetApiError),
-    #[error("Validation timed out.")]
-    ValidationTimeout,
-    #[error("Proposal interrupted.")]
-    ProposalInterrupted,
-    #[error("Got an invalid proposal part {1:?}. {0}")]
-    InvalidProposalPart(String, Option<ProposalPart>),
+    #[error("Invalid BlockInfo: {2}. received:{0:?}, validation criteria {1:?}.")]
+    InvalidBlockInfo(ConsensusBlockInfo, BlockInfoValidation, String),
+    #[error("Validation timed out while {0}")]
+    ValidationTimeout(String),
+    #[error("Proposal interrupted while {0}")]
+    ProposalInterrupted(String),
+    #[error("Got an invalid second proposal part: {0:?}.")]
+    InvalidSecondProposalPart(Option<ProposalPart>),
+    #[error("Batcher returned Invalid status: {0}.")]
+    InvalidProposal(String),
+    #[error("Proposal part {1:?} failed validation: {0}.")]
+    ProposalPartFailed(String, Option<ProposalPart>),
+    #[error("proposal_commitment built by the batcher does not match the proposal fin.")]
+    ProposalFinMismatch,
+    #[error("Cannot calculate deadline. timeout: {timeout:?}, now: {now:?}")]
+    CannotCalculateDeadline { timeout: Duration, now: DateTime },
 }
 
-pub(crate) async fn validate_proposal(mut args: ProposalValidateArguments) {
+pub(crate) async fn validate_proposal(
+    mut args: ProposalValidateArguments,
+) -> ValidateProposalResult<ProposalCommitment> {
     let mut content = Vec::new();
     let mut final_n_executed_txs: Option<usize> = None;
     let now = args.deps.clock.now();
 
     let Some(deadline) = now.checked_add_signed(chrono::TimeDelta::from_std(args.timeout).unwrap())
     else {
-        warn!("Cannot calculate deadline. Timeout: {:?}, now: {:?}", args.timeout, now);
-        return;
+        return Err(ValidateProposalError::CannotCalculateDeadline { timeout: args.timeout, now });
     };
 
     let block_info = match await_second_proposal_part(
@@ -118,34 +148,23 @@ pub(crate) async fn validate_proposal(mut args: ProposalValidateArguments) {
         &mut args.content_receiver,
         args.deps.clock.as_ref(),
     )
-    .await
+    .await?
     {
-        Ok(SecondProposalPart::BlockInfo(block_info)) => block_info,
-        Ok(SecondProposalPart::Fin(ProposalFin { proposal_commitment })) => {
-            if args.fin_sender.send(proposal_commitment).is_err() {
-                // Consensus may exit early (e.g. sync).
-                warn!("Failed to send proposal content ids");
-            }
-            return;
-        }
-        Err(_) => {
-            return;
+        SecondProposalPart::BlockInfo(block_info) => block_info,
+        SecondProposalPart::Fin(ProposalFin { proposal_commitment }) => {
+            return Ok(proposal_commitment);
         }
     };
-
-    if !is_block_info_valid(
+    is_block_info_valid(
         args.block_info_validation.clone(),
         block_info.clone(),
-        args.deps.eth_to_strk_oracle_client,
         args.deps.clock.as_ref(),
         args.deps.l1_gas_price_provider,
         &args.gas_price_params,
     )
-    .await
-    {
-        return;
-    }
-    if let Err(e) = initiate_validation(
+    .await?;
+
+    initiate_validation(
         args.deps.batcher.as_ref(),
         args.deps.state_sync_client,
         block_info.clone(),
@@ -153,29 +172,28 @@ pub(crate) async fn validate_proposal(mut args: ProposalValidateArguments) {
         args.timeout + args.batcher_timeout_margin,
         args.deps.clock.as_ref(),
     )
-    .await
-    {
-        error!("Failed to initiate proposal validation. {e:?}");
-        return;
-    }
+    .await?;
+
     // Validating the rest of the proposal parts.
     let (built_block, received_fin) = loop {
         tokio::select! {
             _ = args.cancel_token.cancelled() => {
-                warn!("Proposal interrupted during validation.");
                 batcher_abort_proposal(args.deps.batcher.as_ref(), args.proposal_id).await;
-                return;
+                return Err(ValidateProposalError::ProposalInterrupted(
+                    "validating proposal parts".to_string(),
+                ));
             }
-            _ = sleep_until(deadline, args.deps.clock.as_ref()) => {
-                warn!("Validation timed out.");
+            _ = args.deps.clock.sleep_until(deadline) => {
                 batcher_abort_proposal(args.deps.batcher.as_ref(), args.proposal_id).await;
-                return;
+                return Err(ValidateProposalError::ValidationTimeout(
+                    "validating proposal parts".to_string(),
+                ));
             }
             proposal_part = args.content_receiver.next() => {
                 match handle_proposal_part(
                     args.proposal_id,
                     args.deps.batcher.as_ref(),
-                    proposal_part,
+                    proposal_part.clone(),
                     &mut content,
                     &mut final_n_executed_txs,
                     args.deps.transaction_converter.clone(),
@@ -184,15 +202,13 @@ pub(crate) async fn validate_proposal(mut args: ProposalValidateArguments) {
                         break (built_block, received_fin);
                     }
                     HandledProposalPart::Continue => {continue;}
-                    HandledProposalPart::Invalid => {
-                        warn!("Invalid proposal.");
+                    HandledProposalPart::Invalid(err) => {
                         // No need to abort since the Batcher is the source of this info.
-                        return;
+                        return Err(ValidateProposalError::InvalidProposal(err));
                     }
                     HandledProposalPart::Failed(fail_reason) => {
-                        warn!("Failed to handle proposal part. {fail_reason}");
                         batcher_abort_proposal(args.deps.batcher.as_ref(), args.proposal_id).await;
-                        return;
+                        return Err(ValidateProposalError::ProposalPartFailed(fail_reason,proposal_part));
                     }
                 }
             }
@@ -216,40 +232,58 @@ pub(crate) async fn validate_proposal(mut args: ProposalValidateArguments) {
 
     // TODO(matan): Switch to signature validation.
     if built_block != received_fin.proposal_commitment {
-        warn!("proposal_id built from content received does not match fin.");
-        return;
+        CONSENSUS_PROPOSAL_FIN_MISMATCH.increment(1);
+        return Err(ValidateProposalError::ProposalFinMismatch);
     }
 
-    if args.fin_sender.send(built_block).is_err() {
-        // Consensus may exit early (e.g. sync).
-        warn!("Failed to send proposal content ids");
-    }
+    Ok(built_block)
 }
 
 #[instrument(level = "warn", skip_all, fields(?block_info_validation, ?block_info_proposed))]
 async fn is_block_info_valid(
     block_info_validation: BlockInfoValidation,
     block_info_proposed: ConsensusBlockInfo,
-    eth_to_strk_oracle_client: Arc<dyn EthToStrkOracleClientTrait>,
     clock: &dyn Clock,
     l1_gas_price_provider: Arc<dyn L1GasPriceProviderClient>,
     gas_price_params: &GasPriceParams,
-) -> bool {
+) -> ValidateProposalResult<()> {
     let now: u64 = clock.unix_now();
     let last_block_timestamp =
         block_info_validation.previous_block_info.as_ref().map_or(0, |info| info.timestamp);
+    if block_info_proposed.timestamp < last_block_timestamp {
+        return Err(ValidateProposalError::InvalidBlockInfo(
+            block_info_proposed.clone(),
+            block_info_validation.clone(),
+            format!(
+                "Timestamp is too old: last_block_timestamp={}, proposed={}",
+                last_block_timestamp, block_info_proposed.timestamp
+            ),
+        ));
+    }
+    if block_info_proposed.timestamp > now + block_info_validation.block_timestamp_window_seconds {
+        return Err(ValidateProposalError::InvalidBlockInfo(
+            block_info_proposed.clone(),
+            block_info_validation.clone(),
+            format!(
+                "Timestamp is in the future: now={}, block_timestamp_window_seconds={}, \
+                 proposed={}",
+                now,
+                block_info_validation.block_timestamp_window_seconds,
+                block_info_proposed.timestamp
+            ),
+        ));
+    }
     if !(block_info_proposed.height == block_info_validation.height
-        && block_info_proposed.timestamp >= last_block_timestamp
-        // Check timestamp isn't in the future (allowing for clock disagreement).
-        && block_info_proposed.timestamp <= now + block_info_validation.block_timestamp_window_seconds
         && block_info_proposed.l1_da_mode == block_info_validation.l1_da_mode
         && block_info_proposed.l2_gas_price_fri == block_info_validation.l2_gas_price_fri)
     {
-        warn!("Invalid BlockInfo. local_timestamp={now}");
-        return false;
+        return Err(ValidateProposalError::InvalidBlockInfo(
+            block_info_proposed.clone(),
+            block_info_validation.clone(),
+            "Block info validation failed".to_string(),
+        ));
     }
     let (eth_to_fri_rate, l1_gas_prices) = get_oracle_rate_and_prices(
-        eth_to_strk_oracle_client,
         l1_gas_price_provider,
         block_info_proposed.timestamp,
         block_info_validation.previous_block_info.as_ref(),
@@ -260,24 +294,14 @@ async fn is_block_info_valid(
         VersionedConstants::latest_constants().l1_gas_price_margin_percent.into();
     debug!("L1 price info: {l1_gas_prices:?}");
 
-    // TODO(guyn): when is_block_info_valid is refactored to return a Result, propagate these
-    // errors.
-    let Ok(l1_gas_price_fri) = l1_gas_prices.base_fee_per_gas.wei_to_fri(eth_to_fri_rate) else {
-        return false;
-    };
-    let Ok(l1_data_gas_price_fri) = l1_gas_prices.blob_fee.wei_to_fri(eth_to_fri_rate) else {
-        return false;
-    };
-    let Ok(l1_gas_price_fri_proposed) =
-        block_info_proposed.l1_gas_price_wei.wei_to_fri(block_info_proposed.eth_to_fri_rate)
-    else {
-        return false;
-    };
-    let Ok(l1_data_gas_price_fri_proposed) =
-        block_info_proposed.l1_data_gas_price_wei.wei_to_fri(block_info_proposed.eth_to_fri_rate)
-    else {
-        return false;
-    };
+    let l1_gas_price_fri = l1_gas_prices.base_fee_per_gas.wei_to_fri(eth_to_fri_rate)?;
+    let l1_data_gas_price_fri = l1_gas_prices.blob_fee.wei_to_fri(eth_to_fri_rate)?;
+    let l1_gas_price_fri_proposed =
+        block_info_proposed.l1_gas_price_wei.wei_to_fri(block_info_proposed.eth_to_fri_rate)?;
+    let l1_data_gas_price_fri_proposed = block_info_proposed
+        .l1_data_gas_price_wei
+        .wei_to_fri(block_info_proposed.eth_to_fri_rate)?;
+
     if !(within_margin(l1_gas_price_fri_proposed, l1_gas_price_fri, l1_gas_price_margin_percent)
         && within_margin(
             l1_data_gas_price_fri_proposed,
@@ -285,26 +309,40 @@ async fn is_block_info_valid(
             l1_gas_price_margin_percent,
         ))
     {
-        warn!(
-            %l1_gas_price_fri_proposed,
-            %l1_gas_price_fri,
-            %l1_data_gas_price_fri_proposed,
-            %l1_data_gas_price_fri,
-            %l1_gas_price_margin_percent,
-            "Invalid L1 gas price proposed.",
-        );
-        return false;
+        return Err(ValidateProposalError::InvalidBlockInfo(
+            block_info_proposed,
+            block_info_validation,
+            format!(
+                "L1 gas price mismatch: expected L1 gas price FRI={l1_gas_price_fri}, \
+                 proposed={l1_gas_price_fri_proposed}, expected L1 data gas price \
+                 FRI={l1_data_gas_price_fri}, proposed={l1_data_gas_price_fri_proposed}, \
+                 l1_gas_price_margin_percent={l1_gas_price_margin_percent}"
+            ),
+        ));
     }
-    if l1_gas_price_fri_proposed != l1_gas_price_fri {
+    // TODO(Asmaa): consider removing after 0.14 as other validators may use other sources.
+    if block_info_proposed.eth_to_fri_rate != eth_to_fri_rate {
+        CONSENSUS_ETH_TO_FRI_RATE_MISMATCH.increment(1);
+    }
+
+    // L1 gas prices should match exactly in wei.
+    if block_info_proposed.l1_gas_price_wei != l1_gas_prices.base_fee_per_gas {
         CONSENSUS_L1_GAS_MISMATCH.increment(1);
     }
-    if l1_data_gas_price_fri_proposed != l1_data_gas_price_fri {
+    if block_info_proposed.l1_data_gas_price_wei != l1_gas_prices.blob_fee {
         CONSENSUS_L1_DATA_GAS_MISMATCH.increment(1);
     }
-    true
+    Ok(())
 }
 
 fn within_margin(number1: GasPrice, number2: GasPrice, margin_percent: u128) -> bool {
+    // For small numbers (e.g., less than 10 wei, if margin is 10%), even an off-by-one
+    // error might be bigger than the margin, even if it is just a rounding error.
+    // We make an exception for such mismatch, and don't bother checking percentages
+    // if the difference in price is only one wei.
+    if number1.0.abs_diff(number2.0) <= GAS_PRICE_ABS_DIFF_MARGIN {
+        return true;
+    }
     let margin = (number1.0 * margin_percent) / 100;
     number1.0.abs_diff(number2.0) <= margin
 }
@@ -320,12 +358,14 @@ async fn await_second_proposal_part(
 ) -> ValidateProposalResult<SecondProposalPart> {
     tokio::select! {
         _ = cancel_token.cancelled() => {
-            warn!("Proposal interrupted");
-            Err(ValidateProposalError::ProposalInterrupted)
+            Err(ValidateProposalError::ProposalInterrupted(
+                "waiting for second proposal part".to_string(),
+            ))
         }
-        _ = sleep_until(deadline, clock) => {
-            warn!("Validation timed out.");
-            Err(ValidateProposalError::ValidationTimeout)
+        _ = clock.sleep_until(deadline) => {
+            Err(ValidateProposalError::ValidationTimeout(
+                "waiting for second proposal part".to_string(),
+            ))
         }
         proposal_part = content_receiver.next() => {
             match proposal_part {
@@ -337,9 +377,7 @@ async fn await_second_proposal_part(
                     Ok(SecondProposalPart::Fin(ProposalFin { proposal_commitment }))
                 }
                 x => {
-                    warn!("Invalid second proposal part: {x:?}");
-                    Err(ValidateProposalError::InvalidProposalPart(
-                        "Invalid second proposal part.".to_string(), x
+                    Err(ValidateProposalError::InvalidSecondProposalPart(x
                     ))
                 }
             }
@@ -361,11 +399,18 @@ async fn initiate_validation(
     let input = ValidateBlockInput {
         proposal_id,
         deadline: clock.now() + chrono_timeout,
-        retrospective_block_hash: retrospective_block_hash(state_sync_client, &block_info).await?,
+        retrospective_block_hash: retrospective_block_hash(state_sync_client, &block_info)
+            .await
+            .map_err(ValidateProposalError::from)?,
         block_info: convert_to_sn_api_block_info(&block_info)?,
     };
     debug!("Initiating validate proposal: input={input:?}");
-    batcher.validate_block(input).await?;
+    batcher.validate_block(input.clone()).await.map_err(|err| {
+        ValidateProposalError::Batcher(
+            format!("Failed to initiate validate proposal {input:?}."),
+            err,
+        )
+    })?;
     Ok(())
 }
 
@@ -382,7 +427,16 @@ async fn handle_proposal_part(
     transaction_converter: Arc<dyn TransactionConverterTrait>,
 ) -> HandledProposalPart {
     match proposal_part {
-        None => HandledProposalPart::Failed("Failed to receive proposal content".to_string()),
+        None => {
+            // Can happen due to:
+            // 1. The StreamHandler evicted this stream.
+            // 2. The stream was closed by the Proposer without sending ProposalFin.
+            //    - Can occur if the Proposer can't complete the proposal (e.g. error during
+            //      build_proposal).
+            HandledProposalPart::Failed(
+                "Proposal content stream was closed before receiving fin".to_string(),
+            )
+        }
         Some(ProposalPart::Fin(fin)) => {
             info!("Received fin={fin:?}");
             let Some(final_n_executed_txs_nonopt) = *final_n_executed_txs else {
@@ -395,15 +449,22 @@ async fn handle_proposal_part(
                 proposal_id,
                 content: SendProposalContent::Finish(final_n_executed_txs_nonopt),
             };
-            let response = batcher.send_proposal_content(input).await.unwrap_or_else(|e| {
-                panic!("Failed to send Fin to batcher: {proposal_id:?}. {e:?}")
-            });
+            let response = match batcher.send_proposal_content(input).await {
+                Ok(response) => response,
+                Err(e) => {
+                    return HandledProposalPart::Failed(format!(
+                        "Failed to send Fin to batcher: {e:?}"
+                    ));
+                }
+            };
             let response_id = match response.response {
                 ProposalStatus::Finished(id) => id,
-                ProposalStatus::InvalidProposal => return HandledProposalPart::Invalid,
-                status => panic!("Unexpected status: for {proposal_id:?}, {status:?}"),
+                ProposalStatus::InvalidProposal(err) => return HandledProposalPart::Invalid(err),
+                status => {
+                    unreachable!("Unexpected batcher status for fin: {status:?}");
+                }
             };
-            let batcher_block_id = BlockHash(response_id.state_diff_commitment.0.0);
+            let batcher_block_id = ProposalCommitment(response_id.state_diff_commitment.0.0);
 
             info!(
                 network_block_id = ?fin.proposal_commitment,
@@ -447,13 +508,20 @@ async fn handle_proposal_part(
             content.push(txs.clone());
             let input =
                 SendProposalContentInput { proposal_id, content: SendProposalContent::Txs(txs) };
-            let response = batcher.send_proposal_content(input).await.unwrap_or_else(|e| {
-                panic!("Failed to send proposal content to batcher: {proposal_id:?}. {e:?}")
-            });
+            let response = match batcher.send_proposal_content(input).await {
+                Ok(response) => response,
+                Err(e) => {
+                    return HandledProposalPart::Failed(format!(
+                        "Failed to send transactions to batcher: {e:?}"
+                    ));
+                }
+            };
             match response.response {
                 ProposalStatus::Processing => HandledProposalPart::Continue,
-                ProposalStatus::InvalidProposal => HandledProposalPart::Invalid,
-                status => panic!("Unexpected status: for {proposal_id:?}, {status:?}"),
+                ProposalStatus::InvalidProposal(err) => HandledProposalPart::Invalid(err),
+                status => {
+                    unreachable!("Unexpected batcher status for transactions: {status:?}");
+                }
             }
         }
         Some(ProposalPart::ExecutedTransactionCount(executed_txs_count)) => {
@@ -478,10 +546,38 @@ async fn handle_proposal_part(
     }
 }
 
+// TODO(alonl, matan): consider making the retry logic part of the client interface.
 async fn batcher_abort_proposal(batcher: &dyn BatcherClient, proposal_id: ProposalId) {
     let input = SendProposalContentInput { proposal_id, content: SendProposalContent::Abort };
-    batcher
-        .send_proposal_content(input)
-        .await
-        .unwrap_or_else(|e| panic!("Failed to send Abort to batcher: {proposal_id:?}. {e:?}"));
+
+    const MAX_CLIENT_RETRIES: usize = 10;
+    let mut client_attempts = 0;
+
+    loop {
+        match batcher.send_proposal_content(input.clone()).await {
+            Ok(_) => return, // Success - abort sent successfully
+
+            Err(BatcherClientError::BatcherError(BatcherError::ProposalAborted)) => {
+                warn!("Proposal {proposal_id:?} was already aborted by batcher");
+                return;
+            }
+
+            // TODO(Dafna): Properly handle errors. Not all errors should be propagated as panics.
+            // We should have a way to report an error and continue to the next height.
+            Err(BatcherClientError::BatcherError(e)) => {
+                panic!("Batcher failed to abort proposal {proposal_id:?}: {e:?}");
+            }
+
+            Err(BatcherClientError::ClientError(e)) => {
+                client_attempts += 1;
+                if client_attempts >= MAX_CLIENT_RETRIES {
+                    panic!(
+                        "Failed to send abort to batcher after {MAX_CLIENT_RETRIES} attempts: \
+                         {e:?}"
+                    );
+                }
+                // Continue loop for retry
+            }
+        }
+    }
 }

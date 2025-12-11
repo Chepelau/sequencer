@@ -5,14 +5,16 @@ mod block_test;
 use std::fmt::Display;
 use std::ops::Deref;
 
+use apollo_sizeof::SizeOf;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use size_of::SizeOf;
 use starknet_types_core::felt::Felt;
 use starknet_types_core::hash::{Poseidon, StarkHash as CoreStarkHash};
 use strum_macros::EnumIter;
+use time::OffsetDateTime;
 
 use crate::core::{
+    ascii_as_felt,
     ContractAddress,
     EventCommitment,
     GlobalRoot,
@@ -62,6 +64,10 @@ macro_rules! starknet_version_enum {
 
         impl StarknetVersion {
             pub const LATEST: Self = Self::$latest;
+
+            pub fn has_partial_block_hash_components(&self) -> bool {
+                self >= &Self::V0_13_2
+            }
         }
 
         impl From<&StarknetVersion> for Vec<u8> {
@@ -90,6 +96,7 @@ macro_rules! starknet_version_enum {
 }
 
 starknet_version_enum! {
+    (PreV0_9_1, 0, 0, 0), // Blocks pre V0.9.1 had no starknet version field
     (V0_9_1, 0, 9, 1),
     (V0_10_0, 0, 10, 0),
     (V0_10_1, 0, 10, 1),
@@ -113,8 +120,9 @@ starknet_version_enum! {
     (V0_13_5, 0, 13, 5),
     (V0_13_6, 0, 13, 6),
     (V0_14_0, 0, 14, 0),
-    V0_14_0
-
+    (V0_14_1, 0, 14, 1),
+    (V0_15_0, 0, 15, 0),
+    V0_15_0
 }
 
 impl Default for StarknetVersion {
@@ -156,6 +164,14 @@ impl TryFrom<&str> for StarknetVersion {
     type Error = StarknetApiError;
     fn try_from(starknet_version: &str) -> Result<Self, StarknetApiError> {
         Self::try_from(starknet_version.to_string())
+    }
+}
+
+impl TryFrom<&StarknetVersion> for Felt {
+    type Error = StarknetApiError;
+
+    fn try_from(starknet_version: &StarknetVersion) -> Result<Self, Self::Error> {
+        ascii_as_felt(&starknet_version.to_string())
     }
 }
 
@@ -208,6 +224,7 @@ pub struct BlockHeader {
     pub receipt_commitment: Option<ReceiptCommitment>,
 }
 
+// TODO(Nimrod): Consider deleting this struct or move it to the CLI crate.
 /// The header of a [Block](`crate::block::Block`) without hashing.
 #[derive(Debug, Default, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, PartialOrd, Ord)]
 pub struct BlockHeaderWithoutHash {
@@ -265,6 +282,7 @@ pub enum BlockStatus {
     PartialOrd,
     Ord,
     derive_more::Display,
+    derive_more::Deref,
 )]
 pub struct BlockHash(pub StarkHash);
 
@@ -308,6 +326,50 @@ impl BlockNumber {
     pub fn iter_up_to(&self, up_to: Self) -> impl Iterator<Item = BlockNumber> {
         let range = self.0..up_to.0;
         range.map(Self)
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PreviousBlockNumber(pub Option<BlockNumber>);
+
+impl std::fmt::Display for PreviousBlockNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(block_number) => write!(f, "{}", block_number),
+            None => write!(f, "None"),
+        }
+    }
+}
+
+impl TryFrom<Felt> for PreviousBlockNumber {
+    type Error = StarknetApiError;
+
+    /// Returns None if the Felt is Felt::MAX, which represents the previous block number for the
+    /// first block.
+    /// Otherwise, returns Some(BlockNumber) if the Felt is a valid block number.
+    fn try_from(value: Felt) -> Result<Self, Self::Error> {
+        // -1 in the Field (Felt::MAX) represents the previous block number for the first block.
+        if value == Felt::MAX {
+            Ok(Self(None))
+        } else {
+            Ok(Self(Some(BlockNumber(value.try_into().map_err(|_| {
+                StarknetApiError::OutOfRange {
+                    string: format!("Block number {value} is out of range"),
+                }
+            })?))))
+        }
+    }
+}
+
+impl From<PreviousBlockNumber> for Felt {
+    /// Converts a [PreviousBlockNumber](`crate::block::PreviousBlockNumber`) into a Felt.
+    /// Returns Felt::MAX (-1 in the field) if the previous block number is None, which means the
+    /// current block is the first block.
+    fn from(value: PreviousBlockNumber) -> Self {
+        match value.0 {
+            Some(block_number) => Self::from(block_number.0),
+            None => Self::MAX,
+        }
     }
 }
 
@@ -548,13 +610,37 @@ impl GasPrices {
             FeeType::Eth => &self.eth_gas_prices,
         }
     }
+    pub fn l1_gas_price_per_token(&self) -> GasPricePerToken {
+        GasPricePerToken {
+            price_in_fri: self.strk_gas_prices.l1_gas_price.get(),
+            price_in_wei: self.eth_gas_prices.l1_gas_price.get(),
+        }
+    }
+
+    pub fn l1_data_gas_price_per_token(&self) -> GasPricePerToken {
+        GasPricePerToken {
+            price_in_fri: self.strk_gas_prices.l1_data_gas_price.get(),
+            price_in_wei: self.eth_gas_prices.l1_data_gas_price.get(),
+        }
+    }
+
+    pub fn l2_gas_price_per_token(&self) -> GasPricePerToken {
+        GasPricePerToken {
+            price_in_fri: self.strk_gas_prices.l2_gas_price.get(),
+            price_in_wei: self.eth_gas_prices.l2_gas_price.get(),
+        }
+    }
 }
+
+// TODO(Arni): replace all relevant instances of `u64` with UnixTimestamp.
+/// A Unix timestamp in seconds since the Unix epoch (January 1, 1970).
+pub type UnixTimestamp = u64;
 
 /// The timestamp of a [Block](`crate::block::Block`).
 #[derive(
     Debug, Default, Copy, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, PartialOrd, Ord,
 )]
-pub struct BlockTimestamp(pub u64);
+pub struct BlockTimestamp(pub UnixTimestamp);
 
 impl BlockTimestamp {
     pub fn saturating_add(self, rhs: &u64) -> Self {
@@ -582,7 +668,10 @@ impl From<u64> for BlockTimestamp {
 
 impl Display for BlockTimestamp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        let seconds_from_epoch = i64::try_from(self.0).map_err(|_| std::fmt::Error)?;
+        let time_in_range =
+            OffsetDateTime::from_unix_timestamp(seconds_from_epoch).map_err(|_| std::fmt::Error)?;
+        write!(f, "{time_in_range}")
     }
 }
 
@@ -590,6 +679,7 @@ impl Display for BlockTimestamp {
 pub struct BlockInfo {
     pub block_number: BlockNumber,
     pub block_timestamp: BlockTimestamp,
+    pub starknet_version: StarknetVersion,
 
     // Fee-related.
     pub sequencer_address: ContractAddress,
@@ -599,9 +689,7 @@ pub struct BlockInfo {
 
 /// The signature of a [Block](`crate::block::Block`), signed by the sequencer. The signed message
 /// is defined as poseidon_hash(block_hash, state_diff_commitment).
-#[derive(
-    Debug, Default, Copy, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, PartialOrd, Ord,
-)]
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Hash, Deserialize, Serialize)]
 pub struct BlockSignature(pub Signature);
 
 /// The error type returned from the block verification functions.

@@ -6,7 +6,6 @@ use blockifier::state::state_api::StateReader;
 use cairo_lang_starknet_classes::casm_contract_class::CasmContractClass;
 use pretty_assertions::assert_eq;
 use starknet_api::class_hash;
-use starknet_api::contract_class::SierraVersion;
 use starknet_api::deprecated_contract_class::ContractClass as DeprecatedContractClass;
 use starknet_api::state::SierraContractClass;
 use starknet_types_core::felt::Felt;
@@ -33,15 +32,11 @@ fn global_contract_cache_update() {
     };
     let sierra = SierraContractClass::default();
     let contract_class = RunnableCompiledClass::V1(
-        CompiledClassV1::try_from((
-            casm.clone(),
-            SierraVersion::extract_from_program(&sierra.sierra_program).unwrap(),
-        ))
-        .unwrap(),
+        CompiledClassV1::try_from((casm.clone(), sierra.get_sierra_version().unwrap())).unwrap(),
     );
     let class_hash = class_hash!("0x1");
 
-    let temp_storage_path = tempfile::tempdir().unwrap().into_path();
+    let temp_storage_path = tempfile::tempdir().unwrap().keep();
     let mut block_executor = PyBlockExecutor::create_for_testing(
         PyConcurrencyConfig::default(),
         PyContractClassManagerConfig::default(),
@@ -49,6 +44,7 @@ fn global_contract_cache_update() {
         temp_storage_path,
         4000,
         DEFAULT_STACK_SIZE,
+        None,
         None,
     );
     block_executor
@@ -124,7 +120,7 @@ fn global_contract_cache_update_large_contract() {
     let dep_casm: DeprecatedContractClass = serde_json::from_value(raw_contract_class)
         .expect("DeprecatedContractClass is not supported for this contract.");
 
-    let temp_storage_path = tempfile::tempdir().unwrap().into_path();
+    let temp_storage_path = tempfile::tempdir().unwrap().keep();
     let mut block_executor = PyBlockExecutor::native_create_for_testing(
         Default::default(),
         PyContractClassManagerConfig::default(),

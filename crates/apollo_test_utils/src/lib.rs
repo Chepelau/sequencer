@@ -49,6 +49,10 @@ use starknet_api::block::{
     GasPricePerToken,
     StarknetVersion,
 };
+use starknet_api::block_hash::block_hash_calculator::{
+    BlockHeaderCommitments,
+    PartialBlockHashComponents,
+};
 use starknet_api::consensus_transaction::ConsensusTransaction;
 use starknet_api::contract_class::EntryPointType;
 use starknet_api::core::{
@@ -86,7 +90,7 @@ use starknet_api::deprecated_contract_class::{
     TypedParameter,
 };
 use starknet_api::execution_resources::{Builtin, ExecutionResources, GasAmount, GasVector};
-use starknet_api::hash::{PoseidonHash, StarkHash};
+use starknet_api::hash::{HashOutput, PoseidonHash, StarkHash, StateRoots};
 use starknet_api::rpc_transaction::{
     EntryPointByType as RpcEntryPointByType,
     EntryPointByType,
@@ -118,6 +122,7 @@ use starknet_api::transaction::fields::{
     ContractAddressSalt,
     Fee,
     PaymasterData,
+    ProofFacts,
     Resource,
     ResourceBounds,
     Tip,
@@ -188,7 +193,7 @@ pub async fn send_request(
 }
 
 pub fn validate_load_and_dump<T: Serialize + for<'a> Deserialize<'a>>(path_in_resource_dir: &str) {
-    let json_value = read_json_file(path_in_resource_dir);
+    let json_value: serde_json::Value = read_json_file(path_in_resource_dir);
     let load_result = serde_json::from_value::<T>(json_value.clone());
     assert!(load_result.is_ok(), "error: {:?}", load_result.err());
     let dump_result = serde_json::to_value(load_result.unwrap());
@@ -422,6 +427,7 @@ pub trait GetTestInstance: Sized {
 
 auto_impl_get_test_instance! {
     pub struct AccountDeploymentData(pub Vec<Felt>);
+    pub struct ProofFacts(pub Vec<Felt>);
     pub struct AllResourceBounds {
         pub l1_gas: ResourceBounds,
         pub l2_gas: ResourceBounds,
@@ -453,6 +459,13 @@ auto_impl_get_test_instance! {
         pub l1_da_mode: L1DataAvailabilityMode,
         pub starknet_version: StarknetVersion,
     }
+    pub struct BlockHeaderCommitments {
+        pub transaction_commitment: TransactionCommitment,
+        pub event_commitment: EventCommitment,
+        pub receipt_commitment: ReceiptCommitment,
+        pub state_diff_commitment: StateDiffCommitment,
+        pub concatenated_counts: Felt,
+    }
     pub struct BlockNumber(pub u64);
     pub struct BlockSignature(pub Signature);
     pub enum BlockStatus {
@@ -476,33 +489,40 @@ auto_impl_get_test_instance! {
         RangeCheck96 = 10,
     }
     pub enum StarknetVersion {
-        V0_9_1 = 0,
-        V0_10_0 = 1,
-        V0_10_1 = 2,
-        V0_10_2 = 3,
-        V0_10_3 = 4,
-        V0_11_0 = 5,
-        V0_11_0_2 = 6,
-        V0_11_1 = 7,
-        V0_11_2 = 8,
-        V0_12_0 = 9,
-        V0_12_1 = 10,
-        V0_12_2 = 11,
-        V0_12_3 = 12,
-        V0_13_0 = 13,
-        V0_13_1 = 14,
-        V0_13_1_1 = 15,
-        V0_13_2 = 16,
-        V0_13_2_1 = 17,
-        V0_13_3 = 18,
-        V0_13_4 = 19,
-        V0_13_5 = 20,
-        V0_13_6 = 21,
-        V0_14_0 = 22,
+        PreV0_9_1 = 0,
+        V0_9_1 = 1,
+        V0_10_0 = 2,
+        V0_10_1 = 3,
+        V0_10_2 = 4,
+        V0_10_3 = 5,
+        V0_11_0 = 6,
+        V0_11_0_2 = 7,
+        V0_11_1 = 8,
+        V0_11_2 = 9,
+        V0_12_0 = 10,
+        V0_12_1 = 11,
+        V0_12_2 = 12,
+        V0_12_3 = 13,
+        V0_13_0 = 14,
+        V0_13_1 = 15,
+        V0_13_1_1 = 16,
+        V0_13_2 = 17,
+        V0_13_2_1 = 18,
+        V0_13_3 = 19,
+        V0_13_4 = 20,
+        V0_13_5 = 21,
+        V0_13_6 = 22,
+        V0_14_0 = 23,
+        V0_14_1 = 24,
+        V0_15_0 = 25,
     }
 
     pub struct Calldata(pub Arc<Vec<Felt>>);
     pub struct ClassHash(pub StarkHash);
+    pub struct StateRoots {
+        pub contracts_trie_root_hash: HashOutput,
+        pub classes_trie_root_hash: HashOutput,
+    }
     pub struct CompiledClassHash(pub StarkHash);
     pub struct ContractAddressSalt(pub StarkHash);
     pub enum ConsensusTransaction {
@@ -669,6 +689,7 @@ auto_impl_get_test_instance! {
         pub price_in_wei: GasPrice,
     }
     pub struct GlobalRoot(pub StarkHash);
+    pub struct HashOutput(pub Felt);
     pub enum InvokeTransaction {
         V0(InvokeTransactionV0) = 0,
         V1(InvokeTransactionV1) = 1,
@@ -706,6 +727,7 @@ auto_impl_get_test_instance! {
         pub fee_data_availability_mode: DataAvailabilityMode,
         pub paymaster_data: PaymasterData,
         pub account_deployment_data: AccountDeploymentData,
+        pub proof_facts: ProofFacts,
     }
     pub enum L1DataAvailabilityMode {
         Calldata = 0,
@@ -738,6 +760,16 @@ auto_impl_get_test_instance! {
     }
     pub struct Nonce(pub Felt);
     pub struct TransactionCommitment(pub StarkHash);
+    pub struct PartialBlockHashComponents {
+        pub header_commitments: BlockHeaderCommitments,
+        pub block_number: BlockNumber,
+        pub l1_gas_price: GasPricePerToken,
+        pub l1_data_gas_price: GasPricePerToken,
+        pub l2_gas_price: GasPricePerToken,
+        pub sequencer: SequencerContractAddress,
+        pub timestamp: BlockTimestamp,
+        pub starknet_version: StarknetVersion,
+    }
     pub struct PaymasterData(pub Vec<Felt>);
     pub struct PoseidonHash(pub Felt);
     pub struct Program {
@@ -848,6 +880,7 @@ auto_impl_get_test_instance! {
         pub deployed_contracts: IndexMap<ContractAddress, ClassHash>,
         pub storage_diffs: IndexMap<ContractAddress, IndexMap<StorageKey, Felt>>,
         pub declared_classes: IndexMap<ClassHash, (CompiledClassHash, SierraContractClass)>,
+        pub migrated_compiled_classes: IndexMap<ClassHash, CompiledClassHash>,
         pub deprecated_declared_classes: IndexMap<ClassHash, DeprecatedContractClass>,
         pub nonces: IndexMap<ContractAddress, Nonce>,
     }
@@ -863,7 +896,7 @@ auto_impl_get_test_instance! {
     pub struct ThinStateDiff {
         pub deployed_contracts: IndexMap<ContractAddress, ClassHash>,
         pub storage_diffs: IndexMap<ContractAddress, IndexMap<StorageKey, Felt>>,
-        pub declared_classes: IndexMap<ClassHash, CompiledClassHash>,
+        pub class_hash_to_compiled_class_hash: IndexMap<ClassHash, CompiledClassHash>,
         pub deprecated_declared_classes: Vec<ClassHash>,
         pub nonces: IndexMap<ContractAddress, Nonce>,
     }
@@ -901,16 +934,6 @@ auto_impl_get_test_instance! {
     pub enum ValidResourceBounds {
         L1Gas(ResourceBounds) = 0,
         AllResources(AllResourceBounds) = 1,
-    }
-
-    pub struct CasmContractClass {
-        pub prime: BigUint,
-        pub compiler_version: String,
-        pub bytecode: Vec<BigUintAsHex>,
-        pub bytecode_segment_lengths: Option<NestedIntList>,
-        pub hints: Vec<(usize, Vec<Hint>)>,
-        pub pythonic_hints: Option<Vec<(usize, Vec<String>)>>,
-        pub entry_points_by_type: CasmContractEntryPoints,
     }
 
     pub struct CasmContractEntryPoints {
@@ -1203,6 +1226,22 @@ impl GetTestInstance for ResourceBounds {
             max_amount: GasAmount(rng.next_u64()),
             // TODO(alonl): change GasPrice generation to use u128 directly
             max_price_per_unit: GasPrice(rng.next_u64().into()),
+        }
+    }
+}
+
+// Custom implementation for CasmContractClass to ensure legal CASM without contradiction between
+// bytecode and segment structure.
+impl GetTestInstance for CasmContractClass {
+    fn get_test_instance(rng: &mut ChaCha8Rng) -> Self {
+        Self {
+            prime: BigUint::get_test_instance(rng),
+            compiler_version: String::get_test_instance(rng),
+            bytecode: Vec::get_test_instance(rng),
+            bytecode_segment_lengths: None,
+            hints: Vec::get_test_instance(rng),
+            pythonic_hints: Option::get_test_instance(rng),
+            entry_points_by_type: CasmContractEntryPoints::get_test_instance(rng),
         }
     }
 }

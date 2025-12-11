@@ -151,7 +151,7 @@ fn test_syscall_compatibility_with_blockifier() {
     assert_eq!(
         blockifier_syscall_strings, syscall_hint_strings,
         "The syscall hints in the 'blockifier' do not match the syscall hints in 'starknet_os'.
-        If this is intentional, please update the 'starknet_os' hints and add a todo to update 
+        If this is intentional, please update the 'starknet_os' hints and add a todo to update
         the implementation."
     );
 }
@@ -198,7 +198,7 @@ fn test_all_hints_are_used(
         os_program_hints.union(&aggregator_program_hints).collect();
     let redundant_hints: HashSet<_> = AllHints::all_iter()
         .filter(|hint| {
-            // Skip syscalls; they do not appear in the OS code.
+            // Skip syscalls and whitelisted hints that do not appear in the OS code.
             !matches!(hint, AllHints::DeprecatedSyscallHint(_))
                 && !all_program_hints.contains(&String::from(hint.to_str()))
         })

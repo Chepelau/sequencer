@@ -19,6 +19,7 @@ pub mod execution_utils;
 pub mod hash;
 pub mod rpc_transaction;
 pub mod serde_utils;
+pub mod staking;
 pub mod state;
 #[cfg(any(feature = "testing", test))]
 pub mod test_utils;
@@ -29,9 +30,27 @@ pub mod versioned_constants_logic;
 
 use std::num::ParseIntError;
 
-use serde_utils::InnerDeserializationError;
-
+use crate::block::{BlockNumber, StarknetVersion};
+use crate::core::{ClassHash, CompiledClassHash};
 use crate::transaction::TransactionVersion;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CasmHashMismatch {
+    hash: ClassHash,
+    actual: CompiledClassHash,
+    expected: CompiledClassHash,
+}
+
+impl std::fmt::Display for CasmHashMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Mismatch compiled class hash for class with hash {:#064x}. Actual: {:#064x}, \
+             Expected: {:#064x}",
+            self.hash.0, self.actual.0, self.expected.0
+        )
+    }
+}
 
 /// The error type returned by StarknetApi.
 // Note: if you need `Eq` see InnerDeserializationError's docstring.
@@ -40,9 +59,6 @@ pub enum StarknetApiError {
     /// An error when a starknet version is out of range.
     #[error("Starknet version {version} is out of range for block hash calculation")]
     BlockHashVersion { version: String },
-    /// Error in the inner deserialization of the node.
-    #[error(transparent)]
-    InnerDeserialization(#[from] InnerDeserializationError),
     #[error("Out of range {string}.")]
     /// An error for when a value is out of range.
     OutOfRange { string: String },
@@ -77,6 +93,15 @@ pub enum StarknetApiError {
     ParseSierraVersionError(String),
     #[error("Unsupported transaction type: {0}")]
     UnknownTransactionType(String),
+    #[error(
+        "Mismatch compiled class hash for class with hash {:#064x}. Actual: {:#064x}, Expected: {:#064x}",
+        .0.hash.0, .0.actual.0, .0.expected.0
+    )]
+    DeclareTransactionCasmHashMissMatch(Box<CasmHashMismatch>),
+    #[error(
+        "Missing block header commitments for block number {block_number} in version {version}"
+    )]
+    MissingBlockHeaderCommitments { block_number: BlockNumber, version: StarknetVersion },
 }
 
 pub type StarknetApiResult<T> = Result<T, StarknetApiError>;

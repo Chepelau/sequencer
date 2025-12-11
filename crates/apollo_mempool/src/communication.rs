@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
+use apollo_config_manager_types::communication::SharedConfigManagerClient;
 use apollo_infra::component_definitions::{ComponentRequestHandler, ComponentStarter};
 use apollo_infra::component_server::{LocalComponentServer, RemoteComponentServer};
+use apollo_mempool_config::config::MempoolConfig;
 use apollo_mempool_p2p_types::communication::SharedMempoolP2pPropagatorClient;
 use apollo_mempool_types::communication::{
     AddTransactionArgsWrapper,
@@ -9,7 +11,12 @@ use apollo_mempool_types::communication::{
     MempoolResponse,
 };
 use apollo_mempool_types::errors::MempoolError;
-use apollo_mempool_types::mempool_types::{CommitBlockArgs, MempoolResult, MempoolSnapshot};
+use apollo_mempool_types::mempool_types::{
+    CommitBlockArgs,
+    MempoolResult,
+    MempoolSnapshot,
+    ValidationArgs,
+};
 use apollo_network_types::network_types::BroadcastedMessageMetadata;
 use apollo_time::time::DefaultClock;
 use async_trait::async_trait;
@@ -18,7 +25,6 @@ use starknet_api::core::ContractAddress;
 use starknet_api::rpc_transaction::InternalRpcTransaction;
 use tracing::warn;
 
-use crate::config::MempoolConfig;
 use crate::mempool::Mempool;
 use crate::metrics::register_metrics;
 
@@ -29,10 +35,12 @@ pub type RemoteMempoolServer = RemoteComponentServer<MempoolRequest, MempoolResp
 pub fn create_mempool(
     config: MempoolConfig,
     mempool_p2p_propagator_client: SharedMempoolP2pPropagatorClient,
+    config_manager_client: SharedConfigManagerClient,
 ) -> MempoolCommunicationWrapper {
     MempoolCommunicationWrapper::new(
         Mempool::new(config, Arc::new(DefaultClock)),
         mempool_p2p_propagator_client,
+        config_manager_client,
     )
 }
 
@@ -40,14 +48,20 @@ pub fn create_mempool(
 pub struct MempoolCommunicationWrapper {
     mempool: Mempool,
     mempool_p2p_propagator_client: SharedMempoolP2pPropagatorClient,
+    config_manager_client: SharedConfigManagerClient,
 }
 
 impl MempoolCommunicationWrapper {
     pub fn new(
         mempool: Mempool,
         mempool_p2p_propagator_client: SharedMempoolP2pPropagatorClient,
+        config_manager_client: SharedConfigManagerClient,
     ) -> Self {
-        MempoolCommunicationWrapper { mempool, mempool_p2p_propagator_client }
+        MempoolCommunicationWrapper {
+            mempool,
+            mempool_p2p_propagator_client,
+            config_manager_client,
+        }
     }
 
     async fn send_tx_to_p2p(
@@ -72,6 +86,15 @@ impl MempoolCommunicationWrapper {
         }
     }
 
+    async fn update_dynamic_config(&mut self) {
+        let mempool_dynamic_config = self
+            .config_manager_client
+            .get_mempool_dynamic_config()
+            .await
+            .expect("Should be able to get mempool dynamic config");
+        self.mempool.update_dynamic_config(mempool_dynamic_config);
+    }
+
     pub(crate) async fn add_tx(
         &mut self,
         args_wrapper: AddTransactionArgsWrapper,
@@ -83,6 +106,11 @@ impl MempoolCommunicationWrapper {
         {
             warn!("Failed to send transaction to P2P: {:?}", p2p_client_err);
         }
+        Ok(())
+    }
+
+    fn validate_tx(&mut self, args: ValidationArgs) -> MempoolResult<()> {
+        self.mempool.validate_tx(args)?;
         Ok(())
     }
 
@@ -115,7 +143,12 @@ impl MempoolCommunicationWrapper {
 #[async_trait]
 impl ComponentRequestHandler<MempoolRequest, MempoolResponse> for MempoolCommunicationWrapper {
     async fn handle_request(&mut self, request: MempoolRequest) -> MempoolResponse {
+        // Update the dynamic config before handling the request.
+        self.update_dynamic_config().await;
         match request {
+            MempoolRequest::ValidateTransaction(args) => {
+                MempoolResponse::ValidateTransaction(self.validate_tx(args))
+            }
             MempoolRequest::AddTransaction(args) => {
                 MempoolResponse::AddTransaction(self.add_tx(args).await)
             }

@@ -17,7 +17,7 @@ fn test_cast_to_node_index(
             &ContractAddress::try_from(Felt::from(leaf_index)).unwrap(),
         )
     } else {
-        (&StarknetStorageKey(Felt::from(leaf_index))).into()
+        (&StarknetStorageKey::from(leaf_index)).into()
     };
     assert_eq!(actual, expected_node_index);
 }

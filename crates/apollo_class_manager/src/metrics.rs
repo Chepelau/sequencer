@@ -1,6 +1,15 @@
 use apollo_compile_to_casm_types::SerializedClass;
-use apollo_metrics::{define_metrics, generate_permutation_labels};
+use apollo_infra::metrics::{
+    InfraMetrics,
+    LocalClientMetrics,
+    LocalServerMetrics,
+    RemoteClientMetrics,
+    RemoteServerMetrics,
+};
+use apollo_metrics::{define_infra_metrics, define_metrics, generate_permutation_labels};
 use strum::VariantNames;
+
+use crate::communication::CLASS_MANAGER_REQUEST_LABELS;
 
 const CAIRO_CLASS_TYPE_LABEL: &str = "class_type";
 
@@ -33,6 +42,8 @@ generate_permutation_labels! {
     (CLASS_OBJECT_TYPE_LABEL, ClassObjectType),
 }
 
+define_infra_metrics!(class_manager);
+
 define_metrics!(
     ClassManager => {
         LabeledMetricCounter {
@@ -44,7 +55,7 @@ define_metrics!(
         LabeledMetricHistogram {
             CLASS_SIZES,
             "class_manager_class_sizes",
-            "Size of the classes in bytes, labeled by type (sierra, casm, deprecated casm)",
+            "Size of the classes in MBs, labeled by type (sierra, casm, deprecated casm)",
             labels = CLASS_OBJECT_TYPE_LABELS
         },
     },
@@ -56,17 +67,19 @@ pub(crate) fn increment_n_classes(cls_type: CairoClassType) {
 
 pub(crate) fn record_class_size<T>(class_type: ClassObjectType, class: &SerializedClass<T>) {
     let class_size = class.size().unwrap_or_else(|_| {
-        panic!("Illegally formatted {} class, should not have gotten into the system.", class_type)
+        panic!("Illegally formatted {class_type} class, should not have gotten into the system.")
     });
     let class_size = u32::try_from(class_size).unwrap_or_else(|_| {
         panic!(
-            "{} class size {} is bigger than what is allowed,
-            should not have gotten into the system.",
-            class_type, class_size
+            "{class_type} class size {class_size} is bigger than what is allowed,
+            should not have gotten into the system."
         )
     });
-
-    CLASS_SIZES.record(class_size, &[(CLASS_OBJECT_TYPE_LABEL, class_type.into())]);
+    CLASS_SIZES.record(
+        // Convert bytes to MB
+        f64::from(class_size) / 1_048_576.0,
+        &[(CLASS_OBJECT_TYPE_LABEL, class_type.into())],
+    );
 }
 
 pub(crate) fn register_metrics() {

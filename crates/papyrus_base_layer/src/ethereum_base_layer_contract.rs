@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use alloy::dyn_abi::SolType;
 use alloy::eips::eip7840;
-use alloy::primitives::Address as EthereumContractAddress;
+use alloy::network::Ethereum;
+use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, RootProvider};
 use alloy::rpc::json_rpc::RpcError;
 use alloy::rpc::types::eth::Filter as EthEventFilter;
@@ -23,15 +24,37 @@ use starknet_api::StarknetApiError;
 use tokio::time::error::Elapsed;
 use tracing::{debug, error, instrument};
 use url::Url;
-use validator::Validate;
+use validator::{Validate, ValidationError};
 
 use crate::eth_events::parse_event;
-use crate::{BaseLayerContract, L1BlockHeader, L1BlockNumber, L1BlockReference, L1Event};
+use crate::{
+    BaseLayerContract,
+    L1BlockHash,
+    L1BlockHeader,
+    L1BlockNumber,
+    L1BlockReference,
+    L1Event,
+};
 
 pub type EthereumBaseLayerResult<T> = Result<T, EthereumBaseLayerError>;
+pub type EthereumContractAddress = Address;
+
+#[cfg(test)]
+#[path = "ethereum_base_layer_contract_test.rs"]
+pub mod ethereum_base_layer_contract_test;
 
 // Wraps the Starknet contract with a type that implements its interface, and is aware of its
 // events.
+
+#[cfg(any(test, feature = "testing"))]
+// Mocked Starknet contract for testing (no governance).
+sol!(
+    #[sol(rpc)]
+    Starknet,
+    "resources/StarknetForSequencerTesting.json"
+);
+#[cfg(not(any(test, feature = "testing")))]
+// Real Starknet contract for production.
 sol!(
     #[sol(rpc)]
     Starknet,
@@ -40,64 +63,19 @@ sol!(
 
 /// An interface that plays the role of the starknet L1 contract. It is able to create messages to
 /// L2 from this contract, which appear on the corresponding base layer.
-pub type StarknetL1Contract = Starknet::StarknetInstance<(), RootProvider>;
-
-#[cfg(any(feature = "testing", test))]
-pub struct L1ToL2MessageArgs {
-    pub tx: starknet_api::transaction::L1HandlerTransaction,
-    pub l1_tx_nonce: u64,
-}
-
-#[cfg(any(feature = "testing", test))]
-impl StarknetL1Contract {
-    /// Converts a given [L1 handler transaction](starknet_api::transaction::L1HandlerTransaction)
-    /// to match the interface of the given [starknet l1 contract](StarknetL1Contract), and
-    /// triggers the L1 entry point which sends the message to L2.
-    pub async fn send_message_to_l2(
-        &self,
-        l1_to_l2_message_args: &L1ToL2MessageArgs,
-    ) -> alloy::rpc::types::TransactionReceipt {
-        use alloy::primitives::U256;
-        const PAID_FEE_ON_L1: U256 = U256::from_be_slice(b"paid"); // Arbitrary value.
-
-        let L1ToL2MessageArgs { tx: l1_handler, l1_tx_nonce } = l1_to_l2_message_args;
-        tracing::info!("Sending message to L2 with the l1 nonce: {l1_tx_nonce}");
-        let l2_contract_address =
-            l1_handler.contract_address.0.key().to_hex_string().parse().unwrap();
-        let l2_entry_point = l1_handler.entry_point_selector.0.to_hex_string().parse().unwrap();
-
-        // The calldata of an L1 handler transaction consists of the L1 sender address followed by
-        // the transaction payload. We remove the sender address to extract the message
-        // payload.
-        let payload =
-            l1_handler.calldata.0[1..].iter().map(|x| x.to_hex_string().parse().unwrap()).collect();
-        let msg = self.sendMessageToL2(l2_contract_address, l2_entry_point, payload);
-
-        msg
-            // Sets a non-zero fee to be paid on L1.
-            .value(PAID_FEE_ON_L1)
-            // Sets the nonce of the L1 handler transaction, to avoid L1 nonce collisions.
-            .nonce(*l1_tx_nonce)
-            // Sends the transaction to the Starknet L1 contract. For debugging purposes, replace
-            // `.send()` with `.call_raw()` to retrieve detailed error messages from L1.
-            .send().await.expect("Transaction submission to Starknet L1 contract failed.")
-            // Waits until the transaction is received on L1 and then fetches its receipt.
-            .get_receipt().await.expect("Transaction was not received on L1 or receipt retrieval failed.")
-    }
-}
+pub type StarknetL1Contract = Starknet::StarknetInstance<RootProvider, Ethereum>;
 
 #[derive(Clone, Debug)]
 pub struct EthereumBaseLayerContract {
+    pub url: Url,
     pub config: EthereumBaseLayerConfig,
     pub contract: StarknetL1Contract,
 }
 
 impl EthereumBaseLayerContract {
-    pub fn new(config: EthereumBaseLayerConfig) -> Self {
-        let current_node_url = config.node_url.clone();
-        let contract =
-            build_contract_instance(config.starknet_contract_address, current_node_url.clone());
-        Self { contract, config }
+    pub fn new(config: EthereumBaseLayerConfig, url: Url) -> Self {
+        let contract = build_contract_instance(config.starknet_contract_address, url.clone());
+        Self { url, contract, config }
     }
 }
 
@@ -105,6 +83,7 @@ impl EthereumBaseLayerContract {
 impl BaseLayerContract for EthereumBaseLayerContract {
     type Error = EthereumBaseLayerError;
 
+    /// Get the Starknet block that is proved on the base layer at a specific L1 block number.
     #[instrument(skip(self), err)]
     async fn get_proved_block_at(
         &self,
@@ -119,28 +98,14 @@ impl BaseLayerContract for EthereumBaseLayerContract {
             call_state_block_hash.call_raw().into_future()
         )?;
 
-        let validate = true;
-        let block_number = sol_data::Uint::<64>::abi_decode(&state_block_number, validate)
+        let block_number = sol_data::Uint::<64>::abi_decode(&state_block_number)
             .inspect_err(|err| error!("{err}: {state_block_number}"))?;
-        let block_hash = sol_data::FixedBytes::<32>::abi_decode(&state_block_hash, validate)
+        let block_hash = sol_data::FixedBytes::<32>::abi_decode(&state_block_hash)
             .inspect_err(|err| error!("{err}: {state_block_hash}"))?;
         Ok(BlockHashAndNumber {
             number: BlockNumber(block_number),
             hash: BlockHash(StarkHash::from_bytes_be(&block_hash)),
         })
-    }
-
-    /// Returns the latest proved block on Ethereum, where finality determines how many
-    /// blocks back (0 = latest).
-    #[instrument(skip(self), err)]
-    async fn latest_proved_block(
-        &self,
-        finality: u64,
-    ) -> EthereumBaseLayerResult<Option<BlockHashAndNumber>> {
-        let Some(ethereum_block_number) = self.latest_l1_block_number(finality).await? else {
-            return Ok(None);
-        };
-        self.get_proved_block_at(ethereum_block_number).await.map(Some)
     }
 
     #[instrument(skip(self), err)]
@@ -153,16 +118,14 @@ impl BaseLayerContract for EthereumBaseLayerContract {
             .select(block_range.clone())
             .events(events)
             .address(self.config.starknet_contract_address);
-
         let matching_logs = tokio::time::timeout(
             self.config.timeout_millis,
             self.contract.provider().get_logs(&filter),
         )
         .await??;
-
         // Debugging.
         let hashes: Vec<_> = matching_logs.iter().filter_map(|log| log.transaction_hash).collect();
-        debug!("Got events in {:?}, transaction hashes: {:?}", block_range, hashes);
+        debug!("Got events in {:?}, L1 tx hashes: {:?}", block_range, hashes);
 
         let block_header_futures = matching_logs.into_iter().map(|log| {
             let block_number = log.block_number.unwrap();
@@ -176,28 +139,13 @@ impl BaseLayerContract for EthereumBaseLayerContract {
     }
 
     #[instrument(skip(self), err)]
-    async fn latest_l1_block_number(
-        &self,
-        finality: u64,
-    ) -> EthereumBaseLayerResult<Option<L1BlockNumber>> {
+    async fn latest_l1_block_number(&self) -> EthereumBaseLayerResult<L1BlockNumber> {
         let block_number = tokio::time::timeout(
             self.config.timeout_millis,
             self.contract.provider().get_block_number(),
         )
         .await??;
-        Ok(block_number.checked_sub(finality))
-    }
-
-    #[instrument(skip(self), err)]
-    async fn latest_l1_block(
-        &self,
-        finality: u64,
-    ) -> EthereumBaseLayerResult<Option<L1BlockReference>> {
-        let Some(block_number) = self.latest_l1_block_number(finality).await? else {
-            return Ok(None);
-        };
-
-        self.l1_block_at(block_number).await
+        Ok(block_number)
     }
 
     #[instrument(skip(self), err)]
@@ -213,7 +161,7 @@ impl BaseLayerContract for EthereumBaseLayerContract {
 
         Ok(block.map(|block| L1BlockReference {
             number: block.header.number,
-            hash: block.header.hash.0,
+            hash: L1BlockHash(block.header.hash.0),
         }))
     }
 
@@ -235,25 +183,39 @@ impl BaseLayerContract for EthereumBaseLayerContract {
             return Ok(None);
         };
         let blob_fee = match block.header.excess_blob_gas {
-            Some(excess_blob_gas) if self.config.prague_blob_gas_calc => {
-                // Pectra update.
-                eip7840::BlobParams::prague().calc_blob_fee(excess_blob_gas)
+            Some(excess_blob_gas) if self.config.bpo2_start_block_number <= block.header.number => {
+                // Fusaka BPO2 update.
+                eip7840::BlobParams::bpo2().calc_blob_fee(excess_blob_gas)
+            }
+            Some(excess_blob_gas) if self.config.bpo1_start_block_number <= block.header.number => {
+                // Fusaka BPO1 update.
+                eip7840::BlobParams::bpo1().calc_blob_fee(excess_blob_gas)
+            }
+            Some(excess_blob_gas)
+                if self.config.fusaka_no_bpo_start_block_number <= block.header.number =>
+            {
+                // Fusaka update.
+                eip7840::BlobParams::osaka().calc_blob_fee(excess_blob_gas)
             }
             Some(excess_blob_gas) => {
-                // EIP 4844 - original blob pricing.
-                eip7840::BlobParams::cancun().calc_blob_fee(excess_blob_gas)
+                // Pectra update.
+                eip7840::BlobParams::prague().calc_blob_fee(excess_blob_gas)
             }
             None => 0,
         };
 
         Ok(Some(L1BlockHeader {
             number: block.header.number,
-            hash: block.header.hash.0,
-            parent_hash: block.header.parent_hash.0,
+            hash: L1BlockHash(block.header.hash.0),
+            parent_hash: L1BlockHash(block.header.parent_hash.0),
             timestamp: block.header.timestamp.into(),
             base_fee_per_gas: base_fee.into(),
             blob_fee,
         }))
+    }
+
+    async fn get_url(&self) -> Result<Url, Self::Error> {
+        Ok(self.url.clone())
     }
 
     /// Rebuilds the provider on the new url.
@@ -269,7 +231,7 @@ pub enum EthereumBaseLayerError {
     Contract(#[from] alloy::contract::Error),
     #[error("{0}")]
     FeeOutOfRange(alloy::primitives::ruint::FromUintError<u128>),
-    #[error("L1 provider response timed out.")]
+    #[error("timed-out while querying the L1 base layer")]
     ProviderTimeout(#[from] Elapsed),
     #[error(transparent)]
     RpcError(#[from] RpcError<TransportErrorKind>),
@@ -296,26 +258,46 @@ impl PartialEq for EthereumBaseLayerError {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, Validate)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct EthereumBaseLayerConfig {
-    pub node_url: Url,
     pub starknet_contract_address: EthereumContractAddress,
-    pub prague_blob_gas_calc: bool,
+    // Note: dates of fusaka-related upgrades: https://eips.ethereum.org/EIPS/eip-7607
+    // Note 2: make sure to calculate the block number as activation epoch x32.
+    // The block number at which the Fusaka upgrade was deployed (not including any BPO updates).
+    pub fusaka_no_bpo_start_block_number: L1BlockNumber,
+    // The block number at which BPO1 update was deployed.
+    pub bpo1_start_block_number: L1BlockNumber,
+    // The block number at which BPO2 update was deployed.
+    pub bpo2_start_block_number: L1BlockNumber,
     #[serde(deserialize_with = "deserialize_milliseconds_to_duration")]
     pub timeout_millis: Duration,
+}
+
+impl Validate for EthereumBaseLayerConfig {
+    fn validate(&self) -> Result<(), validator::ValidationErrors> {
+        let mut errors = validator::ValidationErrors::new();
+
+        if self.fusaka_no_bpo_start_block_number > self.bpo1_start_block_number {
+            let mut error = ValidationError::new("block_numbers_not_ordered");
+            error.message =
+                Some("fusaka_no_bpo_start_block_number must be <= bpo1_start_block_number".into());
+            errors.add("fusaka_no_bpo_start_block_number", error);
+        }
+
+        if self.bpo1_start_block_number > self.bpo2_start_block_number {
+            let mut error = ValidationError::new("block_numbers_not_ordered");
+            error.message =
+                Some("bpo1_start_block_number must be <= bpo2_start_block_number".into());
+            errors.add("bpo1_start_block_number", error);
+        }
+
+        if errors.is_empty() { Ok(()) } else { Err(errors) }
+    }
 }
 
 impl SerializeConfig for EthereumBaseLayerConfig {
     fn dump(&self) -> BTreeMap<ParamPath, SerializedParam> {
         BTreeMap::from_iter([
-            ser_param(
-                "node_url",
-                &self.node_url.to_string(),
-                "Initial ethereum node URL. A schema to match to Infura node: \
-                 https://mainnet.infura.io/v3/<your_api_key>, but any other node can be used. \
-                 May be be replaced during runtime if becomes inoperative",
-                ParamPrivacyInput::Private,
-            ),
             ser_param(
                 "starknet_contract_address",
                 &self.starknet_contract_address.to_string(),
@@ -323,9 +305,22 @@ impl SerializeConfig for EthereumBaseLayerConfig {
                 ParamPrivacyInput::Public,
             ),
             ser_param(
-                "prague_blob_gas_calc",
-                &self.prague_blob_gas_calc,
-                "If true use the blob gas calculcation from the Pectra upgrade. If false use the EIP 4844 calculation.",
+                "fusaka_no_bpo_start_block_number",
+                &self.fusaka_no_bpo_start_block_number,
+                "The block number at which the Fusaka upgrade was deployed (not including any BPO \
+                 updates).",
+                ParamPrivacyInput::Public,
+            ),
+            ser_param(
+                "bpo1_start_block_number",
+                &self.bpo1_start_block_number,
+                "The block number at which BPO1 update was deployed.",
+                ParamPrivacyInput::Public,
+            ),
+            ser_param(
+                "bpo2_start_block_number",
+                &self.bpo2_start_block_number,
+                "The block number at which BPO2 update was deployed.",
                 ParamPrivacyInput::Public,
             ),
             ser_param(
@@ -344,9 +339,10 @@ impl Default for EthereumBaseLayerConfig {
             "0xc662c410C0ECf747543f5bA90660f6ABeBD9C8c4".parse().unwrap();
 
         Self {
-            node_url: "https://mainnet.infura.io/v3/<your_api_key>".parse().unwrap(),
             starknet_contract_address,
-            prague_blob_gas_calc: true,
+            fusaka_no_bpo_start_block_number: 0,
+            bpo1_start_block_number: 0,
+            bpo2_start_block_number: 0,
             timeout_millis: Duration::from_millis(1000),
         }
     }
@@ -356,7 +352,7 @@ fn build_contract_instance(
     starknet_contract_address: EthereumContractAddress,
     node_url: Url,
 ) -> StarknetL1Contract {
-    let l1_client = ProviderBuilder::default().on_http(node_url);
+    let l1_client = ProviderBuilder::default().connect_http(node_url);
     // This type is generated from `sol!` macro, and the `new` method assumes it is already
     // deployed at L1, and wraps it with a type.
     Starknet::new(starknet_contract_address, l1_client)

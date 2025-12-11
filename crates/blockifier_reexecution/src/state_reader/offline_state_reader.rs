@@ -16,6 +16,7 @@ use starknet_api::block::{BlockHash, BlockHashAndNumber, BlockInfo, BlockNumber,
 use starknet_api::core::{ChainId, ClassHash, CompiledClassHash, ContractAddress, Nonce};
 use starknet_api::state::StorageKey;
 use starknet_api::transaction::{Transaction, TransactionHash};
+use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
 use starknet_core::types::ContractClass as StarknetContractClass;
 use starknet_types_core::felt::Felt;
 
@@ -62,7 +63,6 @@ pub struct SerializableOfflineReexecutionData {
 }
 
 impl SerializableOfflineReexecutionData {
-    #[allow(clippy::result_large_err)]
     pub fn write_to_file(&self, full_file_path: &str) -> ReexecutionResult<()> {
         let file_path = full_file_path.rsplit_once('/').expect("Invalid file path.").0;
         fs::create_dir_all(file_path)
@@ -72,7 +72,6 @@ impl SerializableOfflineReexecutionData {
         Ok(())
     }
 
-    #[allow(clippy::result_large_err)]
     pub fn read_from_file(full_file_path: &str) -> ReexecutionResult<Self> {
         let file_content = fs::read_to_string(full_file_path).unwrap_or_else(|err| {
             panic!("Failed to read reexecution data from file {full_file_path}. Error: {err}")
@@ -139,8 +138,7 @@ impl StateReader for OfflineStateReader {
     ) -> StateResult<Felt> {
         Ok(*self.state_maps.storage.get(&(contract_address, key)).ok_or(
             StateError::StateReadError(format!(
-                "Missing Storage Value at contract_address: {}, key:{:?}",
-                contract_address, key
+                "Missing Storage Value at contract_address: {contract_address}, key:{key:?}"
             )),
         )?)
     }
@@ -189,14 +187,12 @@ impl ReexecutionStateReader for OfflineStateReader {
             .clone())
     }
 
-    #[allow(clippy::result_large_err)]
     fn get_old_block_hash(&self, _old_block_number: BlockNumber) -> ReexecutionResult<BlockHash> {
         Ok(self.old_block_hash)
     }
 }
 
 impl OfflineStateReader {
-    #[allow(clippy::result_large_err)]
     pub fn get_transaction_executor(
         self,
         block_context_next_block: BlockContext,
@@ -224,7 +220,6 @@ pub struct OfflineConsecutiveStateReaders {
 }
 
 impl OfflineConsecutiveStateReaders {
-    #[allow(clippy::result_large_err)]
     pub fn new_from_file(full_file_path: &str) -> ReexecutionResult<Self> {
         let serializable_offline_reexecution_data =
             SerializableOfflineReexecutionData::read_from_file(full_file_path)?;
@@ -249,7 +244,6 @@ impl OfflineConsecutiveStateReaders {
 }
 
 impl ConsecutiveReexecutionStateReaders<OfflineStateReader> for OfflineConsecutiveStateReaders {
-    #[allow(clippy::result_large_err)]
     fn pre_process_and_create_executor(
         self,
         transaction_executor_config: Option<TransactionExecutorConfig>,
@@ -258,12 +252,10 @@ impl ConsecutiveReexecutionStateReaders<OfflineStateReader> for OfflineConsecuti
             .get_transaction_executor(self.block_context_next_block, transaction_executor_config)
     }
 
-    #[allow(clippy::result_large_err)]
     fn get_next_block_txs(&self) -> ReexecutionResult<Vec<BlockifierTransaction>> {
         Ok(self.transactions_next_block.clone())
     }
 
-    #[allow(clippy::result_large_err)]
     fn get_next_block_state_diff(&self) -> ReexecutionResult<CommitmentStateDiff> {
         Ok(self.state_diff_next_block.clone())
     }

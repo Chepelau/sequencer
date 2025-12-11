@@ -1,5 +1,6 @@
 pub mod contracts;
 pub mod dict_state_reader;
+pub mod execution;
 pub mod initial_test_state;
 pub mod l1_handler;
 pub mod prices;
@@ -8,6 +9,7 @@ pub mod syscall;
 #[cfg(test)]
 pub mod test_templates;
 pub mod transfers_generator;
+
 use std::collections::HashMap;
 use std::slice::Iter;
 use std::sync::LazyLock;
@@ -218,19 +220,22 @@ macro_rules! check_entry_point_execution_error {
         use cairo_vm::vm::errors::vm_exception::VmException;
         use $crate::execution::errors::EntryPointExecutionError;
 
-        if let EntryPointExecutionError::CairoRunError(CairoRunError::VmException(VmException {
-            inner_exc,
-            ..
-        })) = $error
-        {
-            match $expected_hint {
-                Some(expected_hint) => {
-                    $crate::check_inner_exc_for_custom_hint!(inner_exc, expected_hint)
+        match $error {
+            EntryPointExecutionError::CairoRunError(boxed_error) => {
+                if let CairoRunError::VmException(VmException { inner_exc, .. }) =
+                    &*(boxed_error.as_ref())
+                {
+                    match $expected_hint {
+                        Some(expected_hint) => {
+                            $crate::check_inner_exc_for_custom_hint!(inner_exc, expected_hint)
+                        }
+                        None => $crate::check_inner_exc_for_invalid_scenario!(inner_exc),
+                    };
+                } else {
+                    panic!("Unexpected structure for error: {:?}", $error);
                 }
-                None => $crate::check_inner_exc_for_invalid_scenario!(inner_exc),
-            };
-        } else {
-            panic!("Unexpected structure for error: {:?}", $error);
+            }
+            _ => panic!("Unexpected structure for error: {:?}", $error),
         }
     }};
 }
@@ -254,14 +259,14 @@ macro_rules! check_tx_execution_error_inner {
                 TransactionExecutionError::ContractConstructorExecutionFailed(
                     ConstructorEntryPointExecutionError::ExecutionError { error, .. },
                 ) => {
-                    $crate::check_entry_point_execution_error!(error, $expected_hint)
+                    $crate::check_entry_point_execution_error!(&*(error.as_ref()), $expected_hint)
                 }
                 _ => panic!("Unexpected structure for error: {:?}", $error),
             }
         } else {
             match $error {
                 TransactionExecutionError::ValidateTransactionError { error, .. } => {
-                    $crate::check_entry_point_execution_error!(error, $expected_hint)
+                    $crate::check_entry_point_execution_error!(&*(error.as_ref()), $expected_hint)
                 }
                 _ => panic!("Unexpected structure for error: {:?}", $error),
             }
@@ -313,7 +318,7 @@ macro_rules! check_tx_execution_error_for_invalid_scenario {
 pub fn get_const_syscall_resources(syscall_selector: SyscallSelector) -> ExecutionResources {
     let versioned_constants = VersionedConstants::create_for_testing();
     let syscalls_usage: SyscallUsageMap =
-        HashMap::from([(syscall_selector, SyscallUsage::new(1, 0))]);
+        HashMap::from([(syscall_selector, SyscallUsage::with_call_count(1))]);
     versioned_constants.get_additional_os_syscall_resources(&syscalls_usage)
 }
 

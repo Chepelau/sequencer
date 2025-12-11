@@ -3,7 +3,7 @@ macro_rules! define_hint_enum_base {
     ($enum_name:ident, $(($hint_name:ident, $hint_str:expr)),+ $(,)?) => {
         #[cfg_attr(
             any(test, feature = "testing"),
-            derive(Default, Serialize, strum_macros::EnumIter)
+            derive(Default, Deserialize, Serialize, Ord, PartialOrd, strum_macros::EnumIter)
         )]
         #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
         pub enum $enum_name {
@@ -40,7 +40,7 @@ macro_rules! define_hint_enum_helper {
     (
         $enum_name:ident,
         $hp_arg:ident,
-        $(($hint_name:ident, $implementation:ident, $hint_str:expr $(, $passed_arg:ident)?)),+ $(,)?
+        $(($hint_name:ident, $implementation:ident $(::<$generic_type:ty>)?, $hint_str:expr $(, $passed_arg:ident)?)),+ $(,)?
     ) => {
 
         $crate::define_hint_enum_base!($enum_name, $(($hint_name, $hint_str)),+);
@@ -54,8 +54,8 @@ macro_rules! define_hint_enum_helper {
                 match self {
                     $(Self::$hint_name => {
                         #[cfg(any(test, feature = "testing"))]
-                        $hp_arg.get_unused_hints().remove(&Self::$hint_name.into());
-                        $implementation($($passed_arg, )? hint_args)
+                        $hp_arg.get_mut_unused_hints().remove(&Self::$hint_name.into());
+                        $crate::log_time!($implementation $(::<$generic_type>)?($($passed_arg, )? hint_args), Self::$hint_name)
                     })+
                 }
             }
@@ -65,11 +65,11 @@ macro_rules! define_hint_enum_helper {
 
 #[macro_export]
 macro_rules! define_stateless_hint_enum {
-    ($enum_name:ident, $(($hint_name:ident, $implementation:ident, $hint_str:expr)),+ $(,)?) => {
+    ($enum_name:ident, $(($hint_name:ident, $implementation:ident $(::<$generic_type:ty>)?, $hint_str:expr)),+ $(,)?) => {
         $crate::define_hint_enum_helper!(
             $enum_name,
             _hint_processor,
-            $(($hint_name, $implementation, $hint_str)),+
+            $(($hint_name, $implementation $(::<$generic_type>)?, $hint_str)),+
         );
     };
 }
@@ -106,7 +106,7 @@ macro_rules! define_hint_enum {
                     $(Self::$hint_name => {
                         #[cfg(any(test, feature = "testing"))]
                         hint_processor.unused_hints.remove(&Self::$hint_name.into());
-                        $implementation(hint_processor, hint_args)
+                        $crate::log_time!($implementation(hint_processor, hint_args), Self::$hint_name)
                     })+
 
                 }
@@ -136,10 +136,21 @@ macro_rules! define_hint_extension_enum {
                             hint_processor
                             .unused_hints
                             .remove(&Self::$hint_name.into());
-                        $implementation::<S>(hint_processor, hint_extension_args)
+                        $crate::log_time!($implementation::<S>(hint_processor, hint_extension_args), Self::$hint_name)
                     })+
                 }
             }
         }
     };
+}
+
+#[macro_export]
+macro_rules! log_time {
+    ($command:expr, $hint:expr) => {{
+        let start = std::time::Instant::now();
+        let result = $command;
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        log::debug!("Took {elapsed:>7.3} ms to execute hint {:?}.", $hint);
+        result
+    }};
 }

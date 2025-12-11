@@ -1,8 +1,13 @@
 use std::sync::Arc;
 
 use apollo_infra::component_client::{ClientError, LocalComponentClient, RemoteComponentClient};
-use apollo_infra::component_definitions::{ComponentClient, ComponentRequestAndResponseSender};
-use apollo_infra::impl_debug_for_infra_requests_and_responses;
+use apollo_infra::component_definitions::{
+    ComponentClient,
+    PrioritizedRequest,
+    RequestPriority,
+    RequestWrapper,
+};
+use apollo_infra::{impl_debug_for_infra_requests_and_responses, impl_labeled_request};
 use apollo_network_types::network_types::BroadcastedMessageMetadata;
 use apollo_proc_macros::handle_all_response_variants;
 use async_trait::async_trait;
@@ -12,18 +17,18 @@ use serde::{Deserialize, Serialize};
 use starknet_api::block::GasPrice;
 use starknet_api::core::ContractAddress;
 use starknet_api::rpc_transaction::InternalRpcTransaction;
-use strum_macros::AsRefStr;
+use strum::EnumVariantNames;
+use strum_macros::{AsRefStr, EnumDiscriminants, EnumIter, IntoStaticStr};
 use thiserror::Error;
 
 use crate::errors::MempoolError;
-use crate::mempool_types::{AddTransactionArgs, CommitBlockArgs, MempoolSnapshot};
+use crate::mempool_types::{AddTransactionArgs, CommitBlockArgs, MempoolSnapshot, ValidationArgs};
 
 pub type LocalMempoolClient = LocalComponentClient<MempoolRequest, MempoolResponse>;
 pub type RemoteMempoolClient = RemoteComponentClient<MempoolRequest, MempoolResponse>;
 pub type MempoolResult<T> = Result<T, MempoolError>;
 pub type MempoolClientResult<T> = Result<T, MempoolClientError>;
-pub type MempoolRequestAndResponseSender =
-    ComponentRequestAndResponseSender<MempoolRequest, MempoolResponse>;
+pub type MempoolRequestWrapper = RequestWrapper<MempoolRequest, MempoolResponse>;
 pub type SharedMempoolClient = Arc<dyn MempoolClient>;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -40,6 +45,7 @@ pub trait MempoolClient: Send + Sync {
     // TODO(AlonH): Add Option<BroadcastedMessageMetadata> as an argument for add_transaction
     // TODO(AlonH): Rename tx to transaction
     async fn add_tx(&self, args: AddTransactionArgsWrapper) -> MempoolClientResult<()>;
+    async fn validate_tx(&self, args: ValidationArgs) -> MempoolClientResult<()>;
     async fn commit_block(&self, args: CommitBlockArgs) -> MempoolClientResult<()>;
     async fn get_txs(&self, n_txs: usize) -> MempoolClientResult<Vec<InternalRpcTransaction>>;
     async fn account_tx_in_pool_or_recent_block(
@@ -50,9 +56,15 @@ pub trait MempoolClient: Send + Sync {
     async fn get_mempool_snapshot(&self) -> MempoolClientResult<MempoolSnapshot>;
 }
 
-#[derive(Clone, Serialize, Deserialize, AsRefStr)]
+#[derive(Serialize, Deserialize, Clone, AsRefStr, EnumDiscriminants)]
+#[strum_discriminants(
+    name(MempoolRequestLabelValue),
+    derive(IntoStaticStr, EnumIter, EnumVariantNames),
+    strum(serialize_all = "snake_case")
+)]
 pub enum MempoolRequest {
     AddTransaction(AddTransactionArgsWrapper),
+    ValidateTransaction(ValidationArgs),
     CommitBlock(CommitBlockArgs),
     GetTransactions(usize),
     AccountTxInPoolOrRecentBlock(ContractAddress),
@@ -61,10 +73,26 @@ pub enum MempoolRequest {
     GetMempoolSnapshot(),
 }
 impl_debug_for_infra_requests_and_responses!(MempoolRequest);
+impl_labeled_request!(MempoolRequest, MempoolRequestLabelValue);
+impl PrioritizedRequest for MempoolRequest {
+    fn priority(&self) -> RequestPriority {
+        match self {
+            MempoolRequest::CommitBlock(_) | MempoolRequest::GetTransactions(_) => {
+                RequestPriority::High
+            }
+            MempoolRequest::AddTransaction(_)
+            | MempoolRequest::ValidateTransaction(_)
+            | MempoolRequest::AccountTxInPoolOrRecentBlock(_)
+            | MempoolRequest::UpdateGasPrice(_)
+            | MempoolRequest::GetMempoolSnapshot() => RequestPriority::Normal,
+        }
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize, AsRefStr)]
 pub enum MempoolResponse {
     AddTransaction(MempoolResult<()>),
+    ValidateTransaction(MempoolResult<()>),
     CommitBlock(MempoolResult<()>),
     GetTransactions(MempoolResult<Vec<InternalRpcTransaction>>),
     AccountTxInPoolOrRecentBlock(MempoolResult<bool>),
@@ -91,6 +119,17 @@ where
         handle_all_response_variants!(
             MempoolResponse,
             AddTransaction,
+            MempoolClientError,
+            MempoolError,
+            Direct
+        )
+    }
+
+    async fn validate_tx(&self, args: ValidationArgs) -> MempoolClientResult<()> {
+        let request = MempoolRequest::ValidateTransaction(args);
+        handle_all_response_variants!(
+            MempoolResponse,
+            ValidateTransaction,
             MempoolClientError,
             MempoolError,
             Direct

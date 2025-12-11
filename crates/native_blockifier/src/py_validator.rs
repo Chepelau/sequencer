@@ -31,7 +31,6 @@ pub struct PyValidator {
 impl PyValidator {
     #[new]
     #[pyo3(signature = (os_config, state_reader_proxy, next_block_info, max_nonce_for_validation_skip, py_versioned_constants_overrides))]
-    #[allow(clippy::result_large_err)]
     pub fn create(
         os_config: PyOsConfig,
         state_reader_proxy: &PyAny,
@@ -44,8 +43,11 @@ impl PyValidator {
         let state = CachedState::new(state_reader);
 
         // Create the block context.
-        let versioned_constants =
-            VersionedConstants::get_versioned_constants(py_versioned_constants_overrides.into());
+        let mut versioned_constants = VersionedConstants::get_versioned_constants(Some(
+            py_versioned_constants_overrides.into(),
+        ));
+        // The validation of a transaction is not affected by the casm hash migration.
+        versioned_constants.enable_casm_hash_migration = false;
         let block_context = BlockContext::new(
             next_block_info.try_into().expect("Failed to convert block info."),
             os_config.into_chain_info(),
@@ -62,8 +64,8 @@ impl PyValidator {
 
     // Transaction Execution API.
 
-    #[pyo3(signature = (tx, optional_py_class_info, deploy_account_tx_hash))]
     #[allow(clippy::result_large_err)]
+    #[pyo3(signature = (tx, optional_py_class_info, deploy_account_tx_hash))]
     pub fn perform_validations(
         &mut self,
         tx: &PyAny,
@@ -75,11 +77,13 @@ impl PyValidator {
 
         // We check if the transaction should be skipped due to the deploy account not being
         // processed.
-        let validate = self.should_run_stateful_validations(&account_tx, deploy_account_tx_hash)?;
+        let validate = self
+            .should_run_stateful_validations(&account_tx, deploy_account_tx_hash)
+            .map_err(Box::new)?;
 
         account_tx.execution_flags.validate = validate;
         account_tx.execution_flags.strict_nonce_check = false;
-        self.stateful_validator.perform_validations(account_tx)?;
+        self.stateful_validator.perform_validations(account_tx).map_err(Box::new)?;
 
         Ok(())
     }

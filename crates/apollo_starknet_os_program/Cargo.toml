@@ -8,7 +8,6 @@ description = "The source (Cairo) code of the Starknet OS."
 build = "build/main.rs"
 
 [features]
-dump_source_files = []
 test_programs = []
 
 [lints]
@@ -30,5 +29,6 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 [dev-dependencies]
 apollo_infra_utils = { workspace = true, features = ["testing"] }
 blockifier.workspace = true
+expect-test.workspace = true
 starknet-types-core.workspace = true
 starknet_api.workspace = true

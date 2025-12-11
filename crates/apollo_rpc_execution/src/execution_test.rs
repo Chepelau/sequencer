@@ -13,10 +13,11 @@ use indexmap::indexmap;
 use pretty_assertions::assert_eq;
 use starknet_api::abi::abi_utils::get_storage_var_address;
 use starknet_api::block::{BlockNumber, StarknetVersion};
-use starknet_api::core::{ChainId, CompiledClassHash, EntryPointSelector};
+use starknet_api::core::{ChainId, EntryPointSelector};
 use starknet_api::state::{StateNumber, ThinStateDiff};
 use starknet_api::transaction::fields::{Calldata, Fee};
-use starknet_api::{calldata, class_hash, contract_address, felt, nonce};
+use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
+use starknet_api::{calldata, class_hash, compiled_class_hash, contract_address, felt, nonce};
 use starknet_types_core::felt::Felt;
 
 use crate::execution_utils::selector_from_name;
@@ -686,7 +687,7 @@ fn induced_state_diff() {
                 sequencer_balance_key => felt!(sequencer_balance),
             },
         },
-        declared_classes: indexmap! {},
+        class_hash_to_compiled_class_hash: indexmap! {},
         deprecated_declared_classes: vec![],
     };
     assert_eq!(simulation_results[0].induced_state_diff, expected_invoke_deprecated);
@@ -695,7 +696,7 @@ fn induced_state_diff() {
     sequencer_balance += simulation_results[1].fee_estimation.overall_fee.0;
     let expected_declare_class = ThinStateDiff {
         nonces: indexmap! {*ACCOUNT_ADDRESS => nonce!(2_u128)},
-        declared_classes: indexmap! {class_hash!(next_declared_class_hash) => CompiledClassHash::default()},
+        class_hash_to_compiled_class_hash: indexmap! {class_hash!(next_declared_class_hash) => compiled_class_hash!(123)},
         storage_diffs: indexmap! {
             *TEST_ERC20_CONTRACT_ADDRESS => indexmap!{
                 account_balance_key => felt!(account_balance),
@@ -719,7 +720,7 @@ fn induced_state_diff() {
                 sequencer_balance_key => felt!(sequencer_balance),
             },
         },
-        declared_classes: indexmap! {},
+        class_hash_to_compiled_class_hash: indexmap! {},
         deployed_contracts: indexmap! {},
     };
     assert_eq!(simulation_results[2].induced_state_diff, expected_declare_deprecated_class);
@@ -739,7 +740,7 @@ fn induced_state_diff() {
                 sequencer_balance_key => felt!(sequencer_balance),
             },
         },
-        declared_classes: indexmap! {},
+        class_hash_to_compiled_class_hash: indexmap! {},
         deployed_contracts: indexmap! {*NEW_ACCOUNT_ADDRESS => *ACCOUNT_CLASS_HASH},
     };
     assert_eq!(simulation_results[3].induced_state_diff, expected_deploy_account);
@@ -778,14 +779,14 @@ fn blockifier_error_mapping() {
     let class_hash = class_hash!("0x321");
     let expected = format!(
         "Contract constructor execution has failed:\n0: Error in the contract class constructor \
-         (contract address: {:#064x}, class hash: {:#064x}, selector: UNKNOWN):\n{child}\n",
+         (contract address: {:#066x}, class hash: {:#066x}, selector: UNKNOWN):\n{child}\n",
         storage_address.0.key(),
         class_hash.0
     );
 
     let blockifier_err = BlockifierTransactionExecutionError::ContractConstructorExecutionFailed(
         ConstructorEntryPointExecutionError::ExecutionError {
-            error: child,
+            error: Box::new(child),
             class_hash,
             contract_address: storage_address,
             constructor_selector: None,
@@ -802,7 +803,7 @@ fn blockifier_error_mapping() {
     let child = blockifier::execution::errors::EntryPointExecutionError::RecursionDepthExceeded;
     let selector = EntryPointSelector(felt!("0x111"));
     let blockifier_err = BlockifierTransactionExecutionError::ExecutionError {
-        error: child,
+        error: Box::new(child),
         class_hash,
         storage_address,
         selector,
@@ -818,7 +819,7 @@ fn blockifier_error_mapping() {
 
     let child = blockifier::execution::errors::EntryPointExecutionError::RecursionDepthExceeded;
     let blockifier_err = BlockifierTransactionExecutionError::ValidateTransactionError {
-        error: child,
+        error: Box::new(child),
         class_hash,
         storage_address,
         selector,

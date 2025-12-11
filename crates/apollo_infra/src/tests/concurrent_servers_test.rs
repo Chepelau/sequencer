@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use strum::EnumVariantNames;
+use strum_macros::{AsRefStr, EnumDiscriminants, EnumIter, IntoStaticStr};
 use tokio::sync::mpsc::channel;
 use tokio::sync::Semaphore;
 use tokio::task;
@@ -17,28 +19,41 @@ use crate::component_client::{
 };
 use crate::component_definitions::{
     ComponentClient,
-    ComponentRequestAndResponseSender,
     ComponentRequestHandler,
     ComponentStarter,
+    PrioritizedRequest,
+    RequestWrapper,
 };
 use crate::component_server::{
     ComponentServerStarter,
     ConcurrentLocalComponentServer,
+    LocalServerConfig,
     RemoteComponentServer,
 };
 use crate::tests::{
+    dummy_remote_server_config,
     AVAILABLE_PORTS,
+    TEST_LOCAL_CLIENT_METRICS,
     TEST_LOCAL_SERVER_METRICS,
     TEST_REMOTE_CLIENT_METRICS,
     TEST_REMOTE_SERVER_METRICS,
 };
+use crate::{impl_debug_for_infra_requests_and_responses, impl_labeled_request};
 
 type TestResult = ClientResult<()>;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, AsRefStr, EnumDiscriminants)]
+#[strum_discriminants(
+    name(ConcurrentComponentRequestLabelValue),
+    derive(IntoStaticStr, EnumIter, EnumVariantNames),
+    strum(serialize_all = "snake_case")
+)]
 enum ConcurrentComponentRequest {
     PerformAction(TestSemaphore),
 }
+impl_debug_for_infra_requests_and_responses!(ConcurrentComponentRequest);
+impl_labeled_request!(ConcurrentComponentRequest, ConcurrentComponentRequestLabelValue);
+impl PrioritizedRequest for ConcurrentComponentRequest {}
 
 #[derive(Serialize, Deserialize, Debug)]
 enum ConcurrentComponentResponse {
@@ -120,18 +135,18 @@ where
 async fn setup_concurrent_local_test() -> LocalConcurrentComponentClient {
     let component = ConcurrentComponent::new();
 
-    let (tx_a, rx_a) = channel::<
-        ComponentRequestAndResponseSender<ConcurrentComponentRequest, ConcurrentComponentResponse>,
-    >(32);
+    let (tx_a, rx_a) =
+        channel::<RequestWrapper<ConcurrentComponentRequest, ConcurrentComponentResponse>>(32);
 
-    let local_client = LocalConcurrentComponentClient::new(tx_a);
-
+    let local_client = LocalConcurrentComponentClient::new(tx_a, &TEST_LOCAL_CLIENT_METRICS);
+    let local_server_config = LocalServerConfig::default();
     let max_concurrency = 10;
     let mut concurrent_local_server = ConcurrentLocalComponentServer::new(
         component,
+        &local_server_config,
         rx_a,
         max_concurrency,
-        TEST_LOCAL_SERVER_METRICS,
+        &TEST_LOCAL_SERVER_METRICS,
     );
     task::spawn(async move {
         let _ = concurrent_local_server.start().await;
@@ -143,24 +158,24 @@ async fn setup_concurrent_local_test() -> LocalConcurrentComponentClient {
 async fn setup_concurrent_remote_test() -> RemoteConcurrentComponentClient {
     let local_client = setup_concurrent_local_test().await;
     let socket = AVAILABLE_PORTS.lock().await.get_next_local_host_socket();
-    let config = RemoteClientConfig::default();
+    let remote_client_config = RemoteClientConfig::default();
 
     let max_concurrency = 10;
     let mut concurrent_remote_server = RemoteComponentServer::new(
         local_client.clone(),
-        socket.ip(),
+        dummy_remote_server_config(socket.ip()),
         socket.port(),
         max_concurrency,
-        TEST_REMOTE_SERVER_METRICS,
+        &TEST_REMOTE_SERVER_METRICS,
     );
     task::spawn(async move {
         let _ = concurrent_remote_server.start().await;
     });
     RemoteConcurrentComponentClient::new(
-        config,
+        remote_client_config,
         &socket.ip().to_string(),
         socket.port(),
-        TEST_REMOTE_CLIENT_METRICS,
+        &TEST_REMOTE_CLIENT_METRICS,
     )
 }
 

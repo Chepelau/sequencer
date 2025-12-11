@@ -7,10 +7,9 @@ use futures::future::{ready, Ready};
 use futures::sink::With;
 use futures::stream::Map;
 use futures::{SinkExt, StreamExt};
-use libp2p::core::multiaddr::Protocol;
 use libp2p::gossipsub::SubscriptionError;
 use libp2p::identity::Keypair;
-use libp2p::{Multiaddr, PeerId};
+use libp2p::PeerId;
 
 use super::{
     BroadcastReceivedMessagesConverterFn,
@@ -28,8 +27,8 @@ use super::{
     SqmrServerReceiver,
     Topic,
 };
-use crate::sqmr::Bytes;
-use crate::NetworkConfig;
+use crate::utils::make_multiaddr;
+use crate::{Bytes, NetworkConfig};
 
 pub fn mock_register_sqmr_protocol_client<Query, Response>(
     buffer_size: usize,
@@ -176,10 +175,7 @@ pub fn create_connected_network_configs(ports: Vec<u16>) -> Vec<NetworkConfig> {
         .iter()
         .zip(ports.iter())
         .map(|(public_key, port)| {
-            Multiaddr::empty()
-                .with(Protocol::Ip4(Ipv4Addr::LOCALHOST))
-                .with(Protocol::Tcp(*port))
-                .with(Protocol::P2p(PeerId::from_public_key(public_key)))
+            make_multiaddr(Ipv4Addr::LOCALHOST, *port, Some(PeerId::from_public_key(public_key)))
         })
         .collect();
     ports
@@ -188,7 +184,7 @@ pub fn create_connected_network_configs(ports: Vec<u16>) -> Vec<NetworkConfig> {
         .map(|(port, private_key)| NetworkConfig {
             port,
             bootstrap_peer_multiaddr: Some(nodes_addresses.clone()),
-            secret_key: Some(private_key.to_vec()),
+            secret_key: Some(private_key.to_vec().into()),
             ..Default::default()
         })
         .collect()

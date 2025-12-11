@@ -4,16 +4,19 @@ use std::fs;
 use clap::Error;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
-use starknet_committer::block_committer::input::{ConfigImpl, Input, StarknetStorageValue};
+use starknet_committer::block_committer::input::StarknetStorageValue;
+use starknet_committer::db::external_test_utils::single_tree_flow_test;
 use starknet_committer::hash_function::hash::TreeHashFunctionImpl;
 use starknet_committer::patricia_merkle_tree::tree::OriginalSkeletonStorageTrieConfig;
-use starknet_patricia::patricia_merkle_tree::external_test_utils::single_tree_flow_test;
 use tempfile::NamedTempFile;
 
-use super::utils::parse_from_python::parse_input_single_storage_tree_flow_test;
 use crate::committer_cli::commands::commit;
+use crate::committer_cli::parse_input::cast::CommitterInputImpl;
 use crate::committer_cli::parse_input::read::parse_input;
-use crate::committer_cli::tests::utils::parse_from_python::TreeFlowInput;
+use crate::committer_cli::tests::parse_from_python::{
+    parse_input_single_storage_tree_flow_test,
+    TreeFlowInput,
+};
 
 // TODO(Aner, 20/06/2024): these tests needs to be fixed to be run correctly in the CI:
 // 1. Fix the test to measure cpu_time and not wall_time.
@@ -37,20 +40,18 @@ impl<'de> Deserialize<'de> for FactMap {
     }
 }
 
-struct CommitterInput(Input<ConfigImpl>);
-
-impl<'de> Deserialize<'de> for CommitterInput {
+impl<'de> Deserialize<'de> for CommitterInputImpl {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        Ok(Self(parse_input(&String::deserialize(deserializer)?).unwrap()))
+        Ok(parse_input(&String::deserialize(deserializer)?).unwrap())
     }
 }
 
 #[derive(Deserialize)]
 struct CommitterRegressionInput {
-    committer_input: CommitterInput,
+    committer_input: CommitterInputImpl,
     contract_states_root: String,
     contract_classes_root: String,
     expected_facts: FactMap,
@@ -63,15 +64,10 @@ struct TreeRegressionOutput {
 }
 
 #[derive(Deserialize)]
-struct StorageObject {
-    storage: Value,
-}
-
-#[derive(Deserialize)]
 struct CommitterRegressionOutput {
     contract_storage_root_hash: Value,
     compiled_class_root_hash: Value,
-    storage: StorageObject,
+    storage: Value,
 }
 
 struct TreeRegressionInput {
@@ -103,7 +99,7 @@ impl<'de> Deserialize<'de> for TreeRegressionInput {
 #[tokio::test(flavor = "multi_thread")]
 pub async fn test_regression_single_tree() {
     let TreeRegressionInput {
-        tree_flow_input: TreeFlowInput { leaf_modifications, storage, root_hash },
+        tree_flow_input: TreeFlowInput { leaf_modifications, mut storage, root_hash },
         expected_hash,
         expected_storage_changes,
     } = serde_json::from_str(SINGLE_TREE_FLOW_INPUT).unwrap();
@@ -112,7 +108,7 @@ pub async fn test_regression_single_tree() {
     // Benchmark the single tree flow test.
     let output = single_tree_flow_test::<StarknetStorageValue, TreeHashFunctionImpl>(
         leaf_modifications,
-        storage,
+        &mut storage,
         root_hash,
         OriginalSkeletonStorageTrieConfig::new(false),
     )
@@ -141,13 +137,13 @@ pub async fn test_single_committer_flow(input: String, output_path: String) -> R
         expected_facts,
     } = serde_json::from_str(&input).unwrap();
     // Benchmark the committer flow test.
-    commit(committer_input.0, output_path.to_owned()).await;
+    commit(committer_input.input, output_path.to_owned(), committer_input.storage).await;
 
     // Assert correctness of the output of the committer flow test.
     let CommitterRegressionOutput {
         contract_storage_root_hash,
         compiled_class_root_hash,
-        storage: StorageObject { storage: Value::Object(storage_changes) },
+        storage: Value::Object(storage_changes),
     } = serde_json::from_str(&std::fs::read_to_string(output_path).unwrap()).unwrap()
     else {
         panic!("Expected the storage to be an object.");
@@ -175,6 +171,16 @@ pub async fn test_regression_committer_flow() {
     assert!(execution_time.as_secs_f64() < MAX_TIME_FOR_COMMITTER_FLOW_BECHMARK_TEST);
 }
 
+async fn process_single_file(file_content: String, file_path_string: String) {
+    let output_file = NamedTempFile::new().unwrap();
+    let result =
+        test_single_committer_flow(file_content, output_file.path().to_str().unwrap().to_string())
+            .await;
+    if result.is_err() {
+        panic!("Error {} for file: {}", result.err().unwrap(), file_path_string);
+    }
+}
+
 #[ignore = "To avoid running the regression test in Coverage or without the --release flag."]
 #[tokio::test(flavor = "multi_thread")]
 pub async fn test_regression_committer_all_files() {
@@ -183,20 +189,21 @@ pub async fn test_regression_committer_all_files() {
         EXPECTED_NUMBER_OF_FILES
     );
     let dir_path = fs::read_dir("./test_inputs/regression_files").unwrap();
-    let mut tasks = Vec::with_capacity(EXPECTED_NUMBER_OF_FILES);
-    for entry in dir_path {
-        tasks.push(tokio::task::spawn(async move {
+
+    // Collect all file paths and contents first
+    let files: Vec<_> = dir_path
+        .map(|entry| {
             let file_path = entry.unwrap().path();
-            let output_file = NamedTempFile::new().unwrap();
-            let result = test_single_committer_flow(
-                fs::read_to_string(file_path.clone()).unwrap(),
-                output_file.path().to_str().unwrap().to_string(),
-            )
-            .await;
-            if result.is_err() {
-                panic!("Error {} for file: {:?}", result.err().unwrap(), file_path);
-            }
-        }));
-    }
-    futures::future::try_join_all(tasks).await.unwrap();
+            let file_path_string = file_path.to_str().unwrap().to_string();
+            let file_content = fs::read_to_string(&file_path_string).unwrap();
+            (file_content, file_path_string)
+        })
+        .collect();
+
+    // Process all files concurrently
+    let tasks = files.into_iter().map(|(file_content, file_path_string)| {
+        process_single_file(file_content, file_path_string)
+    });
+
+    futures::future::join_all(tasks).await;
 }

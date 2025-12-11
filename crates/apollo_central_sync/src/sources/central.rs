@@ -3,20 +3,17 @@
 mod central_test;
 mod state_update_stream;
 
-use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
-use apollo_config::converters::{deserialize_optional_map, serialize_optional_map};
-use apollo_config::dumping::{prepend_sub_config_name, ser_param, SerializeConfig};
-use apollo_config::{ParamPath, ParamPrivacyInput, SerializedParam};
+use apollo_central_sync_config::config::CentralSourceConfig;
 use apollo_starknet_client::reader::{
     BlockSignatureData,
     ReaderClientError,
     StarknetFeederGatewayClient,
     StarknetReader,
 };
-use apollo_starknet_client::{ClientCreationError, RetryConfig};
+use apollo_starknet_client::ClientCreationError;
 use apollo_storage::state::StateStorageReader;
 use apollo_storage::{StorageError, StorageReader};
 use async_stream::stream;
@@ -25,12 +22,10 @@ use cairo_lang_starknet_classes::casm_contract_class::CasmContractClass;
 use futures::stream::BoxStream;
 use futures_util::StreamExt;
 use indexmap::IndexMap;
-use itertools::chain;
 use lru::LruCache;
 #[cfg(test)]
 use mockall::automock;
 use papyrus_common::pending_classes::ApiContractClass;
-use serde::{Deserialize, Serialize};
 use starknet_api::block::{Block, BlockHash, BlockHashAndNumber, BlockNumber, BlockSignature};
 use starknet_api::core::{ClassHash, CompiledClassHash, SequencerPublicKey};
 use starknet_api::crypto::utils::Signature;
@@ -42,90 +37,6 @@ use tracing::{debug, trace};
 use self::state_update_stream::{StateUpdateStream, StateUpdateStreamConfig};
 
 type CentralResult<T> = Result<T, CentralError>;
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct CentralSourceConfig {
-    pub concurrent_requests: usize,
-    pub starknet_url: String,
-    #[serde(deserialize_with = "deserialize_optional_map")]
-    pub http_headers: Option<HashMap<String, String>>,
-    pub max_state_updates_to_download: usize,
-    pub max_state_updates_to_store_in_memory: usize,
-    pub max_classes_to_download: usize,
-    // TODO(dan): validate that class_cache_size is a positive integer.
-    pub class_cache_size: usize,
-    pub retry_config: RetryConfig,
-}
-
-impl Default for CentralSourceConfig {
-    fn default() -> Self {
-        CentralSourceConfig {
-            concurrent_requests: 10,
-            starknet_url: String::from("https://alpha-mainnet.starknet.io/"),
-            http_headers: None,
-            max_state_updates_to_download: 20,
-            max_state_updates_to_store_in_memory: 20,
-            max_classes_to_download: 20,
-            class_cache_size: 100,
-            retry_config: RetryConfig {
-                retry_base_millis: 30,
-                retry_max_delay_millis: 30000,
-                max_retries: 10,
-            },
-        }
-    }
-}
-
-impl SerializeConfig for CentralSourceConfig {
-    fn dump(&self) -> BTreeMap<ParamPath, SerializedParam> {
-        let self_params_dump = BTreeMap::from_iter([
-            ser_param(
-                "concurrent_requests",
-                &self.concurrent_requests,
-                "Maximum number of concurrent requests to Starknet feeder-gateway for getting a \
-                 type of data (for example, blocks).",
-                ParamPrivacyInput::Public,
-            ),
-            ser_param(
-                "starknet_url",
-                &self.starknet_url,
-                "Starknet feeder-gateway URL. It should match chain_id.",
-                ParamPrivacyInput::Public,
-            ),
-            ser_param(
-                "http_headers",
-                &serialize_optional_map(&self.http_headers),
-                "'k1:v1 k2:v2 ...' headers for SN-client.",
-                ParamPrivacyInput::Private,
-            ),
-            ser_param(
-                "max_state_updates_to_download",
-                &self.max_state_updates_to_download,
-                "Maximum number of state updates to download at a given time.",
-                ParamPrivacyInput::Public,
-            ),
-            ser_param(
-                "max_state_updates_to_store_in_memory",
-                &self.max_state_updates_to_store_in_memory,
-                "Maximum number of state updates to store in memory at a given time.",
-                ParamPrivacyInput::Public,
-            ),
-            ser_param(
-                "max_classes_to_download",
-                &self.max_classes_to_download,
-                "Maximum number of classes to download at a given time.",
-                ParamPrivacyInput::Public,
-            ),
-            ser_param(
-                "class_cache_size",
-                &self.class_cache_size,
-                "Size of class cache, must be a positive integer.",
-                ParamPrivacyInput::Public,
-            ),
-        ]);
-        chain!(self_params_dump, prepend_sub_config_name(self.retry_config.dump(), "retry_config"))
-            .collect()
-    }
-}
 
 pub struct GenericCentralSource<TStarknetClient: StarknetReader + Send + Sync> {
     pub concurrent_requests: usize,
@@ -214,15 +125,7 @@ impl<TStarknetClient: StarknetReader + Send + Sync + 'static> CentralSourceTrait
 {
     // Returns the block hash and the block number of the latest block from the central source.
     async fn get_latest_block(&self) -> Result<Option<BlockHashAndNumber>, CentralError> {
-        self.apollo_starknet_client.latest_block().await.map_err(Arc::new)?.map_or(
-            Ok(None),
-            |block| {
-                Ok(Some(BlockHashAndNumber {
-                    hash: block.block_hash(),
-                    number: block.block_number(),
-                }))
-            },
-        )
+        Ok(self.apollo_starknet_client.latest_block_number_and_hash().await.map_err(Arc::new)?)
     }
 
     // Returns the current block hash of the given block number from the central source.
@@ -299,6 +202,8 @@ impl<TStarknetClient: StarknetReader + Send + Sync + 'static> CentralSourceTrait
     ) -> CompiledClassesStream<'_> {
         stream! {
             let txn = self.storage_reader.begin_ro_txn().map_err(CentralError::StorageError)?;
+            // TODO(Aviv): Now the class hashes include both declared classes and migrated compiled class hashes.
+            // Consider refactoring it.
             let class_hashes_iter = initial_block_number
                 .iter_up_to(up_to_block_number)
                 .map(|bn| {
@@ -313,7 +218,7 @@ impl<TStarknetClient: StarknetReader + Send + Sync + 'static> CentralSourceTrait
                 .flat_map(|maybe_state_diff| match maybe_state_diff {
                     Ok(state_diff) => {
                         state_diff
-                            .declared_classes
+                            .class_hash_to_compiled_class_hash
                             .into_iter()
                             .map(Ok)
                             .collect()
@@ -413,7 +318,7 @@ fn client_to_central_block(
     match maybe_client_block {
         Ok((Some(block), Some(signature_data))) => {
             debug!(
-                "Received new block {current_block_number} with hash {:#064x}.",
+                "Received new block {current_block_number} with hash {:#066x}.",
                 block.block_hash().0
             );
             trace!("Block: {block:#?}, signature data: {signature_data:#?}.");
@@ -451,7 +356,7 @@ impl CentralSource {
         storage_reader: StorageReader,
     ) -> Result<CentralSource, ClientCreationError> {
         let apollo_starknet_client = StarknetFeederGatewayClient::new(
-            &config.starknet_url,
+            config.starknet_url.as_ref(),
             config.http_headers,
             node_version,
             config.retry_config,

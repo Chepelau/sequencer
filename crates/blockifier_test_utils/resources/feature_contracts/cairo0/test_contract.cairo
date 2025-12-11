@@ -6,6 +6,8 @@ from starkware.cairo.common.bool import FALSE
 from starkware.cairo.common.cairo_builtins import BitwiseBuiltin, HashBuiltin, EcOpBuiltin
 from starkware.cairo.common.ec import ec_op
 from starkware.cairo.common.ec_point import EcPoint
+from starkware.cairo.common.hash import hash2
+from starkware.cairo.common.math import assert_nn_le, assert_not_zero
 from starkware.cairo.common.memcpy import memcpy
 from starkware.cairo.common.registers import get_fp_and_pc
 from starkware.starknet.common.messages import send_message_to_l1
@@ -28,6 +30,7 @@ from starkware.starknet.common.syscalls import (
     emit_event,
 )
 from starkware.starknet.core.os.contract_address.contract_address import get_contract_address
+from starkware.starknet.core.test_contract.test_contract_interface import TestContract
 
 // selector_from_name('transferFrom').
 const TRANSFER_FROM_SELECTOR = 0x0041b033f4a31df8067c24d1e9b550a2ce75fd4a29e1147af9752174f0e6cb20;
@@ -54,6 +57,26 @@ func with_arg(num: felt) {
 }
 
 @external
+func read_write_read{syscall_ptr: felt*, pedersen_ptr: HashBuiltin*}() {
+    const address = 15;
+
+    let (value) = storage_read(address=address);
+    storage_write(address=address, value=value + 1);
+    let (new_value) = storage_read(address=address);
+
+    assert new_value = value + 1;
+    return ();
+}
+
+@external
+func test_builtins{pedersen_ptr: HashBuiltin*, range_check_ptr}() -> (result: felt) {
+    assert_nn_le(17, 85);
+    let (result) = hash2{hash_ptr=pedersen_ptr}(x=1, y=2);
+    assert result = 2592987851775965742543459319508348457290966253241455514226127639100457844774;
+    return (result=result);
+}
+
+@external
 func return_result(num: felt) -> (result: felt) {
     return (result=num);
 }
@@ -67,6 +90,36 @@ func other_syscalls{syscall_ptr: felt*}() {
         calldata=new(4, 5, 6),
     );
     get_contract_address_syscall();
+    return ();
+}
+
+@l1_handler
+func l1_handler_set_value_and_revert{syscall_ptr: felt*}(
+    from_address: felt, key: felt, value: felt
+) {
+    storage_write(address=key, value=value);
+    assert 0 = 1;
+    return ();
+}
+
+@l1_handler
+func deposit{syscall_ptr: felt*, range_check_ptr, pedersen_ptr: HashBuiltin*}(
+    from_address: felt, amount: felt
+) {
+    advance_counter(index=from_address, diff_0=amount, diff_1=0);
+    return ();
+}
+
+@external
+func test_library_call_l1_handler{syscall_ptr: felt*, pedersen_ptr: HashBuiltin*, range_check_ptr}(
+    class_hash: felt, selector: felt, calldata_len: felt, calldata: felt*
+) {
+    library_call_l1_handler(
+        class_hash=class_hash,
+        function_selector=selector,
+        calldata_size=calldata_len,
+        calldata=calldata,
+    );
     return ();
 }
 
@@ -140,6 +193,21 @@ func test_library_call{syscall_ptr: felt*}(
         calldata=calldata,
     );
     return (retdata_size=retdata_size, retdata=retdata);
+}
+
+@external
+func test_library_call_syntactic_sugar{syscall_ptr: felt*, range_check_ptr}(class_hash: felt) {
+    // Set value in this contract context.
+    set_value(address=444, value=555);
+    let (value) = storage_read(address=444);
+    assert value = 555;
+
+    // Set value in this contract context using library call.
+    TestContract.library_call_set_value(class_hash=class_hash, address=444, value=666);
+    let (value) = storage_read(address=444);
+    assert value = 666;
+
+    return ();
 }
 
 @external
@@ -266,6 +334,75 @@ func test_deploy{syscall_ptr: felt*}(
         deploy_from_zero=deploy_from_zero,
     );
     return (contract_address=contract_address);
+}
+
+// This function is designed to deploy test_contract.cairo and call it.
+// The param class_hash is expected to be the hash of this contract.
+@external
+func test_deploy_and_call{syscall_ptr: felt*, range_check_ptr}(
+    class_hash: felt,
+    contract_address_salt: felt,
+    deploy_from_zero: felt,
+    constructor_calldata_len: felt,
+    constructor_calldata: felt*,
+    key: felt,
+    value: felt,
+) -> (contract_address: felt) {
+    let (contract_address) = deploy(
+        class_hash=class_hash,
+        contract_address_salt=contract_address_salt,
+        constructor_calldata_size=constructor_calldata_len,
+        constructor_calldata=constructor_calldata,
+        deploy_from_zero=deploy_from_zero,
+    );
+    TestContract.set_value(contract_address=contract_address, address=key, value=value);
+    return (contract_address=contract_address);
+}
+
+@external
+func test_call_storage_consistency{syscall_ptr: felt*, range_check_ptr}(
+    other_contract_address: felt, address: felt
+) {
+    // Set 1991 to the given address in this contract.
+    set_value(address=address, value=1991);
+
+    // Set 2021 to the given address in the other contract.
+    let saved_range_check_ptr = range_check_ptr;
+    TestContract.set_value(contract_address=other_contract_address, address=address, value=2021);
+    let range_check_ptr = saved_range_check_ptr;
+
+    // Verify that this contract's storage did not change.
+    let (value) = get_value(address=address);
+    assert value = 1991;
+
+    let (other_value) = TestContract.get_value(
+        contract_address=other_contract_address, address=address
+    );
+    assert other_value = 2021;
+
+    return ();
+}
+
+@external
+func test_re_entrance{syscall_ptr: felt*, range_check_ptr}(
+    other_contract_address: felt, depth: felt
+) {
+    // Reset storage at address 5.
+    set_value(address=5, value=100);
+
+    // Call add_value on a different contract address.
+    let saved_range_check_ptr = range_check_ptr;
+    TestContract.add_value(contract_address=other_contract_address, value=depth);
+    let range_check_ptr = saved_range_check_ptr;
+
+    // Check calculation result.
+    let (final_value) = get_value(address=5);
+    assert final_value = 100 + depth;
+
+    // Check that the dummy value was written to the correct storage.
+    let (dummy_value) = TestContract.get_value(contract_address=other_contract_address, address=5);
+    assert dummy_value = 555 * depth;
+    return ();
 }
 
 @external
@@ -559,11 +696,83 @@ func add_signature_to_counters{pedersen_ptr: HashBuiltin*, range_check_ptr, sysc
 }
 
 @external
+func set_value{syscall_ptr: felt*}(address: felt, value: felt) {
+    return storage_write(address=address, value=value);
+}
+
+@external
+func get_value{syscall_ptr: felt*}(address: felt) -> (res: felt) {
+    let (value) = storage_read(address=address);
+    return (res=value);
+}
+
+// This function changes the caller storage, thus cannot be called directly as a main transaction.
+@external
+func add_value{syscall_ptr: felt*, range_check_ptr}(value: felt) {
+    let (caller_address) = get_caller_address();
+    assert_not_zero(caller_address);
+
+    // Call recursive_add_value on the caller contract.
+    let saved_range_check_ptr = range_check_ptr;
+    TestContract.recursive_add_value(
+        contract_address=caller_address, self_address=caller_address, value=value
+    );
+    let range_check_ptr = saved_range_check_ptr;
+
+    // Add noise to the call: write dummy value to self storage;
+    // This should not affect the caller storage.
+    set_value(address=5, value=555 * value);
+    return ();
+}
+
+@external
+func recursive_add_value{syscall_ptr: felt*, range_check_ptr}(self_address: felt, value: felt) {
+    if (value == 0) {
+        return ();
+    }
+
+    increase_value(address=5);
+
+    // Call recursive_add_value with the same contract address.
+    let saved_range_check_ptr = range_check_ptr;
+    TestContract.recursive_add_value(
+        contract_address=self_address, self_address=self_address, value=value - 1
+    );
+    let range_check_ptr = saved_range_check_ptr;
+
+    // Send message: put the current call height (distance from the deepest call) as to_address,
+    // for messages order checks. We should see [1, 2, ... ,depth].
+    send_message(to_address=value);
+    return ();
+}
+
+@external
+func increase_value{syscall_ptr: felt*}(address: felt) {
+    let (prev_value) = storage_read(address=address);
+    storage_write(address, value=prev_value + 1);
+    return ();
+}
+
+@external
 func send_message{syscall_ptr: felt*}(to_address: felt) {
     alloc_locals;
     local payload: (felt, felt) = (12, 34);
     let (__fp__, _) = get_fp_and_pc();
     send_message_to_l1(to_address=to_address, payload_size=2, payload=cast(&payload, felt*));
+    return ();
+}
+
+@external
+func test_get_caller_address{syscall_ptr: felt*}(expected_address: felt) {
+    let (caller_address) = get_caller_address();
+    assert caller_address = expected_address;
+    return ();
+}
+
+@external
+func test_get_contract_address{syscall_ptr: felt*}(expected_address: felt) {
+    let (contract_address) = get_contract_address_syscall();
+    assert contract_address = expected_address;
     return ();
 }
 

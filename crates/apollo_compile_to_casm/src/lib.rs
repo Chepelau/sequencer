@@ -4,21 +4,20 @@ use apollo_compilation_utils::errors::CompilationUtilError;
 use apollo_compile_to_casm_types::{RawClass, RawExecutableClass, RawExecutableHashedClass};
 use apollo_infra::component_definitions::{default_component_start_fn, ComponentStarter};
 use apollo_proc_macros::sequencer_latency_histogram;
+use apollo_sierra_compilation_config::config::SierraCompilationConfig;
 use async_trait::async_trait;
-use starknet_api::contract_class::{ContractClass, SierraVersion};
-use starknet_api::core::CompiledClassHash;
+use starknet_api::contract_class::compiled_class_hash::{HashVersion, HashableCompiledClass};
+use starknet_api::contract_class::ContractClass;
 use starknet_api::state::SierraContractClass;
 use starknet_api::StarknetApiError;
 use thiserror::Error;
 use tracing::instrument;
 
 use crate::compiler::SierraToCasmCompiler;
-use crate::config::SierraCompilationConfig;
 use crate::metrics::{register_metrics, COMPILATION_DURATION};
 
 pub mod communication;
 pub mod compiler;
-pub mod config;
 pub mod constants;
 pub mod metrics;
 
@@ -60,14 +59,14 @@ impl SierraCompiler {
     #[sequencer_latency_histogram(COMPILATION_DURATION, true)]
     pub fn compile(&self, class: RawClass) -> SierraCompilerResult<RawExecutableHashedClass> {
         let class = SierraContractClass::try_from(class)?;
-        let sierra_version = SierraVersion::extract_from_program(&class.sierra_program)
-            .map_err(SierraCompilerError::SierraVersionFormat)?;
+        let sierra_version =
+            class.get_sierra_version().map_err(SierraCompilerError::SierraVersionFormat)?;
         let class = into_contract_class_for_compilation(&class);
 
         // TODO(Elin): handle resources (whether here or an infra. layer load-balancing).
         let executable_class = self.compiler.compile(class)?;
-        // TODO(Elin): consider spawning a worker for hash calculatioln.
-        let executable_class_hash = CompiledClassHash(executable_class.compiled_class_hash());
+        // TODO(Elin): consider spawning a worker for hash calculation.
+        let executable_class_hash = executable_class.hash(&HashVersion::V2);
         let executable_class = ContractClass::V1((executable_class, sierra_version));
         let executable_class = RawExecutableClass::try_from(executable_class)?;
 

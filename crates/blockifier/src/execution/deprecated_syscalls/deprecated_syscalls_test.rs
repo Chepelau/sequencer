@@ -7,6 +7,7 @@ use cairo_vm::vm::runners::cairo_runner::ExecutionResources;
 use pretty_assertions::assert_eq;
 use rstest::rstest;
 use starknet_api::abi::abi_utils::selector_from_name;
+use starknet_api::contract_class::compiled_class_hash::HashVersion;
 use starknet_api::core::calculate_contract_address;
 use starknet_api::state::StorageKey;
 use starknet_api::test_utils::{
@@ -25,6 +26,7 @@ use starknet_api::transaction::{
     TransactionVersion,
     QUERY_VERSION_BASE,
 };
+use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
 use starknet_api::{calldata, felt, nonce, storage_key, tx_hash};
 use starknet_types_core::felt::Felt;
 use test_case::test_case;
@@ -38,9 +40,10 @@ use crate::execution::deprecated_syscalls::DeprecatedSyscallSelector;
 use crate::execution::entry_point::{CallEntryPoint, CallType};
 use crate::execution::errors::EntryPointExecutionError;
 use crate::execution::syscalls::hint_processor::EmitEventError;
+use crate::execution::syscalls::vm_syscall_utils::{SyscallSelector, SyscallUsage};
 use crate::state::state_api::StateReader;
 use crate::test_utils::contracts::FeatureContractData;
-use crate::test_utils::initial_test_state::{test_state, test_state_ex};
+use crate::test_utils::initial_test_state::{test_state, test_state_inner};
 use crate::test_utils::{
     calldata_for_deploy_test,
     get_const_syscall_resources,
@@ -151,6 +154,10 @@ fn test_nested_library_call() {
         n_memory_holes: 0,
         builtin_instance_counter: HashMap::from([(BuiltinName::range_check, 2)]),
     };
+    let storage_entry_point_syscalls_usage = HashMap::from([
+        (SyscallSelector::StorageRead, SyscallUsage::with_call_count(1)),
+        (SyscallSelector::StorageWrite, SyscallUsage::with_call_count(1)),
+    ]);
     let nested_storage_call_info = CallInfo {
         call: nested_storage_entry_point,
         execution: CallExecution::from_retdata(retdata![felt!(value + 1)]),
@@ -161,6 +168,7 @@ fn test_nested_library_call() {
             ..Default::default()
         },
         builtin_counters: HashMap::from([(BuiltinName::range_check, 2)]),
+        syscalls_usage: storage_entry_point_syscalls_usage.clone(),
         ..Default::default()
     };
     let mut library_call_resources =
@@ -177,6 +185,10 @@ fn test_nested_library_call() {
         resources: library_call_resources.clone(),
         inner_calls: vec![nested_storage_call_info],
         builtin_counters: HashMap::from([(BuiltinName::range_check, 19)]),
+        syscalls_usage: HashMap::from([(
+            SyscallSelector::LibraryCall,
+            SyscallUsage::with_call_count(1),
+        )]),
         ..Default::default()
     };
     let storage_call_info = CallInfo {
@@ -189,6 +201,7 @@ fn test_nested_library_call() {
             ..Default::default()
         },
         builtin_counters: HashMap::from([(BuiltinName::range_check, 2)]),
+        syscalls_usage: storage_entry_point_syscalls_usage.clone(),
         ..Default::default()
     };
 
@@ -207,6 +220,10 @@ fn test_nested_library_call() {
         resources: main_call_resources,
         inner_calls: vec![library_call_info, storage_call_info],
         builtin_counters: HashMap::from([(BuiltinName::range_check, 37)]),
+        syscalls_usage: HashMap::from([(
+            SyscallSelector::LibraryCall,
+            SyscallUsage::with_call_count(2),
+        )]),
         ..Default::default()
     };
 
@@ -308,6 +325,10 @@ fn test_call_contract() {
             ..Default::default()
         },
         builtin_counters: HashMap::from([(BuiltinName::range_check, 2)]),
+        syscalls_usage: HashMap::from([
+            (SyscallSelector::StorageWrite, SyscallUsage::with_call_count(1)),
+            (SyscallSelector::StorageRead, SyscallUsage::with_call_count(1)),
+        ]),
         ..Default::default()
     };
     let expected_call_info = CallInfo {
@@ -326,6 +347,10 @@ fn test_call_contract() {
                 builtin_instance_counter: HashMap::from([(BuiltinName::range_check, 3)]),
             },
         builtin_counters: HashMap::from([(BuiltinName::range_check, 19)]),
+        syscalls_usage: HashMap::from([(
+            SyscallSelector::CallContract,
+            SyscallUsage::with_call_count(1),
+        )]),
         ..Default::default()
     };
 
@@ -483,7 +508,7 @@ fn test_block_info_syscalls(
 ) {
     let test_contract = FeatureContract::TestContract(CairoVersion::Cairo0);
     let mut state = test_state(&ChainInfo::create_for_testing(), Fee(0), &[(test_contract, 1)]);
-    let entry_point_selector = selector_from_name(&format!("test_get_{}", block_info_member_name));
+    let entry_point_selector = selector_from_name(&format!("test_get_{block_info_member_name}"));
     let entry_point_call = CallEntryPoint {
         entry_point_selector,
         calldata,
@@ -496,8 +521,7 @@ fn test_block_info_syscalls(
             check_entry_point_execution_error_for_custom_hint!(
                 &error,
                 &format!(
-                    "Unauthorized syscall get_{} in execution mode Validate.",
-                    block_info_member_name
+                    "Unauthorized syscall get_{block_info_member_name} in execution mode Validate."
                 ),
             );
         } else {
@@ -530,8 +554,13 @@ fn test_tx_info(
             *optional_class_hash.expect("No v1 bound accounts found in versioned constants.");
     }
 
-    let mut state =
-        test_state_ex(&ChainInfo::create_for_testing(), Fee(0), &[(test_contract_data, 1)]);
+    let mut state = test_state_inner(
+        &ChainInfo::create_for_testing(),
+        Fee(0),
+        &[(test_contract_data, 1)],
+        &HashVersion::V2,
+        CairoVersion::Cairo0,
+    );
     let mut version = felt!(3_u8);
     let mut expected_version = if v1_bound_account && !high_tip { felt!(1_u8) } else { version };
     if only_query {
@@ -617,7 +646,7 @@ fn test_emit_event() {
         data_length: max_event_data_length + 1,
         max_data_length: max_event_data_length,
     };
-    assert!(error.to_string().contains(format!("{}", expected_error).as_str()));
+    assert!(error.to_string().contains(format!("{expected_error}").as_str()));
 
     // Negative flow, the keys length exceeds the limit.
     let max_event_keys_length = versioned_constants.tx_event_limits.max_keys_length;
@@ -627,7 +656,7 @@ fn test_emit_event() {
         keys_length: max_event_keys_length + 1,
         max_keys_length: max_event_keys_length,
     };
-    assert!(error.to_string().contains(format!("{}", expected_error).as_str()));
+    assert!(error.to_string().contains(format!("{expected_error}").as_str()));
 
     // Negative flow, the number of events exceeds the limit.
     let max_n_emitted_events = versioned_constants.tx_event_limits.max_n_emitted_events;
@@ -639,10 +668,9 @@ fn test_emit_event() {
         n_emitted_events: max_n_emitted_events + 1,
         max_n_emitted_events,
     };
-    assert!(error.to_string().contains(format!("{}", expected_error).as_str()));
+    assert!(error.to_string().contains(format!("{expected_error}").as_str()));
 }
 
-#[allow(clippy::result_large_err)]
 fn emit_events(
     n_emitted_events: &[Felt],
     keys: &[Felt],
@@ -669,4 +697,37 @@ fn emit_events(
     };
 
     entry_point_call.execute_directly(&mut state)
+}
+
+#[rstest]
+fn test_send_message_to_l1_invalid_address(#[values(true, false)] is_l3: bool) {
+    let test_contract = FeatureContract::TestContract(CairoVersion::Cairo0);
+    let mut chain_info = ChainInfo::create_for_testing();
+    chain_info.is_l3 = is_l3;
+    let mut state = test_state(&chain_info, Fee(0), &[(test_contract, 1)]);
+
+    let invalid_to_address = felt!("0x10000000000000000000000000000000000000000");
+
+    let calldata = calldata![invalid_to_address];
+    let entry_point_call = CallEntryPoint {
+        entry_point_selector: selector_from_name("send_message"),
+        calldata,
+        ..trivial_external_entry_point_new(test_contract)
+    };
+
+    let block_context =
+        BlockContext { chain_info: chain_info.clone(), ..BlockContext::create_for_testing() };
+    let result = entry_point_call.execute_directly_given_block_context(&mut state, block_context);
+
+    if is_l3 {
+        assert!(result.is_ok(), "Expected execution to succeed on L3 chain");
+    } else {
+        assert!(result.is_err(), "Expected execution to fail with invalid address");
+        let error = result.unwrap_err();
+        let error_string = error.to_string();
+        assert!(
+            error_string.contains("Out of range"),
+            "Expected error containing 'Out of range', got: {error_string}"
+        );
+    }
 }

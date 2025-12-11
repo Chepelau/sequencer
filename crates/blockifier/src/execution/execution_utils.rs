@@ -29,6 +29,7 @@ use crate::execution::entry_point::{
     ConstructorEntryPointExecutionResult,
     EntryPointExecutionContext,
     EntryPointExecutionResult,
+    EntryPointRevertInfo,
     ExecutableCallEntryPoint,
 };
 use crate::execution::errors::{
@@ -40,7 +41,10 @@ use crate::execution::errors::{
 #[cfg(feature = "cairo_native")]
 use crate::execution::native::entry_point_execution as native_entry_point_execution;
 use crate::execution::stack_trace::{extract_trailing_cairo1_revert_trace, Cairo1RevertHeader};
-use crate::execution::syscalls::hint_processor::{ENTRYPOINT_NOT_FOUND_ERROR, OUT_OF_GAS_ERROR};
+use crate::execution::syscalls::hint_processor::{
+    ENTRYPOINT_NOT_FOUND_ERROR_FELT,
+    OUT_OF_GAS_ERROR_FELT,
+};
 use crate::execution::{deprecated_entry_point_execution, entry_point_execution};
 use crate::state::errors::StateError;
 use crate::state::state_api::State;
@@ -50,7 +54,6 @@ pub type Args = Vec<CairoArg>;
 pub const SEGMENT_ARENA_BUILTIN_SIZE: usize = 3;
 
 /// A wrapper for execute_entry_point_call that performs pre and post-processing.
-#[allow(clippy::result_large_err)]
 pub fn execute_entry_point_call_wrapper(
     mut call: ExecutableCallEntryPoint,
     compiled_class: RunnableCompiledClass,
@@ -89,14 +92,14 @@ pub fn execute_entry_point_call_wrapper(
         {
             let error_code = match err {
                 PreExecutionError::EntryPointNotFound(_)
-                | PreExecutionError::NoEntryPointOfTypeFound(_) => ENTRYPOINT_NOT_FOUND_ERROR,
-                PreExecutionError::InsufficientEntryPointGas => OUT_OF_GAS_ERROR,
+                | PreExecutionError::NoEntryPointOfTypeFound(_) => ENTRYPOINT_NOT_FOUND_ERROR_FELT,
+                PreExecutionError::InsufficientEntryPointGas => OUT_OF_GAS_ERROR_FELT,
                 _ => return Err(err.into()),
             };
             Ok(CallInfo {
                 call: orig_call.into(),
                 execution: CallExecution {
-                    retdata: Retdata(vec![Felt::from_hex(error_code).unwrap()]),
+                    retdata: Retdata(vec![error_code]),
                     // FIXME: Should we get the `is_cairo_native` bool?
                     failed: true,
                     gas_consumed: 0,
@@ -111,7 +114,6 @@ pub fn execute_entry_point_call_wrapper(
 }
 
 /// Executes a specific call to a contract entry point and returns its output.
-#[allow(clippy::result_large_err)]
 pub fn execute_entry_point_call(
     call: ExecutableCallEntryPoint,
     compiled_class: RunnableCompiledClass,
@@ -299,7 +301,6 @@ impl ReadOnlySegments {
 
 /// Instantiates the given class and assigns it an address.
 /// Returns the call info of the deployed class' constructor execution.
-#[allow(clippy::result_large_err)]
 pub fn execute_deployment(
     state: &mut dyn State,
     context: &mut EntryPointExecutionContext,
@@ -322,6 +323,12 @@ pub fn execute_deployment(
         ));
     }
 
+    context.revert_infos.0.push(EntryPointRevertInfo::new(
+        deployed_contract_address,
+        current_class_hash,
+        context.n_emitted_events,
+        context.n_sent_messages_to_l1,
+    ));
     state.set_class_hash_at(deployed_contract_address, ctor_context.class_hash).map_err(
         |error| ConstructorEntryPointExecutionError::new(error.into(), &ctor_context, None),
     )?;

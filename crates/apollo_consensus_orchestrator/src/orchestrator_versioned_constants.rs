@@ -2,10 +2,11 @@ use serde::Deserialize;
 use starknet_api::block::{GasPrice, StarknetVersion};
 use starknet_api::define_versioned_constants;
 use starknet_api::execution_resources::GasAmount;
+use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
 use thiserror::Error;
 
 /// Versioned constants for the Consensus.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct VersionedConstants {
     ///  This is used to calculate the base gas price for the next block according to EIP-1559 and
     /// serves as a sensitivity parameter that limits the maximum rate of change of the gas price
@@ -14,8 +15,10 @@ pub struct VersionedConstants {
     /// The minimum gas price in fri.
     pub min_gas_price: GasPrice,
     /// The maximum block size in gas units.
+    // NOTE: Must stay in sync with BouncerWeights sierra gas.
+    // NOTE: When max_block_size is changed, update `gas_target` accordingly to maintain the ratio.
     pub max_block_size: GasAmount,
-    /// The target gas usage per block (usually half of a block's gas limit).
+    /// The target gas usage per block.
     pub gas_target: GasAmount,
     /// The margin for the eth to fri rate disagreement, expressed as a percentage (parts per
     /// hundred).
@@ -25,7 +28,11 @@ pub struct VersionedConstants {
 define_versioned_constants!(
     VersionedConstants,
     VersionedConstantsError,
+    StarknetVersion::V0_14_0,
+    "resources/versioned_constants_diff_regression",
     (V0_14_0, "../resources/orchestrator_versioned_constants_0_14_0.json"),
+    (V0_14_1, "../resources/orchestrator_versioned_constants_0_14_1.json"),
+    (V0_15_0, "../resources/orchestrator_versioned_constants_0_15_0.json"),
 );
 
 /// Error type for the Consensus' versioned constants.

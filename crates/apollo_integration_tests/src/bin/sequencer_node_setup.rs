@@ -8,8 +8,6 @@ use clap::Parser;
 use tokio::fs::create_dir_all;
 use tracing::info;
 
-// TODO(Tsabary): unify the constants throughout this code with their respective usages.
-
 #[tokio::main]
 async fn main() {
     configure_tracing().await;
@@ -29,6 +27,7 @@ async fn main() {
     let test_manager = IntegrationTestManager::new(
         args.n_consolidated,
         args.n_distributed,
+        args.n_hybrid,
         Some(custom_paths),
         // TODO(Tsabary/Nadin): add a different identifier.
         TestIdentifier::PositiveFlowIntegrationTest,
@@ -41,7 +40,7 @@ async fn main() {
     info!("Generate simulator ports json files under {:?}", simulator_config_file);
     create_dir_all(&simulator_config_file).await.unwrap();
     for (node_index, node_setup) in test_manager.get_idle_nodes().iter() {
-        let path = format!("{}/node_{}", simulator_config_file, node_index);
+        let path = format!("{simulator_config_file}/node_{node_index}");
         node_setup.generate_simulator_ports_json(&path);
     }
 
@@ -59,6 +58,9 @@ struct Args {
 
     #[arg(long)]
     n_distributed: usize,
+
+    #[arg(long)]
+    n_hybrid: usize,
 
     #[arg(long)]
     output_base_dir: String,

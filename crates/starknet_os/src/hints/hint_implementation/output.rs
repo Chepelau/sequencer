@@ -1,10 +1,19 @@
 use std::cmp::min;
+use std::collections::HashMap;
 
 use cairo_vm::hint_processor::builtin_hint_processor::hint_utils::{
     get_integer_from_var_name,
     get_ptr_from_var_name,
     insert_value_from_var_name,
 };
+use cairo_vm::hint_processor::hint_processor_definition::HintReference;
+use cairo_vm::hint_processor::hint_processor_utils::felt_to_usize;
+use cairo_vm::serde::deserialize_program::ApTracking;
+use cairo_vm::types::relocatable::MaybeRelocatable;
+use cairo_vm::vm::vm_core::VirtualMachine;
+use rand::rngs::OsRng;
+use rand::RngCore;
+use sha2::{Digest, Sha256};
 use starknet_types_core::felt::Felt;
 
 use crate::hint_processor::common_hint_processor::CommonHintProcessor;
@@ -12,8 +21,44 @@ use crate::hints::error::{OsHintError, OsHintResult};
 use crate::hints::types::HintArgs;
 use crate::hints::vars::{Const, Ids, Scope};
 
-const MAX_PAGE_SIZE: usize = 3800;
-const OUTPUT_ATTRIBUTE_FACT_TOPOLOGY: &str = "gps_fact_topology";
+pub(crate) const MAX_PAGE_SIZE: usize = 3800;
+pub(crate) const OUTPUT_ATTRIBUTE_FACT_TOPOLOGY: &str = "gps_fact_topology";
+
+fn felt_to_bool(felt: Felt, id: Ids) -> Result<bool, OsHintError> {
+    match felt {
+        x if x == Felt::ONE => Ok(true),
+        x if x == Felt::ZERO => Ok(false),
+        _ => Err(OsHintError::BooleanIdExpected { id, felt }),
+    }
+}
+
+pub(crate) fn load_public_keys_into_memory(
+    vm: &mut VirtualMachine,
+    ids_data: &HashMap<String, HintReference>,
+    ap_tracking: &ApTracking,
+    public_keys: Option<Vec<Felt>>,
+) -> OsHintResult {
+    let public_keys: Vec<MaybeRelocatable> =
+        public_keys.unwrap_or_default().into_iter().map(Into::into).collect();
+
+    let public_keys_segment = vm.gen_arg(&public_keys)?;
+
+    insert_value_from_var_name(
+        Ids::PublicKeys.into(),
+        public_keys_segment,
+        vm,
+        ids_data,
+        ap_tracking,
+    )?;
+    insert_value_from_var_name(
+        Ids::NPublicKeys.into(),
+        public_keys.len(),
+        vm,
+        ids_data,
+        ap_tracking,
+    )?;
+    Ok(())
+}
 
 pub(crate) fn set_tree_structure<'program, CHP: CommonHintProcessor<'program>>(
     hint_processor: &mut CHP,
@@ -65,39 +110,19 @@ pub(crate) fn set_state_updates_start(
     let compress_state_updates =
         get_integer_from_var_name(Ids::CompressStateUpdates.into(), vm, ids_data, ap_tracking)?;
 
-    let use_kzg_da = match use_kzg_da_felt {
-        x if x == Felt::ONE => Ok(true),
-        x if x == Felt::ZERO => Ok(false),
-        _ => Err(OsHintError::BooleanIdExpected { id: Ids::UseKzgDa, felt: use_kzg_da_felt }),
-    }?;
+    let use_kzg_da = felt_to_bool(use_kzg_da_felt, Ids::UseKzgDa)?;
 
-    let use_compress_state_updates = match compress_state_updates {
-        x if x == Felt::ONE => Ok(true),
-        x if x == Felt::ZERO => Ok(false),
-        _ => Err(OsHintError::BooleanIdExpected {
-            id: Ids::CompressStateUpdates,
-            felt: compress_state_updates,
-        }),
-    }?;
+    let use_compress_state_updates =
+        felt_to_bool(compress_state_updates, Ids::CompressStateUpdates)?;
 
-    if use_kzg_da || use_compress_state_updates {
-        insert_value_from_var_name(
-            Ids::StateUpdatesStart.into(),
-            vm.add_memory_segment(),
-            vm,
-            ids_data,
-            ap_tracking,
-        )?;
+    let segment = if use_kzg_da || use_compress_state_updates {
+        vm.add_memory_segment()
     } else {
         // Assign a temporary segment, to be relocated into the output segment.
-        insert_value_from_var_name(
-            Ids::StateUpdatesStart.into(),
-            vm.add_temporary_segment(),
-            vm,
-            ids_data,
-            ap_tracking,
-        )?;
-    }
+        vm.add_temporary_segment()
+    };
+
+    insert_value_from_var_name(Ids::StateUpdatesStart.into(), segment, vm, ids_data, ap_tracking)?;
 
     Ok(())
 }
@@ -105,32 +130,38 @@ pub(crate) fn set_state_updates_start(
 pub(crate) fn set_compressed_start(
     HintArgs { vm, exec_scopes, ids_data, ap_tracking, .. }: HintArgs<'_>,
 ) -> OsHintResult {
+    let n_keys = get_integer_from_var_name(Ids::NKeys.into(), vm, ids_data, ap_tracking)?;
     let use_kzg_da_felt = exec_scopes.get::<Felt>(Scope::UseKzgDa.into())?;
 
-    let use_kzg_da = match use_kzg_da_felt {
-        x if x == Felt::ONE => Ok(true),
-        x if x == Felt::ZERO => Ok(false),
-        _ => Err(OsHintError::BooleanIdExpected { id: Ids::UseKzgDa, felt: use_kzg_da_felt }),
-    }?;
+    let use_kzg_da = felt_to_bool(use_kzg_da_felt, Ids::UseKzgDa)?;
 
-    if use_kzg_da {
-        insert_value_from_var_name(
-            Ids::CompressedStart.into(),
-            vm.add_memory_segment(),
-            vm,
-            ids_data,
-            ap_tracking,
-        )?;
+    let segment = if use_kzg_da || n_keys > Felt::ZERO {
+        vm.add_memory_segment()
     } else {
         // Assign a temporary segment, to be relocated into the output segment.
-        insert_value_from_var_name(
-            Ids::CompressedStart.into(),
-            vm.add_temporary_segment(),
-            vm,
-            ids_data,
-            ap_tracking,
-        )?;
-    }
+        vm.add_temporary_segment()
+    };
+
+    insert_value_from_var_name(Ids::CompressedStart.into(), segment, vm, ids_data, ap_tracking)?;
+
+    Ok(())
+}
+
+pub(crate) fn set_encrypted_start(
+    HintArgs { vm, exec_scopes, ids_data, ap_tracking, .. }: HintArgs<'_>,
+) -> OsHintResult {
+    let use_kzg_da_felt = exec_scopes.get::<Felt>(Scope::UseKzgDa.into())?;
+
+    let use_kzg_da = felt_to_bool(use_kzg_da_felt, Ids::UseKzgDa)?;
+
+    let segment = if use_kzg_da {
+        vm.add_memory_segment()
+    } else {
+        // Assign a temporary segment, to be relocated into the output segment.
+        vm.add_temporary_segment()
+    };
+
+    insert_value_from_var_name(Ids::EncryptedStart.into(), segment, vm, ids_data, ap_tracking)?;
 
     Ok(())
 }
@@ -148,5 +179,74 @@ pub(crate) fn set_n_updates_small(
         ids_data,
         ap_tracking,
     )?;
+    Ok(())
+}
+
+pub(crate) fn calculate_keys_using_sha256_hash(
+    HintArgs { vm, ids_data, ap_tracking, .. }: HintArgs<'_>,
+) -> OsHintResult {
+    // Generate a cryptographically secure random seed.
+    let mut random_bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut random_bytes);
+
+    let mut hasher = Sha256::new();
+    hasher.update(random_bytes);
+
+    // In addition, hash the compressed state diff for extra defense against potential attacks on
+    // randomness source.
+    let compressed_start =
+        get_ptr_from_var_name(Ids::CompressedStart.into(), vm, ids_data, ap_tracking)?;
+    let compressed_end =
+        get_ptr_from_var_name(Ids::CompressedEnd.into(), vm, ids_data, ap_tracking)?;
+    let array_size = (compressed_end - compressed_start)?;
+    for i in 0..array_size {
+        let felt = vm.get_integer((compressed_start + i)?)?;
+        hasher.update(felt.to_bytes_be());
+    }
+    let random_key_seed = hasher.finalize().to_vec();
+
+    const SYM_LABEL: &[u8] = b"SYM"; // domain separation: symmetric key
+    const PRIV_LABEL: &[u8] = b"PRIV"; // domain separation: private keys
+
+    // Derive the symmetric key (full 32 bytes):
+    let symmetric_key = {
+        let hash = Sha256::new().chain_update(&random_key_seed).chain_update(SYM_LABEL).finalize();
+        Felt::from_bytes_be(&hash.into())
+    };
+    insert_value_from_var_name(Ids::SymmetricKey.into(), symmetric_key, vm, ids_data, ap_tracking)?;
+
+    // Private keys: derive with a counter and truncate to 31 bytes (248 bits)
+    // to ensure result is < 2^248 < EC group order < PRIME. This is required for
+    // the Diffie-Hellman elliptic curve.
+
+    let mut priv_counter: u8 = 0;
+    let mut next_private_key = || -> MaybeRelocatable {
+        let hash = Sha256::new()
+            .chain_update(&random_key_seed)
+            .chain_update(PRIV_LABEL)
+            .chain_update([priv_counter])
+            .finalize();
+        priv_counter += 1;
+
+        // Use only first 31 bytes to ensure < 2^248.
+        let mut key_bytes = [0u8; 32];
+        key_bytes[1..].copy_from_slice(&hash[..31]);
+        MaybeRelocatable::from(Felt::from_bytes_be(&key_bytes))
+    };
+
+    let n_keys = get_integer_from_var_name(Ids::NKeys.into(), vm, ids_data, ap_tracking)?;
+    let num_private_keys = felt_to_usize(&n_keys)?;
+    let private_keys: Vec<MaybeRelocatable> =
+        (0..num_private_keys).map(|_| next_private_key()).collect();
+    let private_keys_start = vm.gen_arg(&private_keys)?;
+
+    insert_value_from_var_name(
+        Ids::SnPrivateKeys.into(),
+        private_keys_start,
+        vm,
+        ids_data,
+        ap_tracking,
+    )?;
+
     Ok(())
 }

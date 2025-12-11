@@ -1,21 +1,15 @@
-use std::sync::Arc;
-
-use apollo_class_manager_types::transaction_converter::TransactionConverter;
-use apollo_class_manager_types::EmptyClassManagerClient;
-use apollo_gateway::config::GatewayConfig;
 use apollo_gateway::gateway::Gateway;
-use apollo_gateway::state_reader_test_utils::local_test_state_reader_factory;
-use apollo_mempool_types::communication::MockMempoolClient;
+use apollo_gateway::test_utils::gateway_for_benchmark;
+use apollo_gateway_config::config::GatewayConfig;
 use blockifier::context::ChainInfo;
 use blockifier_test_utils::cairo_versions::{CairoVersion, RunnableCairo1};
 use blockifier_test_utils::calldata::create_trivial_calldata;
 use blockifier_test_utils::contracts::FeatureContract;
-use mempool_test_utils::starknet_api_test_utils::test_valid_resource_bounds;
 use starknet_api::core::ContractAddress;
 use starknet_api::invoke_tx_args;
 use starknet_api::rpc_transaction::RpcTransaction;
 use starknet_api::test_utils::invoke::rpc_invoke_tx;
-use starknet_api::test_utils::NonceManager;
+use starknet_api::test_utils::{valid_resource_bounds_for_testing, NonceManager};
 
 const N_TXS: usize = 100;
 
@@ -39,7 +33,7 @@ impl TransactionGenerator {
         let invoke_args = invoke_tx_args!(
             nonce: self.nonce_manager.next(self.sender_address),
             sender_address: self.sender_address,
-            resource_bounds: test_valid_resource_bounds(),
+            resource_bounds: valid_resource_bounds_for_testing(),
             calldata: create_trivial_calldata(self.test_contract_address),
         );
         rpc_invoke_tx(invoke_args)
@@ -80,22 +74,7 @@ impl BenchTestSetup {
             generate_invoke());
         }
 
-        let state_reader_factory = local_test_state_reader_factory(cairo_version, false);
-        let mut mempool_client = MockMempoolClient::new();
-        // TODO(noamsp): use MockTransactionConverter
-        let class_manager_client = Arc::new(EmptyClassManagerClient);
-        let transaction_converter = TransactionConverter::new(
-            class_manager_client.clone(),
-            config.gateway_config.chain_info.chain_id.clone(),
-        );
-        mempool_client.expect_add_tx().returning(|_| Ok(()));
-
-        let gateway_business_logic = Gateway::new(
-            config.gateway_config,
-            Arc::new(state_reader_factory),
-            Arc::new(mempool_client),
-            transaction_converter,
-        );
+        let gateway_business_logic = gateway_for_benchmark(config.gateway_config);
 
         Self { gateway: gateway_business_logic, txs }
     }

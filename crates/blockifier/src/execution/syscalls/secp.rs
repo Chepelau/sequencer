@@ -38,7 +38,6 @@ where
         Self { points: HashMap::new() }
     }
 
-    #[allow(clippy::result_large_err)]
     pub fn secp_add(
         &mut self,
         request: SecpAddRequest,
@@ -54,7 +53,6 @@ where
         Ok(SecpOpRespone { ec_point_ptr })
     }
 
-    #[allow(clippy::result_large_err)]
     pub fn secp_mul(
         &mut self,
         request: SecpMulRequest,
@@ -69,7 +67,6 @@ where
         Ok(SecpOpRespone { ec_point_ptr })
     }
 
-    #[allow(clippy::result_large_err)]
     pub fn secp_get_point_from_x(
         &mut self,
         vm: &mut VirtualMachine,
@@ -88,13 +85,11 @@ where
         Ok(SecpOptionalEcPointResponse { optional_ec_point_ptr })
     }
 
-    #[allow(clippy::result_large_err)]
     pub fn secp_get_xy(&self, request: SecpGetXyRequest) -> SyscallBaseResult<SecpGetXyResponse> {
         let ec_point = self.get_point_by_ptr(request.ec_point_ptr)?;
         Ok(SecpGetXyResponse { x: ec_point.x.into(), y: ec_point.y.into() })
     }
 
-    #[allow(clippy::result_large_err)]
     pub fn secp_new(
         &mut self,
         vm: &mut VirtualMachine,
@@ -113,7 +108,6 @@ where
         Ok(SecpNewResponse { optional_ec_point_ptr })
     }
 
-    #[allow(clippy::result_large_err)]
     fn allocate_point(
         &mut self,
         ec_point: short_weierstrass::Affine<Curve>,
@@ -130,7 +124,6 @@ where
         Ok(point_address)
     }
 
-    #[allow(clippy::result_large_err)]
     fn get_point_by_ptr(
         &self,
         ec_point_ptr: Relocatable,
@@ -165,7 +158,6 @@ pub struct SecpOptionalEcPointResponse {
 }
 
 impl SyscallResponse for SecpOptionalEcPointResponse {
-    #[allow(clippy::result_large_err)]
     fn write(self, vm: &mut VirtualMachine, ptr: &mut Relocatable) -> WriteResponseResult {
         match self.optional_ec_point_ptr {
             Some(ec_point_ptr) => {
@@ -184,7 +176,6 @@ impl SyscallResponse for SecpOptionalEcPointResponse {
 }
 
 impl SyscallResponse for SecpOpRespone {
-    #[allow(clippy::result_large_err)]
     fn write(self, vm: &mut VirtualMachine, ptr: &mut Relocatable) -> WriteResponseResult {
         write_maybe_relocatable(vm, ptr, self.ec_point_ptr)?;
         Ok(())
@@ -200,7 +191,6 @@ pub struct SecpAddRequest {
 }
 
 impl SyscallRequest for SecpAddRequest {
-    #[allow(clippy::result_large_err)]
     fn read(vm: &VirtualMachine, ptr: &mut Relocatable) -> SyscallBaseResult<SecpAddRequest> {
         Ok(SecpAddRequest {
             lhs_ptr: relocatable_from_ptr(vm, ptr)?,
@@ -222,7 +212,6 @@ pub struct SecpGetPointFromXRequest {
 }
 
 impl SyscallRequest for SecpGetPointFromXRequest {
-    #[allow(clippy::result_large_err)]
     fn read(
         vm: &VirtualMachine,
         ptr: &mut Relocatable,
@@ -244,7 +233,6 @@ pub struct SecpGetXyRequest {
 }
 
 impl SyscallRequest for SecpGetXyRequest {
-    #[allow(clippy::result_large_err)]
     fn read(vm: &VirtualMachine, ptr: &mut Relocatable) -> SyscallBaseResult<SecpGetXyRequest> {
         Ok(SecpGetXyRequest { ec_point_ptr: relocatable_from_ptr(vm, ptr)? })
     }
@@ -253,7 +241,6 @@ impl SyscallRequest for SecpGetXyRequest {
 pub type SecpGetXyResponse = EcPointCoordinates;
 
 impl SyscallResponse for SecpGetXyResponse {
-    #[allow(clippy::result_large_err)]
     fn write(self, vm: &mut VirtualMachine, ptr: &mut Relocatable) -> WriteResponseResult {
         write_u256(vm, ptr, self.x)?;
         write_u256(vm, ptr, self.y)?;
@@ -270,7 +257,6 @@ pub struct SecpMulRequest {
 }
 
 impl SyscallRequest for SecpMulRequest {
-    #[allow(clippy::result_large_err)]
     fn read(vm: &VirtualMachine, ptr: &mut Relocatable) -> SyscallBaseResult<SecpMulRequest> {
         let ec_point_ptr = relocatable_from_ptr(vm, ptr)?;
         let multiplier = SierraU256::from_memory(vm, ptr)?.to_biguint();
@@ -285,7 +271,6 @@ pub type SecpMulResponse = SecpOpRespone;
 pub type SecpNewRequest = EcPointCoordinates;
 
 impl SyscallRequest for SecpNewRequest {
-    #[allow(clippy::result_large_err)]
     fn read(vm: &VirtualMachine, ptr: &mut Relocatable) -> SyscallBaseResult<SecpNewRequest> {
         let x = SierraU256::from_memory(vm, ptr)?.to_biguint();
         let y = SierraU256::from_memory(vm, ptr)?.to_biguint();

@@ -1,48 +1,119 @@
-use apollo_metrics::define_metrics;
+use apollo_batcher_types::communication::BATCHER_REQUEST_LABELS;
+use apollo_infra::metrics::{
+    InfraMetrics,
+    LocalClientMetrics,
+    LocalServerMetrics,
+    RemoteClientMetrics,
+    RemoteServerMetrics,
+};
+use apollo_metrics::{define_infra_metrics, define_metrics, generate_permutation_labels};
+use blockifier::metrics::{
+    CacheMetrics,
+    CALLS_RUNNING_NATIVE,
+    NATIVE_CLASS_RETURNED,
+    NATIVE_COMPILATION_ERROR,
+    TOTAL_CALLS,
+};
 use starknet_api::block::BlockNumber;
+use strum::{EnumVariantNames, VariantNames};
+use strum_macros::IntoStaticStr;
+
+define_infra_metrics!(batcher);
 
 define_metrics!(
     Batcher => {
+        // Global class cache
+        MetricCounter { CLASS_CACHE_MISSES, "batcher_class_cache_misses", "Counter of the batcher's global class cache misses", init=0 },
+        MetricCounter { CLASS_CACHE_HITS, "batcher_class_cache_hits", "Counter of the batcher's global class cache hits", init=0 },
         // Heights
         MetricGauge { STORAGE_HEIGHT, "batcher_storage_height", "The height of the batcher's storage" },
-        MetricGauge { LAST_BATCHED_BLOCK, "batcher_last_batched_block", "The last block received by batching" },
-        MetricGauge { LAST_SYNCED_BLOCK, "batcher_last_synced_block", "The last block received by syncing" },
-        MetricGauge { LAST_PROPOSED_BLOCK, "batcher_last_proposed_block", "The last block proposed by this sequencer" },
+        MetricGauge { LAST_BATCHED_BLOCK_HEIGHT, "batcher_last_batched_block_height", "The height of the last block received by batching" },
+        MetricGauge { LAST_SYNCED_BLOCK_HEIGHT, "batcher_last_synced_block_height", "The height of the last block received by syncing" },
+        MetricGauge { LAST_PROPOSED_BLOCK_HEIGHT, "batcher_last_proposed_block_height", "The height of the last block proposed by this sequencer" },
         MetricCounter { REVERTED_BLOCKS, "batcher_reverted_blocks", "Counter of reverted blocks", init = 0 },
         // Proposals
         MetricCounter { PROPOSAL_STARTED, "batcher_proposal_started", "Counter of proposals started", init = 0 },
         MetricCounter { PROPOSAL_SUCCEEDED, "batcher_proposal_succeeded", "Counter of successful proposals", init = 0 },
         MetricCounter { PROPOSAL_FAILED, "batcher_proposal_failed", "Counter of failed proposals", init = 0 },
         MetricCounter { PROPOSAL_ABORTED, "batcher_proposal_aborted", "Counter of aborted proposals", init = 0 },
+        // Per-proposal txs that did not end up in block or were deferred
+        MetricGauge { VALIDATOR_WASTED_TXS, "batcher_validator_wasted_txs", "Number of txs executed by validator but not included in the block"},
+        MetricGauge { PROPOSER_DEFERRED_TXS, "batcher_proposer_deferred_txs", "Number of txs started execution but not finished by end of proposal by proposer"},
         // Transactions
         MetricCounter { BATCHED_TRANSACTIONS, "batcher_batched_transactions", "Counter of batched transactions across all forks", init = 0 },
         MetricCounter { REJECTED_TRANSACTIONS, "batcher_rejected_transactions", "Counter of rejected transactions", init = 0 },
+        MetricCounter { REVERTED_TRANSACTIONS, "batcher_reverted_transactions", "Counter of reverted transactions across all forks", init = 0 },
         MetricCounter { SYNCED_TRANSACTIONS, "batcher_synced_transactions", "Counter of synced transactions", init = 0 },
+        MetricHistogram { NUM_TRANSACTION_IN_BLOCK, "batcher_num_transaction_in_block", "Number of transactions in a block"},
 
-        MetricCounter { FULL_BLOCKS, "batcher_full_blocks", "Counter of blocks closed on full capacity", init = 0 },
+        MetricCounter { BATCHER_L1_PROVIDER_ERRORS, "batcher_l1_provider_errors", "Counter of L1 provider errors", init = 0 },
         MetricCounter { PRECONFIRMED_BLOCK_WRITTEN, "batcher_preconfirmed_block_written", "Counter of preconfirmed blocks written to storage", init = 0 },
+        // Block close reason
+        LabeledMetricCounter { BLOCK_CLOSE_REASON, "batcher_block_close_reason", "Number of blocks closed by reason", init = 0 , labels = BLOCK_CLOSE_REASON_LABELS},
+        // Block weights
+        MetricGauge { SIERRA_GAS_IN_LAST_BLOCK, "batcher_sierra_gas_in_last_block", "The sierra gas in the last block"},
+        MetricGauge { PROVING_GAS_IN_LAST_BLOCK, "batcher_proving_gas_in_last_block", "The proving gas in the last block"},
     },
 );
+
+pub const LABEL_NAME_BLOCK_CLOSE_REASON: &str = "block_close_reason";
+
+#[derive(Clone, Copy, Debug, IntoStaticStr, EnumVariantNames)]
+#[strum(serialize_all = "snake_case")]
+pub enum BlockCloseReason {
+    FullBlock,
+    Deadline,
+    /// Block building finished because no new transactions are being executed and the configured
+    /// timeout passed.
+    IdleExecutionTimeout,
+}
+
+generate_permutation_labels! {
+    BLOCK_CLOSE_REASON_LABELS,
+    (LABEL_NAME_BLOCK_CLOSE_REASON, BlockCloseReason),
+}
+
+pub(crate) fn record_block_close_reason(reason: BlockCloseReason) {
+    BLOCK_CLOSE_REASON.increment(1, &[(LABEL_NAME_BLOCK_CLOSE_REASON, reason.into())]);
+}
+
+pub const BATCHER_CLASS_CACHE_METRICS: CacheMetrics =
+    CacheMetrics::new(CLASS_CACHE_MISSES, CLASS_CACHE_HITS);
 
 pub fn register_metrics(storage_height: BlockNumber) {
     STORAGE_HEIGHT.register();
     STORAGE_HEIGHT.set_lossy(storage_height.0);
-    LAST_BATCHED_BLOCK.register();
-    LAST_SYNCED_BLOCK.register();
-    LAST_PROPOSED_BLOCK.register();
+    LAST_BATCHED_BLOCK_HEIGHT.register();
+    LAST_SYNCED_BLOCK_HEIGHT.register();
+    LAST_PROPOSED_BLOCK_HEIGHT.register();
     REVERTED_BLOCKS.register();
 
     PROPOSAL_STARTED.register();
     PROPOSAL_SUCCEEDED.register();
     PROPOSAL_FAILED.register();
     PROPOSAL_ABORTED.register();
+    VALIDATOR_WASTED_TXS.register();
+    PROPOSER_DEFERRED_TXS.register();
 
     BATCHED_TRANSACTIONS.register();
     REJECTED_TRANSACTIONS.register();
+    REVERTED_TRANSACTIONS.register();
     SYNCED_TRANSACTIONS.register();
 
-    FULL_BLOCKS.register();
+    BATCHER_L1_PROVIDER_ERRORS.register();
     PRECONFIRMED_BLOCK_WRITTEN.register();
+    BLOCK_CLOSE_REASON.register();
+    NUM_TRANSACTION_IN_BLOCK.register();
+
+    SIERRA_GAS_IN_LAST_BLOCK.register();
+    PROVING_GAS_IN_LAST_BLOCK.register();
+
+    // Blockifier's metrics
+    BATCHER_CLASS_CACHE_METRICS.register();
+    CALLS_RUNNING_NATIVE.register();
+    NATIVE_CLASS_RETURNED.register();
+    NATIVE_COMPILATION_ERROR.register();
+    TOTAL_CALLS.register();
 }
 
 /// A handle to update the proposal metrics when the proposal is created and dropped.

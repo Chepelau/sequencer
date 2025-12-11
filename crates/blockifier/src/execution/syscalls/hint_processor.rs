@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use cairo_lang_casm::hints::Hint;
 use cairo_lang_runner::casm_run::execute_core_hint_base;
@@ -76,9 +77,7 @@ use crate::execution::syscalls::vm_syscall_utils::{
     StorageWriteResponse,
     SyscallBaseResult,
     SyscallExecutorBaseError,
-    SyscallRequest,
     SyscallSelector,
-    SyscallUsageMap,
     TryExtractRevert,
 };
 use crate::state::errors::StateError;
@@ -205,32 +204,56 @@ impl SyscallExecutionError {
 }
 
 /// Error codes returned by Cairo 1.0 code.
+///
+/// Utility macro to define a constant Felt error value and its string representation.
+/// Example: `const_felt_error!(MY_ERR, "0xbee")` will output
+/// ```
+/// pub const MY_ERR: &str = "0xbee";
+/// pub const MY_ERR_FELT: starknet_types_core::felt::Felt =
+///     starknet_types_core::felt::Felt::from_hex_unchecked(MY_ERR);
+/// ```
+macro_rules! const_felt_error {
+    ($name:ident, $value:expr) => {
+        pub const $name: &str = $value;
+        paste::paste! { pub const [<$name _FELT>]: Felt = Felt::from_hex_unchecked($name); }
+    };
+}
+
 // "Out of gas";
-pub const OUT_OF_GAS_ERROR: &str =
-    "0x000000000000000000000000000000000000000000004f7574206f6620676173";
+const_felt_error!(
+    OUT_OF_GAS_ERROR,
+    "0x000000000000000000000000000000000000000000004f7574206f6620676173"
+);
 // "Block number out of range";
-pub const BLOCK_NUMBER_OUT_OF_RANGE_ERROR: &str =
-    "0x00000000000000426c6f636b206e756d626572206f7574206f662072616e6765";
+const_felt_error!(
+    BLOCK_NUMBER_OUT_OF_RANGE_ERROR,
+    "0x00000000000000426c6f636b206e756d626572206f7574206f662072616e6765"
+);
 // "ENTRYPOINT_NOT_FOUND";
-pub const ENTRYPOINT_NOT_FOUND_ERROR: &str =
-    "0x000000000000000000000000454e545259504f494e545f4e4f545f464f554e44";
+const_felt_error!(
+    ENTRYPOINT_NOT_FOUND_ERROR,
+    "0x000000000000000000000000454e545259504f494e545f4e4f545f464f554e44"
+);
 // "ENTRYPOINT_FAILED";
-pub const ENTRYPOINT_FAILED_ERROR: &str =
-    "0x000000000000000000000000000000454e545259504f494e545f4641494c4544";
+const_felt_error!(
+    ENTRYPOINT_FAILED_ERROR,
+    "0x000000000000000000000000000000454e545259504f494e545f4641494c4544"
+);
 // "Invalid input length";
-pub const INVALID_INPUT_LENGTH_ERROR: &str =
-    "0x000000000000000000000000496e76616c696420696e707574206c656e677468";
+const_felt_error!(
+    INVALID_INPUT_LENGTH_ERROR,
+    "0x000000000000000000000000496e76616c696420696e707574206c656e677468"
+);
 // "Invalid argument";
-pub const INVALID_ARGUMENT: &str =
-    "0x00000000000000000000000000000000496e76616c696420617267756d656e74";
+const_felt_error!(
+    INVALID_ARGUMENT,
+    "0x00000000000000000000000000000000496e76616c696420617267756d656e74"
+);
 
 /// Executes Starknet syscalls (stateful protocol hints) during the execution of an entry point
 /// call.
 pub struct SyscallHintProcessor<'a> {
     pub base: Box<SyscallHandlerBase<'a>>,
-
-    // VM-specific fields.
-    pub syscalls_usage: SyscallUsageMap,
 
     // Fields needed for execution and validation.
     pub read_only_segments: ReadOnlySegments,
@@ -261,7 +284,6 @@ impl<'a> SyscallHintProcessor<'a> {
     ) -> Self {
         SyscallHintProcessor {
             base: Box::new(SyscallHandlerBase::new(call, state, context)),
-            syscalls_usage: SyscallUsageMap::default(),
             read_only_segments,
             syscall_ptr: initial_syscall_ptr,
             hints,
@@ -293,7 +315,6 @@ impl<'a> SyscallHintProcessor<'a> {
         self.execution_mode() == ExecutionMode::Validate
     }
 
-    #[allow(clippy::result_large_err)]
     pub fn get_or_allocate_execution_info_segment(
         &mut self,
         vm: &mut VirtualMachine,
@@ -313,7 +334,6 @@ impl<'a> SyscallHintProcessor<'a> {
         }
     }
 
-    #[allow(clippy::result_large_err)]
     fn allocate_tx_resource_bounds_segment(
         &mut self,
         vm: &mut VirtualMachine,
@@ -327,14 +347,6 @@ impl<'a> SyscallHintProcessor<'a> {
                 .collect();
 
         self.allocate_data_segment(vm, &flat_resource_bounds)
-    }
-
-    pub fn increment_linear_factor_by(&mut self, selector: &SyscallSelector, n: usize) {
-        let syscall_usage = self
-            .syscalls_usage
-            .get_mut(selector)
-            .expect("syscalls_usage entry must be initialized before incrementing linear factor");
-        syscall_usage.linear_factor += n;
     }
 
     #[allow(clippy::result_large_err)]
@@ -358,7 +370,6 @@ impl<'a> SyscallHintProcessor<'a> {
         Ok(execution_info_segment_start_ptr)
     }
 
-    #[allow(clippy::result_large_err)]
     fn allocate_block_info_segment(
         &mut self,
         vm: &mut VirtualMachine,
@@ -379,7 +390,6 @@ impl<'a> SyscallHintProcessor<'a> {
         Ok(block_info_segment_start_ptr)
     }
 
-    #[allow(clippy::result_large_err)]
     fn allocate_data_segment(
         &mut self,
         vm: &mut VirtualMachine,
@@ -391,7 +401,6 @@ impl<'a> SyscallHintProcessor<'a> {
         Ok((data_segment_start_ptr, data_segment_end_ptr))
     }
 
-    #[allow(clippy::result_large_err)]
     fn allocate_tx_info_segment(&mut self, vm: &mut VirtualMachine) -> SyscallResult<Relocatable> {
         let tx_info = &self.base.context.tx_context.clone().tx_info;
         let (tx_signature_start_ptr, tx_signature_end_ptr) =
@@ -485,9 +494,8 @@ impl SyscallExecutor for SyscallHintProcessor<'_> {
         self.secp256k1_hint_processor.points.len() + self.secp256r1_hint_processor.points.len()
     }
 
-    fn increment_syscall_count_by(&mut self, selector: &SyscallSelector, n: usize) {
-        let syscall_usage = self.syscalls_usage.entry(*selector).or_default();
-        syscall_usage.call_count += n;
+    fn increment_syscall_count_by(&mut self, selector: &SyscallSelector, count: usize) {
+        self.base.increment_syscall_count_by(*selector, count);
     }
 
     fn get_mut_syscall_ptr(&mut self) -> &mut Relocatable {
@@ -498,7 +506,6 @@ impl SyscallExecutor for SyscallHintProcessor<'_> {
         self.base.context.update_revert_gas_with_next_remaining_gas(remaining_gas);
     }
 
-    #[allow(clippy::result_large_err)]
     fn call_contract(
         request: CallContractRequest,
         vm: &mut VirtualMachine,
@@ -544,20 +551,12 @@ impl SyscallExecutor for SyscallHintProcessor<'_> {
         Ok(CallContractResponse { segment: retdata_segment })
     }
 
-    #[allow(clippy::result_large_err)]
     fn deploy(
         request: DeployRequest,
         vm: &mut VirtualMachine,
         syscall_handler: &mut Self,
         remaining_gas: &mut u64,
     ) -> Result<DeployResponse, Self::Error> {
-        // Increment the Deploy syscall's linear cost counter by the number of elements in the
-        // constructor calldata.
-        syscall_handler.increment_linear_factor_by(
-            &SyscallSelector::Deploy,
-            request.constructor_calldata.0.len(),
-        );
-
         let (deployed_contract_address, call_info) = syscall_handler.base.deploy(
             request.class_hash,
             request.contract_address_salt,
@@ -572,7 +571,6 @@ impl SyscallExecutor for SyscallHintProcessor<'_> {
         Ok(DeployResponse { contract_address: deployed_contract_address, constructor_retdata })
     }
 
-    #[allow(clippy::result_large_err)]
     fn emit_event(
         request: EmitEventRequest,
         _vm: &mut VirtualMachine,
@@ -588,7 +586,6 @@ impl SyscallExecutor for SyscallHintProcessor<'_> {
     /// Returns the expected block hash if the given block was created at least
     /// [crate::abi::constants::STORED_BLOCK_HASH_BUFFER] blocks before the current block.
     /// Otherwise, returns an error.
-    #[allow(clippy::result_large_err)]
     fn get_block_hash(
         request: GetBlockHashRequest,
         _vm: &mut VirtualMachine,
@@ -599,7 +596,6 @@ impl SyscallExecutor for SyscallHintProcessor<'_> {
         Ok(GetBlockHashResponse { block_hash })
     }
 
-    #[allow(clippy::result_large_err)]
     fn get_class_hash_at(
         request: GetClassHashAtRequest,
         _vm: &mut VirtualMachine,
@@ -609,7 +605,6 @@ impl SyscallExecutor for SyscallHintProcessor<'_> {
         syscall_handler.base.get_class_hash_at(request)
     }
 
-    #[allow(clippy::result_large_err)]
     fn get_execution_info(
         _request: GetExecutionInfoRequest,
         vm: &mut VirtualMachine,
@@ -621,7 +616,6 @@ impl SyscallExecutor for SyscallHintProcessor<'_> {
         Ok(GetExecutionInfoResponse { execution_info_ptr })
     }
 
-    #[allow(clippy::result_large_err)]
     fn library_call(
         request: LibraryCallRequest,
         vm: &mut VirtualMachine,
@@ -655,20 +649,12 @@ impl SyscallExecutor for SyscallHintProcessor<'_> {
         Ok(LibraryCallResponse { segment: retdata_segment })
     }
 
-    #[allow(clippy::result_large_err)]
     fn meta_tx_v0(
         request: MetaTxV0Request,
         vm: &mut VirtualMachine,
         syscall_handler: &mut Self,
         remaining_gas: &mut u64,
     ) -> Result<MetaTxV0Response, Self::Error> {
-        // Increment the MetaTxV0 syscall's linear cost counter by the number of elements in the
-        // calldata.
-        syscall_handler.increment_linear_factor_by(
-            &SyscallSelector::MetaTxV0,
-            request.get_linear_factor_length(),
-        );
-
         let storage_address = request.contract_address;
         let selector = request.entry_point_selector;
 
@@ -684,7 +670,6 @@ impl SyscallExecutor for SyscallHintProcessor<'_> {
         Ok(MetaTxV0Response { segment: retdata_segment })
     }
 
-    #[allow(clippy::result_large_err)]
     fn replace_class(
         request: ReplaceClassRequest,
         _vm: &mut VirtualMachine,
@@ -695,7 +680,6 @@ impl SyscallExecutor for SyscallHintProcessor<'_> {
         Ok(ReplaceClassResponse {})
     }
 
-    #[allow(clippy::result_large_err)]
     fn send_message_to_l1(
         request: SendMessageToL1Request,
         _vm: &mut VirtualMachine,
@@ -706,7 +690,6 @@ impl SyscallExecutor for SyscallHintProcessor<'_> {
         Ok(SendMessageToL1Response {})
     }
 
-    #[allow(clippy::result_large_err)]
     fn storage_read(
         request: StorageReadRequest,
         _vm: &mut VirtualMachine,
@@ -717,7 +700,6 @@ impl SyscallExecutor for SyscallHintProcessor<'_> {
         Ok(StorageReadResponse { value })
     }
 
-    #[allow(clippy::result_large_err)]
     fn storage_write(
         request: StorageWriteRequest,
         _vm: &mut VirtualMachine,
@@ -732,7 +714,7 @@ impl SyscallExecutor for SyscallHintProcessor<'_> {
         self.base.context.versioned_constants()
     }
 
-    fn write_sha256_state(
+    fn write_sha256_out_state(
         &mut self,
         state: &[MaybeRelocatable],
         vm: &mut VirtualMachine,
@@ -778,7 +760,6 @@ impl HintProcessorLogic for SyscallHintProcessor<'_> {
         vm: &mut VirtualMachine,
         exec_scopes: &mut ExecutionScopes,
         hint_data: &Box<dyn Any>,
-        _constants: &HashMap<String, Felt>,
     ) -> HintExecutionResult {
         let hint = hint_data.downcast_ref::<Hint>().ok_or(HintError::WrongHintData)?;
         // Segment arena finalization is relevant only for proof so there is no need to allocate
@@ -802,12 +783,12 @@ impl HintProcessorLogic for SyscallHintProcessor<'_> {
         _ap_tracking_data: &ApTracking,
         _reference_ids: &HashMap<String, usize>,
         _references: &[HintReference],
+        _constants: Rc<HashMap<String, Felt>>,
     ) -> Result<Box<dyn Any>, VirtualMachineError> {
         Ok(Box::new(self.hints[hint_code].clone()))
     }
 }
 
-#[allow(clippy::result_large_err)]
 pub fn felt_to_bool(felt: Felt, error_info: &str) -> SyscallBaseResult<bool> {
     if felt == Felt::ZERO {
         Ok(false)
@@ -818,12 +799,10 @@ pub fn felt_to_bool(felt: Felt, error_info: &str) -> SyscallBaseResult<bool> {
     }
 }
 
-#[allow(clippy::result_large_err)]
 pub fn read_calldata(vm: &VirtualMachine, ptr: &mut Relocatable) -> SyscallBaseResult<Calldata> {
     Ok(Calldata(read_felt_array::<SyscallExecutorBaseError>(vm, ptr)?.into()))
 }
 
-#[allow(clippy::result_large_err)]
 pub fn read_call_params(
     vm: &VirtualMachine,
     ptr: &mut Relocatable,
@@ -834,7 +813,6 @@ pub fn read_call_params(
     Ok((function_selector, calldata))
 }
 
-#[allow(clippy::result_large_err)]
 pub fn execute_inner_call(
     call: CallEntryPoint,
     vm: &mut VirtualMachine,
@@ -845,7 +823,6 @@ pub fn execute_inner_call(
     create_retdata_segment(vm, syscall_handler, &raw_retdata)
 }
 
-#[allow(clippy::result_large_err)]
 pub fn create_retdata_segment(
     vm: &mut VirtualMachine,
     syscall_handler: &mut SyscallHintProcessor<'_>,
@@ -869,7 +846,6 @@ where
     Ok(felt_range_from_ptr(vm, array_data_start_ptr, array_size)?)
 }
 
-#[allow(clippy::result_large_err)]
 pub fn write_segment(
     vm: &mut VirtualMachine,
     ptr: &mut Relocatable,

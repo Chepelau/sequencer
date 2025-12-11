@@ -8,12 +8,14 @@ use cairo_vm::vm::errors::vm_errors::VirtualMachineError;
 use itertools::Itertools;
 use starknet_api::core::{ClassHash, ContractAddress, EntryPointSelector};
 use starknet_api::execution_utils::format_panic_data;
-use starknet_types_core::felt::Felt;
 
 use crate::execution::call_info::{CallInfo, Retdata};
 use crate::execution::deprecated_syscalls::hint_processor::DeprecatedSyscallExecutionError;
 use crate::execution::errors::{ConstructorEntryPointExecutionError, EntryPointExecutionError};
-use crate::execution::syscalls::hint_processor::{SyscallExecutionError, ENTRYPOINT_FAILED_ERROR};
+use crate::execution::syscalls::hint_processor::{
+    SyscallExecutionError,
+    ENTRYPOINT_FAILED_ERROR_FELT,
+};
 use crate::transaction::errors::TransactionExecutionError;
 
 #[cfg(test)]
@@ -55,13 +57,13 @@ pub struct EntryPointErrorFrame {
 impl EntryPointErrorFrame {
     fn preamble_text(&self) -> String {
         format!(
-            "{}: {} (contract address: {:#064x}, class hash: {:#064x}, selector: {}):",
+            "{}: {} (contract address: {:#066x}, class hash: {:#066x}, selector: {}):",
             self.depth,
             self.preamble_type.text(),
             self.storage_address.0.key(),
             self.class_hash.0,
             if let Some(selector) = self.selector {
-                format!("{:#064x}", selector.0)
+                format!("{:#066x}", selector.0)
             } else {
                 "UNKNOWN".to_string()
             }
@@ -92,7 +94,7 @@ impl From<&VmExceptionFrame> for String {
         };
         let vm_exception_preamble = format!("Error at pc={}:", value.pc);
         let vm_exception_traceback = if let Some(traceback) = &value.traceback {
-            format!("\n{}", traceback)
+            format!("\n{traceback}")
         } else {
             "".to_string()
         };
@@ -194,7 +196,7 @@ pub static MIN_CAIRO1_FRAME_LENGTH: LazyLock<usize> = LazyLock::new(|| {
         selector: EntryPointSelector::default(),
     };
     // +1 for newline.
-    format!("{}", frame).len() + 1
+    format!("{frame}").len() + 1
 });
 
 impl From<&&CallInfo> for Cairo1RevertFrame {
@@ -211,10 +213,10 @@ impl Display for Cairo1RevertFrame {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Error in contract (contract address: {:#064x}, class hash: {}, selector: {:#064x}):",
+            "Error in contract (contract address: {:#066x}, class hash: {}, selector: {:#066x}):",
             self.contract_address.0.key(),
             match self.class_hash {
-                Some(class_hash) => format!("{:#064x}", class_hash.0),
+                Some(class_hash) => format!("{:#066x}", class_hash.0),
                 None => "_".to_string(),
             },
             self.selector.0,
@@ -282,7 +284,7 @@ impl Display for Cairo1RevertSummary {
                     .collect::<String>()
                     + Self::TRUNCATION_SEPARATOR
             };
-            return write!(f, "{}", output);
+            return write!(f, "{output}");
         }
 
         let untruncated_string = [header.clone()]
@@ -292,7 +294,7 @@ impl Display for Cairo1RevertSummary {
             .join("\n")
             + tail;
         if untruncated_string.len() <= TRACE_LENGTH_CAP {
-            return write!(f, "{}", untruncated_string);
+            return write!(f, "{untruncated_string}");
         }
 
         // If the number of frames is too large, drop frames above the last frame (two frames are
@@ -346,8 +348,6 @@ pub fn extract_trailing_cairo1_revert_trace(
         stack: vec![],
         last_retdata: root_call.execution.retdata.clone(),
     };
-    let entrypoint_failed_felt = Felt::from_hex(ENTRYPOINT_FAILED_ERROR)
-        .unwrap_or_else(|_| panic!("{ENTRYPOINT_FAILED_ERROR} does not fit in a felt."));
 
     // Compute the failing call chain.
     let mut error_calls: Vec<&CallInfo> = vec![];
@@ -360,7 +360,7 @@ pub fn extract_trailing_cairo1_revert_trace(
         // Even if the next inner call is also in failed state, assume a scenario where the current
         // call panicked after ignoring the error result of the inner call.
         let retdata = &call.execution.retdata.0;
-        if retdata.last() != Some(&entrypoint_failed_felt) {
+        if retdata.last() != Some(&ENTRYPOINT_FAILED_ERROR_FELT) {
             break;
         }
         // Select the next inner failure, if it exists and is unique.
@@ -539,7 +539,7 @@ fn extract_virtual_machine_error_into_stack_trace(
             }
         }
         _ => {
-            error_stack.push(format!("{}\n", vm_error).into());
+            error_stack.push(format!("{vm_error}\n").into());
         }
     }
 }
@@ -716,6 +716,6 @@ fn extract_entry_point_execution_error_into_stack_trace(
         EntryPointExecutionError::ExecutionFailed { error_trace } => {
             error_stack.push(error_trace.clone().into())
         }
-        _ => error_stack.push(format!("{}\n", entry_point_error).into()),
+        _ => error_stack.push(format!("{entry_point_error}\n").into()),
     }
 }

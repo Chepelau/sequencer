@@ -10,7 +10,7 @@ use cairo_vm::vm::vm_core::VirtualMachine;
 use num_traits::ToPrimitive;
 use serde::Serialize;
 use starknet_api::block::{BlockHash, BlockNumber};
-use starknet_api::core::{ClassHash, ContractAddress, EntryPointSelector, EthAddress};
+use starknet_api::core::{ClassHash, ContractAddress, EntryPointSelector};
 use starknet_api::execution_resources::GasAmount;
 use starknet_api::state::StorageKey;
 use starknet_api::transaction::fields::{Calldata, ContractAddressSalt, TransactionSignature};
@@ -37,7 +37,7 @@ use crate::execution::syscalls::hint_processor::{
     read_felt_array,
     write_segment,
     EmitEventError,
-    OUT_OF_GAS_ERROR,
+    OUT_OF_GAS_ERROR_FELT,
 };
 use crate::execution::syscalls::syscall_executor::SyscallExecutor;
 use crate::utils::u64_from_usize;
@@ -48,7 +48,8 @@ pub type SyscallSelector = DeprecatedSyscallSelector;
 
 pub type SyscallUsageMap = HashMap<SyscallSelector, SyscallUsage>;
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[cfg_attr(feature = "transaction_serde", derive(serde::Deserialize))]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct SyscallUsage {
     pub call_count: usize,
     pub linear_factor: usize,
@@ -58,14 +59,15 @@ impl SyscallUsage {
     pub fn new(call_count: usize, linear_factor: usize) -> Self {
         SyscallUsage { call_count, linear_factor }
     }
-
+    pub fn with_call_count(call_count: usize) -> Self {
+        SyscallUsage::new(call_count, 0)
+    }
     pub fn increment_call_count(&mut self) {
         self.call_count += 1;
     }
 }
 
 pub trait SyscallRequest: Sized {
-    #[allow(clippy::result_large_err)]
     fn read(_vm: &VirtualMachine, _ptr: &mut Relocatable) -> SyscallBaseResult<Self>;
 
     /// Returns the linear factor's length for the syscall.
@@ -76,7 +78,6 @@ pub trait SyscallRequest: Sized {
 }
 
 pub trait SyscallResponse {
-    #[allow(clippy::result_large_err)]
     fn write(self, _vm: &mut VirtualMachine, _ptr: &mut Relocatable) -> WriteResponseResult;
 }
 
@@ -86,7 +87,6 @@ pub struct SyscallRequestWrapper<T: SyscallRequest> {
     pub request: T,
 }
 impl<T: SyscallRequest> SyscallRequest for SyscallRequestWrapper<T> {
-    #[allow(clippy::result_large_err)]
     fn read(vm: &VirtualMachine, ptr: &mut Relocatable) -> SyscallBaseResult<Self> {
         let gas_counter = felt_from_ptr(vm, ptr)?;
         let gas_counter =
@@ -103,7 +103,6 @@ pub enum SyscallResponseWrapper<T: SyscallResponse> {
     Failure { gas_counter: u64, revert_data: RevertData },
 }
 impl<T: SyscallResponse> SyscallResponse for SyscallResponseWrapper<T> {
-    #[allow(clippy::result_large_err)]
     fn write(self, vm: &mut VirtualMachine, ptr: &mut Relocatable) -> WriteResponseResult {
         match self {
             Self::Success { gas_counter, response } => {
@@ -145,7 +144,6 @@ impl<T: SyscallResponse> SyscallResponse for SyscallResponseWrapper<T> {
 pub struct EmptyRequest;
 
 impl SyscallRequest for EmptyRequest {
-    #[allow(clippy::result_large_err)]
     fn read(_vm: &VirtualMachine, _ptr: &mut Relocatable) -> SyscallBaseResult<EmptyRequest> {
         Ok(EmptyRequest)
     }
@@ -155,7 +153,6 @@ impl SyscallRequest for EmptyRequest {
 pub struct EmptyResponse;
 
 impl SyscallResponse for EmptyResponse {
-    #[allow(clippy::result_large_err)]
     fn write(self, _vm: &mut VirtualMachine, _ptr: &mut Relocatable) -> WriteResponseResult {
         Ok(())
     }
@@ -167,7 +164,6 @@ pub struct SingleSegmentResponse {
 }
 
 impl SyscallResponse for SingleSegmentResponse {
-    #[allow(clippy::result_large_err)]
     fn write(self, vm: &mut VirtualMachine, ptr: &mut Relocatable) -> WriteResponseResult {
         write_segment(vm, ptr, self.segment)
     }
@@ -183,7 +179,6 @@ pub struct CallContractRequest {
 }
 
 impl SyscallRequest for CallContractRequest {
-    #[allow(clippy::result_large_err)]
     fn read(vm: &VirtualMachine, ptr: &mut Relocatable) -> SyscallBaseResult<CallContractRequest> {
         let contract_address = ContractAddress::try_from(felt_from_ptr(vm, ptr)?)?;
         let (function_selector, calldata) = read_call_params(vm, ptr)?;
@@ -205,7 +200,6 @@ pub struct DeployRequest {
 }
 
 impl SyscallRequest for DeployRequest {
-    #[allow(clippy::result_large_err)]
     fn read(vm: &VirtualMachine, ptr: &mut Relocatable) -> SyscallBaseResult<DeployRequest> {
         let class_hash = ClassHash(felt_from_ptr(vm, ptr)?);
         let contract_address_salt = ContractAddressSalt(felt_from_ptr(vm, ptr)?);
@@ -235,7 +229,6 @@ pub struct DeployResponse {
 }
 
 impl SyscallResponse for DeployResponse {
-    #[allow(clippy::result_large_err)]
     fn write(self, vm: &mut VirtualMachine, ptr: &mut Relocatable) -> WriteResponseResult {
         write_felt(vm, ptr, *self.contract_address.0.key())?;
         write_segment(vm, ptr, self.constructor_retdata)
@@ -251,7 +244,6 @@ pub struct EmitEventRequest {
 
 impl SyscallRequest for EmitEventRequest {
     // The Cairo struct contains: `keys_len`, `keys`, `data_len`, `data`·
-    #[allow(clippy::result_large_err)]
     fn read(vm: &VirtualMachine, ptr: &mut Relocatable) -> SyscallBaseResult<EmitEventRequest> {
         let keys = read_felt_array::<SyscallExecutorBaseError>(vm, ptr)?
             .into_iter()
@@ -298,7 +290,6 @@ pub struct GetBlockHashRequest {
 }
 
 impl SyscallRequest for GetBlockHashRequest {
-    #[allow(clippy::result_large_err)]
     fn read(vm: &VirtualMachine, ptr: &mut Relocatable) -> SyscallBaseResult<GetBlockHashRequest> {
         let felt = felt_from_ptr(vm, ptr)?;
         let block_number = BlockNumber(felt.to_u64().ok_or_else(|| {
@@ -318,7 +309,6 @@ pub struct GetBlockHashResponse {
 }
 
 impl SyscallResponse for GetBlockHashResponse {
-    #[allow(clippy::result_large_err)]
     fn write(self, vm: &mut VirtualMachine, ptr: &mut Relocatable) -> WriteResponseResult {
         write_felt(vm, ptr, self.block_hash.0)?;
         Ok(())
@@ -335,7 +325,6 @@ pub struct GetExecutionInfoResponse {
 }
 
 impl SyscallResponse for GetExecutionInfoResponse {
-    #[allow(clippy::result_large_err)]
     fn write(self, vm: &mut VirtualMachine, ptr: &mut Relocatable) -> WriteResponseResult {
         write_maybe_relocatable(vm, ptr, self.execution_info_ptr)?;
         Ok(())
@@ -352,7 +341,6 @@ pub struct LibraryCallRequest {
 }
 
 impl SyscallRequest for LibraryCallRequest {
-    #[allow(clippy::result_large_err)]
     fn read(vm: &VirtualMachine, ptr: &mut Relocatable) -> SyscallBaseResult<LibraryCallRequest> {
         let class_hash = ClassHash(felt_from_ptr(vm, ptr)?);
         let (function_selector, calldata) = read_call_params(vm, ptr)?;
@@ -374,7 +362,6 @@ pub struct MetaTxV0Request {
 }
 
 impl SyscallRequest for MetaTxV0Request {
-    #[allow(clippy::result_large_err)]
     fn read(vm: &VirtualMachine, ptr: &mut Relocatable) -> SyscallBaseResult<MetaTxV0Request> {
         let contract_address = ContractAddress::try_from(felt_from_ptr(vm, ptr)?)?;
         let (entry_point_selector, calldata) = read_call_params(vm, ptr)?;
@@ -399,7 +386,6 @@ pub struct ReplaceClassRequest {
 }
 
 impl SyscallRequest for ReplaceClassRequest {
-    #[allow(clippy::result_large_err)]
     fn read(vm: &VirtualMachine, ptr: &mut Relocatable) -> SyscallBaseResult<ReplaceClassRequest> {
         let class_hash = ClassHash(felt_from_ptr(vm, ptr)?);
 
@@ -418,12 +404,12 @@ pub struct SendMessageToL1Request {
 
 impl SyscallRequest for SendMessageToL1Request {
     // The Cairo struct contains: `to_address`, `payload_size`, `payload`.
-    #[allow(clippy::result_large_err)]
     fn read(
         vm: &VirtualMachine,
         ptr: &mut Relocatable,
     ) -> SyscallBaseResult<SendMessageToL1Request> {
-        let to_address = EthAddress::try_from(felt_from_ptr(vm, ptr)?)?;
+        let to_address_felt = felt_from_ptr(vm, ptr)?;
+        let to_address = to_address_felt.into();
         let payload = L2ToL1Payload(read_felt_array::<SyscallExecutorBaseError>(vm, ptr)?);
 
         Ok(SendMessageToL1Request { message: MessageToL1 { to_address, payload } })
@@ -442,7 +428,6 @@ pub struct StorageReadRequest {
 }
 
 impl SyscallRequest for StorageReadRequest {
-    #[allow(clippy::result_large_err)]
     fn read(vm: &VirtualMachine, ptr: &mut Relocatable) -> SyscallBaseResult<StorageReadRequest> {
         let address_domain = felt_from_ptr(vm, ptr)?;
         if address_domain != Felt::ZERO {
@@ -459,7 +444,6 @@ pub struct StorageReadResponse {
 }
 
 impl SyscallResponse for StorageReadResponse {
-    #[allow(clippy::result_large_err)]
     fn write(self, vm: &mut VirtualMachine, ptr: &mut Relocatable) -> WriteResponseResult {
         write_felt(vm, ptr, self.value)?;
         Ok(())
@@ -476,7 +460,6 @@ pub struct StorageWriteRequest {
 }
 
 impl SyscallRequest for StorageWriteRequest {
-    #[allow(clippy::result_large_err)]
     fn read(vm: &VirtualMachine, ptr: &mut Relocatable) -> SyscallBaseResult<StorageWriteRequest> {
         let address_domain = felt_from_ptr(vm, ptr)?;
         if address_domain != Felt::ZERO {
@@ -499,7 +482,6 @@ pub struct KeccakRequest {
 }
 
 impl SyscallRequest for KeccakRequest {
-    #[allow(clippy::result_large_err)]
     fn read(vm: &VirtualMachine, ptr: &mut Relocatable) -> SyscallBaseResult<KeccakRequest> {
         let input_start = vm.get_relocatable(*ptr)?;
         *ptr = (*ptr + 1)?;
@@ -516,7 +498,6 @@ pub struct KeccakResponse {
 }
 
 impl SyscallResponse for KeccakResponse {
-    #[allow(clippy::result_large_err)]
     fn write(self, vm: &mut VirtualMachine, ptr: &mut Relocatable) -> WriteResponseResult {
         write_felt(vm, ptr, self.result_low)?;
         write_felt(vm, ptr, self.result_high)?;
@@ -532,7 +513,6 @@ pub struct Sha256ProcessBlockRequest {
 }
 
 impl SyscallRequest for Sha256ProcessBlockRequest {
-    #[allow(clippy::result_large_err)]
     fn read(
         vm: &VirtualMachine,
         ptr: &mut Relocatable,
@@ -551,7 +531,6 @@ pub struct Sha256ProcessBlockResponse {
 }
 
 impl SyscallResponse for Sha256ProcessBlockResponse {
-    #[allow(clippy::result_large_err)]
     fn write(self, vm: &mut VirtualMachine, ptr: &mut Relocatable) -> WriteResponseResult {
         write_maybe_relocatable(vm, ptr, self.state_ptr)?;
         Ok(())
@@ -564,7 +543,6 @@ pub type GetClassHashAtRequest = ContractAddress;
 pub type GetClassHashAtResponse = ClassHash;
 
 impl SyscallRequest for GetClassHashAtRequest {
-    #[allow(clippy::result_large_err)]
     fn read(
         vm: &VirtualMachine,
         ptr: &mut Relocatable,
@@ -575,7 +553,6 @@ impl SyscallRequest for GetClassHashAtRequest {
 }
 
 impl SyscallResponse for GetClassHashAtResponse {
-    #[allow(clippy::result_large_err)]
     fn write(self, vm: &mut VirtualMachine, ptr: &mut Relocatable) -> WriteResponseResult {
         write_felt(vm, ptr, *self)?;
         Ok(())
@@ -713,11 +690,9 @@ where
 
     if gas_counter < required_gas {
         //  Out of gas failure.
-        let out_of_gas_error =
-            Felt::from_hex(OUT_OF_GAS_ERROR).map_err(SyscallExecutorBaseError::from)?;
         let response: SyscallResponseWrapper<Response> = SyscallResponseWrapper::Failure {
             gas_counter,
-            revert_data: RevertData::new_normal(vec![out_of_gas_error]),
+            revert_data: RevertData::new_normal(vec![OUT_OF_GAS_ERROR_FELT]),
         };
         response.write(vm, syscall_executor.get_mut_syscall_ptr())?;
 

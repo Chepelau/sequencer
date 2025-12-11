@@ -4,7 +4,7 @@ from starkware.cairo.common.cairo_builtins import KeccakBuiltin
 from starkware.cairo.common.dict import dict_read, dict_update
 from starkware.cairo.common.dict_access import DictAccess
 from starkware.cairo.common.find_element import find_element
-from starkware.cairo.common.math import assert_not_zero
+from starkware.cairo.common.math import assert_not_equal, assert_not_zero
 from starkware.cairo.common.memcpy import memcpy
 from starkware.cairo.common.segments import relocate_segment
 from starkware.starknet.common.constants import ORIGIN_ADDRESS
@@ -68,6 +68,7 @@ from starkware.starknet.core.os.constants import (
     ENTRY_POINT_TYPE_CONSTRUCTOR,
     ENTRY_POINT_TYPE_EXTERNAL,
     ENTRY_POINT_TYPE_L1_HANDLER,
+    EXECUTE_ENTRY_POINT_SELECTOR,
     RESERVED_CONTRACT_ADDRESS,
 )
 from starkware.starknet.core.os.contract_address.contract_address import get_contract_address
@@ -530,6 +531,8 @@ func execute_deprecated_syscalls{
         // entries before this point belong to the caller.
         assert [revert_log] = RevertLogEntry(selector=CHANGE_CONTRACT_ENTRY, value=caller_address);
         let revert_log = &revert_log[1];
+        // It is forbidded to call the `__execute__` function.
+        assert_not_equal(call_contract_syscall.request.selector, EXECUTE_ENTRY_POINT_SELECTOR);
         execute_contract_call_syscall(
             block_context=block_context,
             contract_address=callee_address,
@@ -823,6 +826,7 @@ func deploy_contract{
     );
 
     // Entries before this point belong to the caller.
+    // Note the caller is the deployer (not the caller of the deployer).
     assert [revert_log] = RevertLogEntry(
         selector=CHANGE_CONTRACT_ENTRY,
         value=constructor_execution_context.execution_info.caller_address,

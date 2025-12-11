@@ -4,8 +4,8 @@ use std::time::Duration;
 use apollo_infra_utils::test_utils::TestIdentifier;
 use apollo_integration_tests::integration_test_manager::IntegrationTestManager;
 use apollo_integration_tests::integration_test_utils::integration_test_setup;
-use apollo_node::config::definitions::ConfigPointersMap;
-use apollo_node::config::node_config::SequencerNodeConfig;
+use apollo_node_config::definitions::ConfigPointersMap;
+use apollo_node_config::node_config::SequencerNodeConfig;
 use serde_json::Value;
 use starknet_api::block::BlockNumber;
 use tracing::info;
@@ -21,10 +21,11 @@ async fn main() {
     assert!(BLOCK_TO_REVERT_FROM < BLOCK_TO_WAIT_FOR_AFTER_REVERT);
 
     const N_INVOKE_TXS: usize = 50;
-    // TODO(Arni): handle L1 handlers in this scenario.
-    const N_L1_HANDLER_TXS: usize = 0;
+    const N_L1_HANDLER_TXS: usize = 5;
     /// The number of consolidated local sequencers that participate in the test.
     const N_CONSOLIDATED_SEQUENCERS: usize = 5;
+    /// The number of hybrid sequencers that participate in the test.
+    const N_HYBRID_SEQUENCERS: usize = 0;
     /// The number of distributed remote sequencers that participate in the test.
     const N_DISTRIBUTED_SEQUENCERS: usize = 0;
 
@@ -36,6 +37,7 @@ async fn main() {
     let mut integration_test_manager = IntegrationTestManager::new(
         N_CONSOLIDATED_SEQUENCERS,
         N_DISTRIBUTED_SEQUENCERS,
+        N_HYBRID_SEQUENCERS,
         None,
         TestIdentifier::RevertFlowIntegrationTest,
     )
@@ -99,12 +101,7 @@ async fn main() {
          {expected_block_number_after_revert}."
     );
     modify_revert_config_idle_nodes(&mut integration_test_manager, node_indices.clone(), None);
-    let node_start_height = expected_block_number_after_revert.unchecked_next();
-    modify_height_configs_idle_nodes(
-        &mut integration_test_manager,
-        node_indices.clone(),
-        node_start_height,
-    );
+    modify_height_configs_idle_nodes(&mut integration_test_manager, node_indices.clone());
 
     integration_test_manager.run_nodes(node_indices.clone()).await;
 
@@ -165,32 +162,29 @@ fn modify_revert_config(
     revert_up_to_and_including: Option<BlockNumber>,
 ) {
     let should_revert = revert_up_to_and_including.is_some();
-    config.state_sync_config.revert_config.should_revert = should_revert;
-    config.consensus_manager_config.revert_config.should_revert = should_revert;
+    config.state_sync_config.as_mut().unwrap().revert_config.should_revert = should_revert;
+    config.consensus_manager_config.as_mut().unwrap().revert_config.should_revert = should_revert;
 
     // If should revert is false, the revert_up_to_and_including value is irrelevant.
     if should_revert {
         let revert_up_to_and_including = revert_up_to_and_including.unwrap();
-        config.state_sync_config.revert_config.revert_up_to_and_including =
+        config.state_sync_config.as_mut().unwrap().revert_config.revert_up_to_and_including =
             revert_up_to_and_including;
-        config.consensus_manager_config.revert_config.revert_up_to_and_including =
-            revert_up_to_and_including;
+        config
+            .consensus_manager_config
+            .as_mut()
+            .unwrap()
+            .revert_config
+            .revert_up_to_and_including = revert_up_to_and_including;
     }
 }
 
 fn modify_height_configs_idle_nodes(
     integration_test_manager: &mut IntegrationTestManager,
     node_indices: HashSet<usize>,
-    node_start_height: BlockNumber,
 ) {
-    integration_test_manager.modify_config_idle_nodes(node_indices, |config| {
+    integration_test_manager.modify_config_idle_nodes(node_indices, |_config| {
         // TODO(noamsp): Change these values point to a single config value and refactor this
         // function accordingly.
-        config.consensus_manager_config.immediate_active_height = node_start_height;
-        config.consensus_manager_config.cende_config.skip_write_height = Some(node_start_height);
-        // TODO(Gilad): remove once we add support to updating the StarknetContract on Anvil.
-        // This will require mocking the required permissions in the contract that typically
-        // forbid one from updating the state through an API call.
-        config.l1_provider_config.provider_startup_height_override = Some(BlockNumber(1));
     });
 }

@@ -13,11 +13,12 @@ use cairo_vm::serde::deserialize_program::ApTracking;
 use cairo_vm::types::exec_scope::ExecutionScopes;
 use cairo_vm::vm::vm_core::VirtualMachine;
 use num_bigint::BigUint;
-use starknet_patricia::hash::hash_trait::HashOutput;
+use starknet_api::hash::HashOutput;
 use starknet_patricia::patricia_merkle_tree::node_data::inner_node::{
     EdgeData,
     EdgePathLength,
     PathToBottom,
+    Preimage,
 };
 use starknet_patricia::patricia_merkle_tree::types::SubTreeHeight;
 use starknet_types_core::felt::Felt;
@@ -34,7 +35,6 @@ use crate::hints::hint_implementation::patricia::utils::{
     InnerNode,
     LayerIndex,
     Path,
-    Preimage,
     UpdateTree,
 };
 use crate::hints::types::HintArgs;

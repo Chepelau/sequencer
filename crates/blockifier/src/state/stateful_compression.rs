@@ -14,12 +14,12 @@ use super::state_api::{State, StateReader, StateResult};
 #[path = "stateful_compression_test.rs"]
 pub mod stateful_compression_test;
 
-type Alias = Felt;
-type AliasKey = StorageKey;
+pub(crate) type Alias = Felt;
+pub(crate) type AliasKey = StorageKey;
 
 #[derive(Debug, Error)]
 pub enum CompressionError {
-    #[error("Missing key in alias contract: {:#064x}", ***.0)]
+    #[error("Missing key in alias contract: {:#066x}", ***.0)]
     MissedAlias(AliasKey),
     #[error(transparent)]
     StateError(#[from] StateError),

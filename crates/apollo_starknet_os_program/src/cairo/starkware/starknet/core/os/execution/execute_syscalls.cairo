@@ -703,6 +703,8 @@ func execute_meta_tx_v0{
         fee_data_availability_mode=0,
         account_deployment_data_start=cast(0, felt*),
         account_deployment_data_end=cast(0, felt*),
+        proof_facts_start=cast(0, felt*),
+        proof_facts_end=cast(0, felt*),
     );
 
     tempvar execution_context: ExecutionContext* = new ExecutionContext(
@@ -1182,6 +1184,8 @@ func execute_get_execution_info{range_check_ptr, syscall_ptr: felt*}(
             fee_data_availability_mode=tx_info.fee_data_availability_mode,
             account_deployment_data_start=tx_info.account_deployment_data_start,
             account_deployment_data_end=tx_info.account_deployment_data_end,
+            proof_facts_start=tx_info.proof_facts_start,
+            proof_facts_end=tx_info.proof_facts_end,
         );
 
         static_assert GetExecutionInfoResponse.SIZE == 1;
@@ -1220,6 +1224,8 @@ func execute_get_execution_info{range_check_ptr, syscall_ptr: felt*}(
             fee_data_availability_mode=tx_info.fee_data_availability_mode,
             account_deployment_data_start=tx_info.account_deployment_data_start,
             account_deployment_data_end=tx_info.account_deployment_data_end,
+            proof_facts_start=tx_info.proof_facts_start,
+            proof_facts_end=tx_info.proof_facts_end,
         );
 
         static_assert GetExecutionInfoResponse.SIZE == 1;
@@ -1367,6 +1373,8 @@ func execute_sha256_process_block{
     }
 
     local sha256_ptr: Sha256ProcessBlock* = builtin_ptrs.non_selectable.sha256;
+    let response = cast(syscall_ptr, Sha256ProcessBlockResponse*);
+    let actual_out_state: Sha256State* = &sha256_ptr.out_state;
 
     let input: Sha256Input* = &sha256_ptr.input;
     assert [input] = [request.input_start];
@@ -1374,13 +1382,21 @@ func execute_sha256_process_block{
     let state: Sha256State* = &sha256_ptr.in_state;
     assert [state] = [request.state_ptr];
 
-    let res: Sha256State* = &sha256_ptr.out_state;
-    let sha256_ptr = &sha256_ptr[1];
+    // Relocate `response.state_ptr` (allocated by the syscall hint) to the next `out_state`
+    // slot in the sha256 segment (`actual_out_state`) and assert that the two pointers are equal.
+    // Also copy [state_ptr] into [actual_out_state], since finalize_sha256 reads from
+    // [actual_out_state] and the relocation happens in the opposite direction.
+    %{
+        state_ptr = ids.response.state_ptr.address_
+        actual_out_state = ids.actual_out_state.address_
+        for i in range(8):
+            memory[actual_out_state + i] = memory[state_ptr + i]
+        memory.add_relocation_rule(src_ptr=state_ptr, dest_ptr=actual_out_state)
+    %}
 
-    assert [cast(syscall_ptr, Sha256ProcessBlockResponse*)] = Sha256ProcessBlockResponse(
-        state_ptr=res
-    );
+    assert [response] = Sha256ProcessBlockResponse(state_ptr=actual_out_state);
     let syscall_ptr = syscall_ptr + Sha256ProcessBlockResponse.SIZE;
+    let sha256_ptr = &sha256_ptr[1];
 
     tempvar builtin_ptrs = new BuiltinPointers(
         selectable=builtin_ptrs.selectable,

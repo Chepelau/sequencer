@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::sync::Arc;
 
+use apollo_batcher_config::config::BatcherConfig;
 use apollo_batcher_types::batcher_types::{
     BatcherResult,
     CentralObjects,
@@ -31,6 +33,8 @@ use apollo_mempool_types::communication::SharedMempoolClient;
 use apollo_mempool_types::mempool_types::CommitBlockArgs;
 use apollo_reverts::revert_block;
 use apollo_state_sync_types::state_sync_types::SyncBlock;
+use apollo_storage::metrics::BATCHER_STORAGE_OPEN_READ_TRANSACTIONS;
+use apollo_storage::partial_block_hash::PartialBlockHashComponentsStorageWriter;
 use apollo_storage::state::{StateStorageReader, StateStorageWriter};
 use async_trait::async_trait;
 use blockifier::concurrency::worker_pool::WorkerPool;
@@ -40,6 +44,7 @@ use indexmap::IndexSet;
 #[cfg(test)]
 use mockall::automock;
 use starknet_api::block::{BlockHeaderWithoutHash, BlockNumber};
+use starknet_api::block_hash::block_hash_calculator::PartialBlockHashComponents;
 use starknet_api::consensus_transaction::InternalConsensusTransaction;
 use starknet_api::core::{ContractAddress, Nonce};
 use starknet_api::state::ThinStateDiff;
@@ -57,26 +62,34 @@ use crate::block_builder::{
     BlockMetadata,
 };
 use crate::cende_client_types::CendeBlockMetadata;
-use crate::config::BatcherConfig;
 use crate::metrics::{
     register_metrics,
     ProposalMetricsHandle,
     BATCHED_TRANSACTIONS,
-    LAST_BATCHED_BLOCK,
-    LAST_PROPOSED_BLOCK,
-    LAST_SYNCED_BLOCK,
+    BATCHER_L1_PROVIDER_ERRORS,
+    LAST_BATCHED_BLOCK_HEIGHT,
+    LAST_PROPOSED_BLOCK_HEIGHT,
+    LAST_SYNCED_BLOCK_HEIGHT,
+    NUM_TRANSACTION_IN_BLOCK,
+    PROVING_GAS_IN_LAST_BLOCK,
     REJECTED_TRANSACTIONS,
     REVERTED_BLOCKS,
+    REVERTED_TRANSACTIONS,
+    SIERRA_GAS_IN_LAST_BLOCK,
     STORAGE_HEIGHT,
     SYNCED_TRANSACTIONS,
 };
 use crate::pre_confirmed_block_writer::{
-    PreConfirmedBlockWriterFactory,
-    PreConfirmedBlockWriterFactoryTrait,
-    PreConfirmedBlockWriterTrait,
+    PreconfirmedBlockWriterFactory,
+    PreconfirmedBlockWriterFactoryTrait,
+    PreconfirmedBlockWriterTrait,
 };
-use crate::pre_confirmed_cende_client::PreConfirmedCendeClientTrait;
-use crate::transaction_provider::{ProposeTransactionProvider, ValidateTransactionProvider};
+use crate::pre_confirmed_cende_client::PreconfirmedCendeClientTrait;
+use crate::transaction_provider::{
+    ProposeTransactionProvider,
+    TxProviderPhase,
+    ValidateTransactionProvider,
+};
 use crate::utils::{
     deadline_as_instant,
     proposal_status_from,
@@ -101,7 +114,7 @@ pub struct Batcher {
     block_builder_factory: Box<dyn BlockBuilderFactoryTrait>,
 
     /// Used to create pre-confirmed block writers.
-    pre_confirmed_block_writer_factory: Box<dyn PreConfirmedBlockWriterFactoryTrait>,
+    pre_confirmed_block_writer_factory: Box<dyn PreconfirmedBlockWriterFactoryTrait>,
 
     /// The height that the batcher is currently working on.
     /// All proposals are considered to be at this height.
@@ -125,6 +138,9 @@ pub struct Batcher {
     /// Each stream is kept until SendProposalContent::Finish/Abort is received, or a new height is
     /// started.
     validate_tx_streams: HashMap<ProposalId, InputStreamSender>,
+
+    /// Number of proposals made since coming online.
+    proposals_counter: u64,
 }
 
 impl Batcher {
@@ -137,7 +153,7 @@ impl Batcher {
         mempool_client: SharedMempoolClient,
         transaction_converter: TransactionConverter,
         block_builder_factory: Box<dyn BlockBuilderFactoryTrait>,
-        pre_confirmed_block_writer_factory: Box<dyn PreConfirmedBlockWriterFactoryTrait>,
+        pre_confirmed_block_writer_factory: Box<dyn PreconfirmedBlockWriterFactoryTrait>,
     ) -> Self {
         Self {
             config,
@@ -154,6 +170,8 @@ impl Batcher {
             executed_proposals: Arc::new(Mutex::new(HashMap::new())),
             propose_tx_streams: HashMap::new(),
             validate_tx_streams: HashMap::new(),
+            // Allow the first few proposals to be without L1 txs while system starts up.
+            proposals_counter: 1,
         }
     }
 
@@ -194,6 +212,10 @@ impl Batcher {
         )?;
 
         // TODO(yair): extract function for the following calls, use join_all.
+        info!(
+            "Notifying the mempool we start to work on block {}, round {}.",
+            block_number, propose_block_input.proposal_round
+        );
         self.mempool_client.commit_block(CommitBlockArgs::default()).await.map_err(|err| {
             error!(
                 "Mempool is not ready to start proposal {}: {}.",
@@ -201,6 +223,10 @@ impl Batcher {
             );
             BatcherError::NotReady
         })?;
+        info!(
+            "Updating gas price for block {}, round {} in Mempool client",
+            block_number, propose_block_input.proposal_round
+        );
         self.mempool_client
             .update_gas_price(
                 propose_block_input.block_info.gas_prices.strk_gas_prices.l2_gas_price.get(),
@@ -210,22 +236,32 @@ impl Batcher {
                 error!("Failed to update gas price in mempool: {}", err);
                 BatcherError::InternalError
             })?;
-        self.l1_provider_client
+        // Ignore errors. If start_block fails, then subsequent calls to l1 provider will fail on
+        // out of session and l1 provider will restart and bootstrap again.
+        let _ = self
+            .l1_provider_client
             .start_block(SessionState::Propose, propose_block_input.block_info.block_number)
             .await
-            .map_err(|err| {
+            .inspect_err(|err| {
                 error!(
                     "L1 provider is not ready to start proposing block {}: {}. ",
                     propose_block_input.block_info.block_number, err
                 );
-                BatcherError::NotReady
-            })?;
+                BATCHER_L1_PROVIDER_ERRORS.increment(1);
+            });
 
+        let start_phase = if self.proposals_counter.is_multiple_of(self.config.propose_l1_txs_every)
+        {
+            TxProviderPhase::L1
+        } else {
+            TxProviderPhase::Mempool
+        };
         let tx_provider = ProposeTransactionProvider::new(
             self.mempool_client.clone(),
             self.l1_provider_client.clone(),
             self.config.max_l1_handler_txs_per_block_proposal,
             propose_block_input.block_info.block_number,
+            start_phase,
         );
 
         // A channel to receive the transactions included in the proposed block.
@@ -249,6 +285,10 @@ impl Batcher {
                 BlockBuilderExecutionParams {
                     deadline: deadline_as_instant(propose_block_input.deadline)?,
                     is_validator: false,
+                    proposer_idle_detection_delay: self
+                        .config
+                        .block_builder_config
+                        .proposer_idle_detection_delay_millis,
                 },
                 Box::new(tx_provider),
                 Some(output_tx_sender),
@@ -278,7 +318,8 @@ impl Batcher {
             "Proposal {} already exists. This should have been checked when spawning the proposal.",
             propose_block_input.proposal_id
         );
-        LAST_PROPOSED_BLOCK.set_lossy(block_number.0);
+        LAST_PROPOSED_BLOCK_HEIGHT.set_lossy(block_number.0);
+        self.proposals_counter += 1;
         Ok(())
     }
 
@@ -295,16 +336,19 @@ impl Batcher {
             validate_block_input.retrospective_block_hash,
         )?;
 
-        self.l1_provider_client
+        // Ignore errors. If start_block fails, then subsequent calls to l1 provider will fail on
+        // out of session and l1 provider will restart and bootstrap again.
+        let _ = self
+            .l1_provider_client
             .start_block(SessionState::Validate, validate_block_input.block_info.block_number)
             .await
-            .map_err(|err| {
+            .inspect_err(|err| {
                 error!(
                     "L1 provider is not ready to start validating block {}: {}. ",
                     validate_block_input.block_info.block_number, err
                 );
-                BatcherError::NotReady
-            })?;
+                BATCHER_L1_PROVIDER_ERRORS.increment(1);
+            });
 
         // A channel to send the transactions to include in the block being validated.
         let (input_tx_sender, input_tx_receiver) =
@@ -318,7 +362,6 @@ impl Batcher {
             self.l1_provider_client.clone(),
             validate_block_input.block_info.block_number,
         );
-
         let (block_builder, abort_signal_sender) = self
             .block_builder_factory
             .create_block_builder(
@@ -329,6 +372,10 @@ impl Batcher {
                 BlockBuilderExecutionParams {
                     deadline: deadline_as_instant(validate_block_input.deadline)?,
                     is_validator: true,
+                    proposer_idle_detection_delay: self
+                        .config
+                        .block_builder_config
+                        .proposer_idle_detection_delay_millis,
                 },
                 Box::new(tx_provider),
                 None,
@@ -426,7 +473,10 @@ impl Batcher {
         proposal_id: ProposalId,
         final_n_executed_txs: usize,
     ) -> BatcherResult<SendProposalContentResponse> {
-        debug!("Send proposal content done for {}", proposal_id);
+        info!(
+            "BATCHER_FIN_VALIDATOR: Send proposal content done for {}. n_txs: {}",
+            proposal_id, final_n_executed_txs
+        );
 
         self.validate_tx_streams.remove(&proposal_id).expect("validate tx stream should exist.");
         if self.is_active(proposal_id).await {
@@ -505,7 +555,10 @@ impl Batcher {
                 error!("Failed to get commitment: {}", err);
                 BatcherError::InternalError
             })?;
-
+        info!(
+            "BATCHER_FIN_PROPOSER: Finished building proposal {proposal_id} with \
+             {final_n_executed_txs} transactions."
+        );
         Ok(GetProposalContentResponse {
             content: GetProposalContent::Finished { id: commitment, final_n_executed_txs },
         })
@@ -542,9 +595,10 @@ impl Batcher {
             address_to_nonce,
             l1_transaction_hashes.iter().copied().collect(),
             Default::default(),
+            None,
         )
         .await?;
-        LAST_SYNCED_BLOCK.set_lossy(block_number.0);
+        LAST_SYNCED_BLOCK_HEIGHT.set_lossy(block_number.0);
         SYNCED_TRANSACTIONS.increment(
             (account_transaction_hashes.len() + l1_transaction_hashes.len()).try_into().unwrap(),
         );
@@ -572,24 +626,42 @@ impl Batcher {
         let n_rejected_txs =
             u64::try_from(block_execution_artifacts.execution_data.rejected_tx_hashes.len())
                 .expect("Number of rejected transactions should fit in u64");
+        let n_reverted_count = u64::try_from(
+            block_execution_artifacts
+                .execution_data
+                .execution_infos_and_signatures
+                .values()
+                .filter(|(info, _)| info.revert_error.is_some())
+                .count(),
+        )
+        .expect("Number of reverted transactions should fit in u64");
+        let partial_block_hash_components =
+            block_execution_artifacts.partial_block_hash_components().await;
+        let block_header_commitments = partial_block_hash_components.header_commitments.clone();
         self.commit_proposal_and_block(
             height,
             state_diff.clone(),
             block_execution_artifacts.address_to_nonce(),
             block_execution_artifacts.execution_data.consumed_l1_handler_tx_hashes,
             block_execution_artifacts.execution_data.rejected_tx_hashes,
+            Some(partial_block_hash_components),
         )
         .await?;
-        let execution_infos: Vec<_> = block_execution_artifacts
+        let execution_infos = block_execution_artifacts
             .execution_data
-            .execution_infos
+            .execution_infos_and_signatures
             .into_iter()
-            .map(|(_, info)| info)
+            .map(|(tx_hash, (info, _))| (tx_hash, info))
             .collect();
 
-        LAST_BATCHED_BLOCK.set_lossy(height.0);
+        LAST_BATCHED_BLOCK_HEIGHT.set_lossy(height.0);
         BATCHED_TRANSACTIONS.increment(n_txs);
         REJECTED_TRANSACTIONS.increment(n_rejected_txs);
+        REVERTED_TRANSACTIONS.increment(n_reverted_count);
+        NUM_TRANSACTION_IN_BLOCK.record_lossy(n_txs);
+        SIERRA_GAS_IN_LAST_BLOCK.set_lossy(block_execution_artifacts.bouncer_weights.sierra_gas.0);
+        PROVING_GAS_IN_LAST_BLOCK
+            .set_lossy(block_execution_artifacts.bouncer_weights.proving_gas.0);
 
         Ok(DecisionReachedResponse {
             state_diff,
@@ -602,10 +674,15 @@ impl Batcher {
                     .casm_hash_computation_data_sierra_gas,
                 casm_hash_computation_data_proving_gas: block_execution_artifacts
                     .casm_hash_computation_data_proving_gas,
+                compiled_class_hashes_for_migration: block_execution_artifacts
+                    .compiled_class_hashes_for_migration,
             },
+            block_header_commitments,
         })
     }
 
+    // The `partial_block_hash_components` is optional as it's not needed for blocks coming from
+    // sync as they contain the full block hash.
     async fn commit_proposal_and_block(
         &mut self,
         height: BlockNumber,
@@ -613,6 +690,7 @@ impl Batcher {
         address_to_nonce: HashMap<ContractAddress, Nonce>,
         consumed_l1_handler_tx_hashes: IndexSet<TransactionHash>,
         rejected_tx_hashes: IndexSet<TransactionHash>,
+        partial_block_hash_components: Option<PartialBlockHashComponents>,
     ) -> BatcherResult<()> {
         info!(
             "Committing block at height {} and notifying mempool & L1 event provider of the block.",
@@ -621,10 +699,13 @@ impl Batcher {
         trace!("Rejected transactions: {:#?}, State diff: {:#?}.", rejected_tx_hashes, state_diff);
 
         // Commit the proposal to the storage.
-        self.storage_writer.commit_proposal(height, state_diff).map_err(|err| {
-            error!("Failed to commit proposal to storage: {}", err);
-            BatcherError::InternalError
-        })?;
+        self.storage_writer
+            .commit_proposal(height, state_diff, partial_block_hash_components)
+            .map_err(|err| {
+                error!("Failed to commit proposal to storage: {}", err);
+                BatcherError::InternalError
+            })?;
+        info!("Successfully committed proposal for block {} to storage.", height);
 
         // Notify the L1 provider of the new block.
         let rejected_l1_handler_tx_hashes = rejected_tx_hashes
@@ -658,9 +739,7 @@ impl Batcher {
                     );
                 }
             }
-            // Rollback the state diff in the storage.
-            self.storage_writer.revert_block(height);
-            return Err(BatcherError::InternalError);
+            BATCHER_L1_PROVIDER_ERRORS.increment(1);
         }
 
         // Notify the mempool of the new block.
@@ -670,8 +749,8 @@ impl Batcher {
             .await;
 
         if let Err(mempool_err) = mempool_result {
+            // Recoverable error, mempool won't be updated with the new block.
             error!("Failed to commit block to mempool: {}", mempool_err);
-            // TODO(AlonH): Should we rollback the state diff and return an error?
         };
 
         STORAGE_HEIGHT.increment(1);
@@ -711,7 +790,7 @@ impl Batcher {
         mut block_builder: Box<dyn BlockBuilderTrait>,
         abort_signal_sender: tokio::sync::oneshot::Sender<()>,
         final_n_executed_txs_sender: Option<tokio::sync::oneshot::Sender<usize>>,
-        pre_confirmed_block_writer: Option<Box<dyn PreConfirmedBlockWriterTrait>>,
+        pre_confirmed_block_writer: Option<Box<dyn PreconfirmedBlockWriterTrait>>,
         mut proposal_metrics_handle: ProposalMetricsHandle,
     ) -> BatcherResult<()> {
         self.set_active_proposal(proposal_id).await?;
@@ -741,6 +820,9 @@ impl Batcher {
                 let mut active_proposal = active_proposal.lock().await;
                 if *active_proposal == Some(proposal_id) {
                     active_proposal.take();
+
+                    log_txs_execution_result(proposal_id, &result);
+
                     let proposal_already_exists =
                         executed_proposals.lock().await.insert(proposal_id, result);
                     assert!(
@@ -857,19 +939,64 @@ impl Batcher {
     }
 }
 
+/// Logs the result of the transactions execution in the proposal.
+fn log_txs_execution_result(
+    proposal_id: ProposalId,
+    result: &Result<BlockExecutionArtifacts, Arc<BlockBuilderError>>,
+) {
+    if let Ok(block_artifacts) = result {
+        let execution_infos = block_artifacts
+            .execution_data
+            .execution_infos_and_signatures
+            .iter()
+            .map(|(tx_hash, (info, _sig))| (tx_hash, info));
+        let rejected_hashes = &block_artifacts.execution_data.rejected_tx_hashes;
+
+        // Estimate capacity: base message + (hash + status) per transaction
+        // TransactionHash is 66 chars (0x + 64 hex), status is ~12 chars, separator is 4 chars
+        // Total per transaction: ~82 chars
+        const CHARS_PER_TX: usize = 82;
+        const BASE_CAPACITY: usize = 80; // Base message length
+        let total_txs = execution_infos.len() + rejected_hashes.len();
+        let estimated_capacity = BASE_CAPACITY + total_txs * CHARS_PER_TX;
+
+        let mut log_msg = String::with_capacity(estimated_capacity);
+        let _ = write!(
+            &mut log_msg,
+            "Finished generating proposal {} with {} transactions",
+            proposal_id,
+            execution_infos.len(),
+        );
+
+        for (tx_hash, info) in execution_infos {
+            let status = if info.revert_error.is_some() { "Reverted" } else { "Successful" };
+            let _ = write!(&mut log_msg, ", {tx_hash}: {status}");
+        }
+
+        for tx_hash in rejected_hashes {
+            let _ = write!(&mut log_msg, ", {tx_hash}: Rejected");
+        }
+
+        info!("{}", log_msg);
+    }
+}
+
 pub fn create_batcher(
     config: BatcherConfig,
     mempool_client: SharedMempoolClient,
     l1_provider_client: SharedL1ProviderClient,
     class_manager_client: SharedClassManagerClient,
-    pre_confirmed_cende_client: Arc<dyn PreConfirmedCendeClientTrait>,
+    pre_confirmed_cende_client: Arc<dyn PreconfirmedCendeClientTrait>,
 ) -> Batcher {
-    let (storage_reader, storage_writer) = apollo_storage::open_storage(config.storage.clone())
-        .expect("Failed to open batcher's storage");
+    let (storage_reader, storage_writer) = apollo_storage::open_storage_with_metric(
+        config.storage.clone(),
+        &BATCHER_STORAGE_OPEN_READ_TRANSACTIONS,
+    )
+    .expect("Failed to open batcher's storage");
 
     let execute_config = &config.block_builder_config.execute_config;
     let worker_pool = Arc::new(WorkerPool::start(execute_config));
-    let pre_confirmed_block_writer_factory = Box::new(PreConfirmedBlockWriterFactory {
+    let pre_confirmed_block_writer_factory = Box::new(PreconfirmedBlockWriterFactory {
         config: config.pre_confirmed_block_writer_config,
         cende_client: pre_confirmed_cende_client,
     });
@@ -917,6 +1044,7 @@ pub trait BatcherStorageWriterTrait: Send + Sync {
         &mut self,
         height: BlockNumber,
         state_diff: ThinStateDiff,
+        partial_block_hash_components: Option<PartialBlockHashComponents>,
     ) -> apollo_storage::StorageResult<()>;
 
     fn revert_block(&mut self, height: BlockNumber);
@@ -927,9 +1055,14 @@ impl BatcherStorageWriterTrait for apollo_storage::StorageWriter {
         &mut self,
         height: BlockNumber,
         state_diff: ThinStateDiff,
+        partial_block_hash_components: Option<PartialBlockHashComponents>,
     ) -> apollo_storage::StorageResult<()> {
         // TODO(AlonH): write casms.
-        self.begin_rw_txn()?.append_state_diff(height, state_diff)?.commit()
+        let mut txn = self.begin_rw_txn()?.append_state_diff(height, state_diff)?;
+        if let Some(ref components) = partial_block_hash_components {
+            txn = txn.set_partial_block_hash_components(&height, components)?;
+        }
+        txn.commit()
     }
 
     // This function will panic if there is a storage failure to revert the block.

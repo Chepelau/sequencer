@@ -21,6 +21,7 @@
 //! #     min_size: 1 << 20,    // 1MB
 //! #     max_size: 1 << 35,    // 32GB
 //! #     growth_step: 1 << 26, // 64MB
+//! #     max_readers: 1 << 13, // 8K readers
 //! # };
 //! # let storage_config = StorageConfig{db_config, ..Default::default()};
 //! let (reader, mut writer) = open_storage(storage_config)?;
@@ -152,7 +153,7 @@ fn update_marker<'env>(
         };
         if let Some((last_class_hash, _)) = file_handlers
             .get_thin_state_diff_unchecked(state_diff_location)?
-            .declared_classes
+            .class_hash_to_compiled_class_hash
             .last()
         {
             // Not the last class in the state diff, keep the current marker.

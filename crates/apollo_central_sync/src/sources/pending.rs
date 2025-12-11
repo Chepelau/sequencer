@@ -4,6 +4,7 @@ mod pending_test;
 
 use std::sync::Arc;
 
+use apollo_central_sync_config::config::CentralSourceConfig;
 use apollo_starknet_client::reader::{
     PendingData,
     ReaderClientError,
@@ -14,9 +15,7 @@ use apollo_starknet_client::ClientCreationError;
 use async_trait::async_trait;
 #[cfg(test)]
 use mockall::automock;
-
 // TODO(dvir): add pending config.
-use super::central::CentralSourceConfig;
 
 pub struct GenericPendingSource<TStarknetClient: StarknetReader + Send + Sync> {
     pub apollo_starknet_client: Arc<TStarknetClient>,
@@ -58,7 +57,7 @@ impl PendingSource {
         node_version: &'static str,
     ) -> Result<PendingSource, ClientCreationError> {
         let apollo_starknet_client = StarknetFeederGatewayClient::new(
-            &config.starknet_url,
+            config.starknet_url.as_ref(),
             config.http_headers,
             node_version,
             config.retry_config,

@@ -9,11 +9,11 @@ use libp2p::swarm::{ConnectionId, NetworkBehaviour, SwarmEvent};
 use libp2p::{PeerId, StreamProtocol, Swarm};
 
 use super::behaviour::{Behaviour, Event, ExternalEvent, ToOtherBehaviourEvent};
-use super::{Bytes, Config, InboundSessionId, OutboundSessionId, SessionId};
+use super::{Config, InboundSessionId, OutboundSessionId, SessionId};
 use crate::mixed_behaviour::BridgedBehaviour;
 use crate::test_utils::create_fully_connected_swarms_stream;
 use crate::utils::StreamMap;
-use crate::{mixed_behaviour, peer_manager};
+use crate::{mixed_behaviour, peer_manager, Bytes};
 
 const NUM_PEERS: usize = 3;
 const NUM_MESSAGES_PER_SESSION: usize = 5;
@@ -132,7 +132,7 @@ fn check_request_peer_assignment_event_and_return_session_id(
         outbound_session_id,
     }) = event
     else {
-        panic!("Got unexpected event {:?} when expecting RequestPeerAssignment", event);
+        panic!("Got unexpected event {event:?} when expecting RequestPeerAssignment");
     };
     let assigned_peer_id =
         *outbound_session_id_to_peer_id.get(&(outbound_peer_id, outbound_session_id)).unwrap();
@@ -153,7 +153,7 @@ fn check_new_inbound_session_event_and_return_id(
         protocol_name,
     }) = event
     else {
-        panic!("Got unexpected event {:?} when expecting NewInboundSession", event);
+        panic!("Got unexpected event {event:?} when expecting NewInboundSession");
     };
     assert_eq!(query, get_bytes_from_query_indices(outbound_peer_id, inbound_peer_id));
     assert_eq!(protocol_name, PROTOCOL_NAME);
@@ -175,7 +175,7 @@ fn check_received_response_event(
         peer_id: inbound_peer_id,
     }) = event
     else {
-        panic!("Got unexpected event {:?} when expecting ReceivedResponse", event);
+        panic!("Got unexpected event {event:?} when expecting ReceivedResponse");
     };
     assert_eq!(
         outbound_session_id_to_peer_id[&(outbound_peer_id, _outbound_session_id)],

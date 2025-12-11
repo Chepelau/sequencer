@@ -15,6 +15,7 @@ use apollo_test_utils::get_rng;
 use futures::FutureExt;
 use indexmap::indexmap;
 use starknet_api::block::BlockNumber;
+use starknet_api::compiled_class_hash;
 use starknet_api::core::{ascii_as_felt, ClassHash, CompiledClassHash, ContractAddress, Nonce};
 use starknet_api::state::{StorageKey, ThinStateDiff};
 use starknet_types_core::felt::Felt;
@@ -45,12 +46,12 @@ async fn state_diff_basic_flow() {
     let value1 = ascii_as_felt("value1").unwrap();
     let nonce0 = Nonce(ascii_as_felt("nonce0").unwrap());
 
-    let state_diffs_and_chunks = vec![
+    let state_diffs_and_chunks = [
         (
             ThinStateDiff {
                 deployed_contracts: indexmap!(address0 => class_hash0),
                 storage_diffs: indexmap!(address0 => indexmap!(key0 => value0, key1 => value1)),
-                declared_classes: indexmap!(class_hash0 => casm_hash0),
+                class_hash_to_compiled_class_hash: indexmap!(class_hash0 => casm_hash0),
                 deprecated_declared_classes: vec![class_hash1],
                 nonces: indexmap!(address0 => nonce0),
             },
@@ -282,11 +283,11 @@ async fn state_diff_conflicting() {
         vec![
             Some(StateDiffChunk::DeclaredClass(DeclaredClass {
                 class_hash: ClassHash::default(),
-                compiled_class_hash: CompiledClassHash::default(),
+                compiled_class_hash: compiled_class_hash!(1_u8),
             })),
             Some(StateDiffChunk::DeclaredClass(DeclaredClass {
                 class_hash: ClassHash::default(),
-                compiled_class_hash: CompiledClassHash::default(),
+                compiled_class_hash: compiled_class_hash!(2_u8),
             })),
         ],
     )

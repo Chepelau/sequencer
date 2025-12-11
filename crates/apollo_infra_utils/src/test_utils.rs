@@ -4,11 +4,13 @@ use assert_json_diff::{assert_json_matches_no_panic, CompareMode, Config};
 use num_enum::IntoPrimitive;
 use serde::Serialize;
 use socket2::{Domain, Socket, Type};
+use strum::EnumCount;
 use tracing::{info, instrument};
 
 const PORTS_PER_INSTANCE: u16 = 60;
 pub const MAX_NUMBER_OF_INSTANCES_PER_TEST: u16 = 28;
-const MAX_NUMBER_OF_TESTS: u16 = 10;
+#[allow(clippy::as_conversions)]
+const MAX_NUMBER_OF_TESTS: u16 = TestIdentifier::COUNT as u16;
 const BASE_PORT: u16 = 11000;
 
 // Ensure available ports don't exceed u16::MAX.
@@ -21,12 +23,15 @@ const _: () = {
 };
 
 #[repr(u16)]
-#[derive(Debug, Copy, Clone, IntoPrimitive)]
+#[derive(Debug, Copy, Clone, IntoPrimitive, EnumCount)]
 // TODO(Nadin): Come up with a better name for this enum.
 pub enum TestIdentifier {
     EndToEndFlowTest,
     EndToEndFlowTestBootstrapDeclare,
     EndToEndFlowTestManyTxs,
+    EndToEndFlowTestCustomSyscallInvokeTxs,
+    EndToEndFlowTestCustomCairo0Txs,
+    RevertedL1HandlerTx,
     InfraUnitTests,
     PositiveFlowIntegrationTest,
     RestartFlowIntegrationTest,
@@ -47,15 +52,11 @@ impl AvailablePorts {
     pub fn new(test_unique_index: u16, instance_index: u16) -> Self {
         assert!(
             test_unique_index < MAX_NUMBER_OF_TESTS,
-            "Test unique index {:?} exceeded bound {:?}",
-            test_unique_index,
-            MAX_NUMBER_OF_TESTS
+            "Test unique index {test_unique_index:?} exceeded bound {MAX_NUMBER_OF_TESTS:?}"
         );
         assert!(
             instance_index < MAX_NUMBER_OF_INSTANCES_PER_TEST,
-            "Instance index {:?} exceeded bound {:?}",
-            instance_index,
-            MAX_NUMBER_OF_INSTANCES_PER_TEST
+            "Instance index {instance_index:?} exceeded bound {MAX_NUMBER_OF_INSTANCES_PER_TEST:?}",
         );
 
         let test_offset: u16 =
@@ -140,7 +141,7 @@ where
     Rhs: Serialize,
 {
     if let Err(error) = assert_json_matches_no_panic(lhs, rhs, Config::new(CompareMode::Strict)) {
-        let printed_error = format!("\n\n{}\n{}\n\n", message, error);
+        let printed_error = format!("\n\n{message}\n{error}\n\n");
         panic!("{}", printed_error);
     }
 }

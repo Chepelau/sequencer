@@ -1,17 +1,28 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use apollo_batcher_types::communication::MockBatcherClient;
+use apollo_infra::trace_util::configure_tracing;
 use apollo_l1_provider_types::errors::L1ProviderError;
 use apollo_l1_provider_types::SessionState::{
     self,
     Propose as ProposeSession,
     Validate as ValidateSession,
 };
-use apollo_l1_provider_types::{Event, InvalidValidationStatus, ValidationStatus};
+use apollo_l1_provider_types::{
+    Event,
+    InvalidValidationStatus,
+    L1ProviderClient,
+    ProviderState,
+    ValidationStatus,
+};
 use apollo_state_sync_types::communication::MockStateSyncClient;
+use apollo_state_sync_types::errors::StateSyncError;
+use apollo_state_sync_types::state_sync_types::SyncBlock;
 use apollo_time::test_utils::FakeClock;
 use assert_matches::assert_matches;
+use indexmap::IndexSet;
 use itertools::Itertools;
 use pretty_assertions::assert_eq;
 use rstest::rstest;
@@ -22,8 +33,14 @@ use starknet_api::tx_hash;
 
 use crate::bootstrapper::{Bootstrapper, CommitBlockBacklog, SyncTaskHandle};
 use crate::l1_provider::L1Provider;
-use crate::test_utils::{l1_handler, FakeL1ProviderClient, L1ProviderContentBuilder};
-use crate::{L1ProviderConfig, ProviderState};
+use crate::test_utils::{
+    l1_handler,
+    make_bootstrapper,
+    ConsumedTransaction,
+    FakeL1ProviderClient,
+    L1ProviderContentBuilder,
+};
+use crate::L1ProviderConfig;
 
 fn commit_block_no_rejected(
     l1_provider: &mut L1Provider,
@@ -31,6 +48,14 @@ fn commit_block_no_rejected(
     block_number: BlockNumber,
 ) {
     l1_provider.commit_block(txs.iter().copied().collect(), [].into(), block_number).unwrap();
+}
+
+fn commit_block_expect_error_just_to_start_bootstrapping(
+    l1_provider: &mut L1Provider,
+    block_number: BlockNumber,
+) {
+    let result = l1_provider.commit_block([].into(), [].into(), block_number);
+    assert!(result.is_err());
 }
 
 fn setup_rejected_transactions() -> L1Provider {
@@ -58,39 +83,21 @@ fn setup_rejected_transactions() -> L1Provider {
     l1_provider
 }
 
-macro_rules! bootstrapper {
-    (backlog: [$($height:literal => [$($tx:literal),* $(,)*]),* $(,)*], catch_up: $catch:expr) => {{
-        Bootstrapper {
-            commit_block_backlog: vec![
-                $(CommitBlockBacklog {
-                    height: BlockNumber($height),
-                    committed_txs: [$(tx_hash!($tx)),*].into()
-                }),*
-            ].into_iter().collect(),
-            catch_up_height: Arc::new(BlockNumber($catch).into()),
-            l1_provider_client: Arc::new(FakeL1ProviderClient::default()),
-            batcher_client: Arc::new(MockBatcherClient::default()),
-            sync_client: Arc::new(MockStateSyncClient::default()),
-            sync_task_handle: SyncTaskHandle::default(),
-            n_sync_health_check_failures: Default::default(),
-            sync_retry_interval: Duration::from_millis(10)
-        }
-    }};
-}
-
 /// Use to easily construct l1 handler messages for tests that don't care about the timestamp.
 fn l1_handler_event(tx_hash: TransactionHash) -> Event {
     let default_timestamp = 0.into();
     Event::L1HandlerTransaction {
         l1_handler_tx: executable_l1_handler_tx(L1HandlerTxArgs { tx_hash, ..Default::default() }),
-        timestamp: default_timestamp,
+        block_timestamp: default_timestamp,
+        scrape_timestamp: default_timestamp.0,
     }
 }
 
 fn timed_l1_handler_event(tx_hash: TransactionHash, timestamp: BlockTimestamp) -> Event {
     Event::L1HandlerTransaction {
         l1_handler_tx: executable_l1_handler_tx(L1HandlerTxArgs { tx_hash, ..Default::default() }),
-        timestamp,
+        block_timestamp: timestamp,
+        scrape_timestamp: timestamp.0,
     }
 }
 
@@ -123,6 +130,7 @@ fn validate_happy_flow() {
     let mut l1_provider = L1ProviderContentBuilder::new()
         .with_txs([l1_handler(1)])
         .with_committed([l1_handler(2)])
+        .with_consumed_txs([ConsumedTransaction { tx: l1_handler(3), timestamp: 0.into() }])
         .with_state(ProviderState::Validate)
         .build_into_l1_provider();
 
@@ -135,9 +143,10 @@ fn validate_happy_flow() {
         l1_provider.validate(tx_hash!(2), BlockNumber(0)).unwrap(),
         ValidationStatus::Invalid(InvalidValidationStatus::AlreadyIncludedOnL2)
     );
+    // Transaction was consumed on L1.
     assert_eq!(
         l1_provider.validate(tx_hash!(3), BlockNumber(0)).unwrap(),
-        ValidationStatus::Invalid(InvalidValidationStatus::ConsumedOnL1OrUnknown)
+        ValidationStatus::Invalid(InvalidValidationStatus::ConsumedOnL1)
     );
     // Transaction wasn't deleted after the validation.
     assert_eq!(
@@ -153,7 +162,7 @@ fn process_events_happy_flow() {
         let mut l1_provider = L1ProviderContentBuilder::new()
             .with_txs([l1_handler(1)])
             .with_committed_hashes([])
-            .with_state(state.clone())
+            .with_state(state)
             .build_into_l1_provider();
 
         // Test.
@@ -201,7 +210,7 @@ fn process_events_committed_txs() {
 }
 
 #[test]
-fn pending_state_errors() {
+fn pending_state_panics() {
     // Setup.
     let mut l1_provider = L1ProviderContentBuilder::new()
         .with_state(ProviderState::Pending)
@@ -209,14 +218,11 @@ fn pending_state_errors() {
         .build_into_l1_provider();
 
     // Test.
-    assert_matches!(
-        l1_provider.get_txs(1, BlockNumber(0)).unwrap_err(),
-        L1ProviderError::OutOfSessionGetTransactions
-    );
+    assert!(catch_unwind(AssertUnwindSafe(|| { l1_provider.get_txs(1, BlockNumber(0)) })).is_err());
 
-    assert_matches!(
-        l1_provider.validate(tx_hash!(1), BlockNumber(0)).unwrap_err(),
-        L1ProviderError::OutOfSessionValidate
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| { l1_provider.validate(tx_hash!(1), BlockNumber(0)) }))
+            .is_err()
     );
 }
 
@@ -316,35 +322,39 @@ fn commit_block_during_validation() {
     expected_l1_provider.assert_eq(&l1_provider);
 }
 
-#[test]
-fn commit_block_backlog() {
+#[tokio::test]
+async fn commit_block_backlog() {
     // Setup.
-    let initial_bootstrap_state = ProviderState::Bootstrap(bootstrapper!(
-        backlog: [10 => [2], 11 => [4]],
-        catch_up: 9
-    ));
+    const STARTUP_HEIGHT: BlockNumber = BlockNumber(8);
+    const TARGET_HEIGHT: BlockNumber = BlockNumber(9);
+    const BACKLOG_HEIGHT: BlockNumber = BlockNumber(11);
+    let bootstrapper = make_bootstrapper!(backlog: [10 => [2], 11 => [4]]);
     let mut l1_provider = L1ProviderContentBuilder::new()
+        .with_bootstrapper(bootstrapper.clone())
         .with_txs([l1_handler(1), l1_handler(2), l1_handler(4)])
-        .with_height(BlockNumber(8))
-        .with_state(initial_bootstrap_state.clone())
         .build_into_l1_provider();
 
+    l1_provider.initialize(STARTUP_HEIGHT, vec![]).await.expect("l1 provider initialize failed");
+    commit_block_expect_error_just_to_start_bootstrapping(&mut l1_provider, TARGET_HEIGHT);
+
     // Test.
-    // Commit height too low to affect backlog.
-    commit_block_no_rejected(&mut l1_provider, &[tx_hash!(1)], BlockNumber(8));
+    // Commit height is below target height. Doesn't trigger backlog.
+    commit_block_no_rejected(&mut l1_provider, &[tx_hash!(1)], STARTUP_HEIGHT);
     let expected_l1_provider = L1ProviderContentBuilder::new()
+        .with_bootstrapper(bootstrapper.clone())
         .with_txs([l1_handler(2), l1_handler(4)])
-        .with_height(BlockNumber(9))
-        .with_state(initial_bootstrap_state)
+        .with_height(STARTUP_HEIGHT.unchecked_next())
+        .with_state(ProviderState::Bootstrap)
         .build();
     expected_l1_provider.assert_eq(&l1_provider);
 
-    // Backlog is consumed, bootstrapping complete.
-    commit_block_no_rejected(&mut l1_provider, &[], BlockNumber(9));
+    // This height triggers finishing the bootstrapping and applying the backlog.
+    commit_block_no_rejected(&mut l1_provider, &[], TARGET_HEIGHT);
 
     let expected_l1_provider = L1ProviderContentBuilder::new()
+        .with_bootstrapper(bootstrapper)
         .with_txs([])
-        .with_height(BlockNumber(12))
+        .with_height(BACKLOG_HEIGHT.unchecked_next())
         .with_state(ProviderState::Pending)
         .build();
     expected_l1_provider.assert_eq(&l1_provider);
@@ -375,17 +385,20 @@ fn commit_block_before_add_tx_stores_tx_in_committed() {
     expected_l1_provider.assert_eq(&l1_provider);
 }
 
-#[test]
-fn bootstrap_commit_block_received_twice_no_error() {
+#[tokio::test]
+async fn bootstrap_commit_block_received_twice_no_error() {
     // Setup.
-    let initial_bootstrap_state = ProviderState::Bootstrap(bootstrapper!(
-        backlog: [],
-        catch_up: 2
-    ));
+    let bootstrapper = make_bootstrapper!(backlog: []);
     let mut l1_provider = L1ProviderContentBuilder::new()
+        .with_bootstrapper(bootstrapper)
         .with_txs([l1_handler(1), l1_handler(2)])
-        .with_state(initial_bootstrap_state)
         .build_into_l1_provider();
+
+    l1_provider.initialize(BlockNumber(0), vec![]).await.expect("l1 provider initialize failed");
+    commit_block_expect_error_just_to_start_bootstrapping(&mut l1_provider, BlockNumber(2));
+
+    commit_block_no_rejected(&mut l1_provider, &[], BlockNumber(2));
+    // l1_provider.start_bootstrapping(BlockNumber(2));
 
     // Test.
     commit_block_no_rejected(&mut l1_provider, &[tx_hash!(1)], BlockNumber(0));
@@ -393,17 +406,17 @@ fn bootstrap_commit_block_received_twice_no_error() {
     commit_block_no_rejected(&mut l1_provider, &[tx_hash!(1)], BlockNumber(0));
 }
 
-#[test]
-fn bootstrap_commit_block_received_twice_error_if_new_uncommitted_txs() {
+#[tokio::test]
+async fn bootstrap_commit_block_received_twice_error_if_new_uncommitted_txs() {
     // Setup.
-    let initial_bootstrap_state = ProviderState::Bootstrap(bootstrapper!(
-        backlog: [],
-        catch_up: 2
-    ));
+    let bootstrapper = make_bootstrapper!(backlog: []);
     let mut l1_provider = L1ProviderContentBuilder::new()
+        .with_bootstrapper(bootstrapper)
         .with_txs([l1_handler(1), l1_handler(2)])
-        .with_state(initial_bootstrap_state)
         .build_into_l1_provider();
+
+    l1_provider.initialize(BlockNumber(0), vec![]).await.expect("l1 provider initialize failed");
+    commit_block_expect_error_just_to_start_bootstrapping(&mut l1_provider, BlockNumber(2));
 
     // Test.
     commit_block_no_rejected(&mut l1_provider, &[tx_hash!(1)], BlockNumber(0));
@@ -424,7 +437,7 @@ async fn restart_service_if_initialized_in_steady_state() {
         L1ProviderContentBuilder::new().with_state(ProviderState::Pending).build_into_l1_provider();
 
     // Test.
-    l1_provider.initialize(vec![]).await.unwrap();
+    l1_provider.initialize(BlockNumber(0), vec![]).await.unwrap();
 }
 
 #[test]
@@ -528,9 +541,16 @@ fn add_tx_identical_timestamp_both_stored() {
     let timestamp_1 = 6;
     let timestamp_2 = timestamp_1;
     let timestamp_3 = 7;
+    // Should contain txs even if they have identical timestamp.
+    let expected = L1ProviderContentBuilder::new()
+        .with_timed_txs([
+            (tx_1.clone(), timestamp_1),
+            (tx_2.clone(), timestamp_2),
+            (tx_3.clone(), timestamp_3),
+        ])
+        .build();
 
     // Test.
-
     let mut l1_provider = L1ProviderContentBuilder::new().build_into_l1_provider();
     l1_provider
         .add_events(vec![
@@ -540,10 +560,6 @@ fn add_tx_identical_timestamp_both_stored() {
         ])
         .unwrap();
 
-    // Should contain txs even if they have identical timestamp.
-    let expected = L1ProviderContentBuilder::new()
-        .with_timed_txs([(tx_1, timestamp_1), (tx_2, timestamp_2), (tx_3, timestamp_3)])
-        .build();
     expected.assert_eq(&l1_provider);
 }
 
@@ -611,7 +627,7 @@ fn get_txs_identical_timestamps() {
     // Can get only one tx out of the two with the same timestamp.
     assert_eq!(
         l1_provider_builder.clone().build_into_l1_provider().get_txs(1, BlockNumber(0)).unwrap(),
-        [tx_1.clone()]
+        std::slice::from_ref(&tx_1)
     );
 
     assert_eq!(
@@ -629,6 +645,7 @@ fn get_txs_timestamp_cutoff_some_eligible() {
 
     let mut l1_provider = L1ProviderContentBuilder::new()
         .with_txs([tx_1.clone()])
+        .with_nonzero_timelock_setup()
         .with_timelocked_txs([tx_2, tx_3])
         .with_state(ProviderState::Propose)
         .build_into_l1_provider();
@@ -644,6 +661,7 @@ fn get_txs_timestamp_cutoff_none_eligible() {
     let tx_1 = l1_handler(1);
     let tx_2 = l1_handler(2);
     let mut l1_provider = L1ProviderContentBuilder::new()
+        .with_nonzero_timelock_setup()
         .with_timelocked_txs([tx_1.clone(), tx_2.clone()])
         .with_state(ProviderState::Propose)
         .build_into_l1_provider();
@@ -673,7 +691,6 @@ fn get_txs_timestamp_cutoff_edge_case_at_cutoff() {
         ..Default::default()
     };
     let mut l1_provider = L1ProviderContentBuilder::new()
-        .with_config(config)
         .with_clock(clock)
         .with_timed_txs([
             (tx_1.clone(), timestamp_1),
@@ -681,6 +698,7 @@ fn get_txs_timestamp_cutoff_edge_case_at_cutoff() {
             (tx_3.clone(), timestamp_3),
         ])
         .with_state(ProviderState::Propose)
+        .with_config(config)
         .build_into_l1_provider();
 
     let result = l1_provider.get_txs(10, BlockNumber(0)).unwrap();
@@ -694,6 +712,7 @@ fn get_txs_excludes_cancellation_requested_and_returns_non_cancellation_requeste
     let tx_2 = l1_handler(2);
     let mut l1_provider = L1ProviderContentBuilder::new()
         .with_txs([tx_2.clone()])
+        .with_nonzero_timelock_setup()
         .with_cancel_requested_txs([tx_1.clone()])
         .with_state(ProviderState::Propose)
         .build_into_l1_provider();
@@ -707,6 +726,7 @@ fn get_txs_excludes_transaction_after_cancellation_expiry() {
     // Setup.
     let tx_1 = l1_handler(1);
     let mut l1_provider = L1ProviderContentBuilder::new()
+        .with_nonzero_timelock_setup()
         .with_cancelled_txs([tx_1.clone()])
         .with_state(ProviderState::Propose)
         .build_into_l1_provider();
@@ -720,6 +740,7 @@ fn validate_tx_cancellation_requested_not_expired_returns_validated() {
     // Setup.
     let tx_1 = l1_handler(1);
     let mut l1_provider = L1ProviderContentBuilder::new()
+        .with_nonzero_timelock_setup()
         .with_cancel_requested_txs([tx_1.clone()])
         .with_state(ProviderState::Validate)
         .build_into_l1_provider();
@@ -734,6 +755,7 @@ fn validate_tx_cancellation_requested_expired_returns_cancelled() {
     // Setup.
     let tx_1 = l1_handler(2);
     let mut l1_provider = L1ProviderContentBuilder::new()
+        .with_nonzero_timelock_setup()
         .with_cancelled_txs([tx_1.clone()])
         .with_state(ProviderState::Validate)
         .build_into_l1_provider();
@@ -754,6 +776,7 @@ fn validate_tx_cancellation_requested_validated_then_expired_returns_cancelled()
     let clock = Arc::new(FakeClock::new(5));
     let mut l1_provider = L1ProviderContentBuilder::new()
         .with_clock(clock.clone())
+        .with_nonzero_timelock_setup()
         .with_cancel_requested_txs([tx_1.clone()])
         .with_state(ProviderState::Validate)
         .build_into_l1_provider();
@@ -778,12 +801,15 @@ fn commit_block_commits_cancellation_requested_tx_not_expired() {
     // Setup.
     let tx = l1_handler(1);
     let mut l1_provider = L1ProviderContentBuilder::new()
+        .with_nonzero_timelock_setup()
         .with_cancel_requested_txs([tx.clone()])
         .build_into_l1_provider();
+    let expected =
+        L1ProviderContentBuilder::new().with_txs([]).with_committed([tx.clone()]).build();
 
     // Test.
     l1_provider.commit_block([tx.tx_hash].into(), [].into(), l1_provider.current_height).unwrap();
-    let expected = L1ProviderContentBuilder::new().with_txs([]).with_committed([tx]).build();
+
     expected.assert_eq(&l1_provider);
 }
 
@@ -794,6 +820,7 @@ fn commit_block_commits_cancellation_requested_expired_and_fully_cancelled() {
     let tx_2 = l1_handler(2);
     let mut l1_provider = L1ProviderContentBuilder::new()
         // Both txs are passed cancellation request already, but still not in `Cancelled` state.
+        .with_nonzero_timelock_setup()
         .with_cancelled_txs([tx_1.clone(), tx_2.clone()])
         .with_state(ProviderState::Validate)
         .build_into_l1_provider();
@@ -801,15 +828,17 @@ fn commit_block_commits_cancellation_requested_expired_and_fully_cancelled() {
     // Validate tx_2, which triggers the record to transition to state `CancelledOnL2`.
     l1_provider.validate(tx_2.tx_hash, l1_provider.current_height).unwrap();
 
-    // Test.
+    let expected = L1ProviderContentBuilder::new()
+        .with_txs([])
+        .with_committed([tx_1.clone(), tx_2.clone()])
+        .build();
 
+    // Test.
     // Commit overrides both Cancelled state and CancellationStarted state.
     l1_provider
         .commit_block([tx_1.tx_hash, tx_2.tx_hash].into(), [].into(), l1_provider.current_height)
         .unwrap();
 
-    let expected =
-        L1ProviderContentBuilder::new().with_txs([]).with_committed([tx_1, tx_2]).build();
     expected.assert_eq(&l1_provider);
 }
 
@@ -819,17 +848,20 @@ fn commit_block_commits_mixed_normal_and_cancellation_requested() {
     let tx_normal = l1_handler(1);
     let tx_cancel = l1_handler(2);
     let mut l1_provider = L1ProviderContentBuilder::new()
+        .with_nonzero_timelock_setup()
         .with_txs([tx_normal.clone()])
         .with_cancel_requested_txs([tx_cancel.clone()])
         .with_state(ProviderState::Propose)
         .build_into_l1_provider();
+    let expected = L1ProviderContentBuilder::new()
+        .with_txs([])
+        .with_committed([tx_normal.clone(), tx_cancel.clone()])
+        .build();
 
     // Test.
     let txs = [tx_normal.tx_hash, tx_cancel.tx_hash];
     l1_provider.commit_block(txs.into(), [].into(), l1_provider.current_height).unwrap();
 
-    let expected =
-        L1ProviderContentBuilder::new().with_txs([]).with_committed([tx_normal, tx_cancel]).build();
     expected.assert_eq(&l1_provider);
 }
 
@@ -840,6 +872,9 @@ fn add_events_tx_and_cancel_same_call_not_expired() {
     let tx_hash = tx.tx_hash;
     let arbitrary_cancellation_timestamp = 1;
     let mut l1_provider = L1ProviderContentBuilder::new().build_into_l1_provider();
+    let expected = L1ProviderContentBuilder::new()
+        .with_timed_cancel_requested_txs([(tx.clone(), arbitrary_cancellation_timestamp)])
+        .build();
 
     // Test.
     let events = [
@@ -847,9 +882,7 @@ fn add_events_tx_and_cancel_same_call_not_expired() {
         cancellation_event(tx_hash, arbitrary_cancellation_timestamp.into()),
     ];
     l1_provider.add_events(events.into()).unwrap();
-    let expected = L1ProviderContentBuilder::new()
-        .with_timed_cancel_requested_txs([(tx.clone(), arbitrary_cancellation_timestamp)])
-        .build();
+
     expected.assert_eq(&l1_provider);
 }
 
@@ -860,6 +893,10 @@ fn add_events_tx_then_cancel_separate_calls_not_expired() {
     let tx_hash = tx.tx_hash;
     let arbitrary_cancellation_timestamp = 1;
     let mut l1_provider = L1ProviderContentBuilder::new().build_into_l1_provider();
+    let expected = L1ProviderContentBuilder::new()
+        .with_txs([])
+        .with_timed_cancel_requested_txs([(tx.clone(), arbitrary_cancellation_timestamp)])
+        .build();
 
     // Test.
     l1_provider.add_events(vec![l1_handler_event(tx_hash)]).unwrap();
@@ -867,10 +904,7 @@ fn add_events_tx_then_cancel_separate_calls_not_expired() {
     l1_provider
         .add_events(vec![cancellation_event(tx_hash, arbitrary_cancellation_timestamp.into())])
         .unwrap();
-    let expected = L1ProviderContentBuilder::new()
-        .with_txs([])
-        .with_timed_cancel_requested_txs([(tx.clone(), arbitrary_cancellation_timestamp)])
-        .build();
+
     expected.assert_eq(&l1_provider);
 }
 
@@ -895,16 +929,16 @@ fn add_events_tx_and_cancel_same_call_expired() {
         .with_clock(clock)
         .with_state(ProviderState::Validate)
         .build_into_l1_provider();
+    let expected = L1ProviderContentBuilder::new()
+        .with_txs([])
+        .with_timed_cancel_requested_txs([(tx.clone(), cancellation_request_timestamp)])
+        .build();
 
     // Test.
     l1_provider.add_events(events.into()).unwrap();
     // Validate tx, which triggers the record to transition to state `CancelledOnL2`.
     l1_provider.validate(tx.tx_hash, l1_provider.current_height).unwrap();
 
-    let expected = L1ProviderContentBuilder::new()
-        .with_txs([])
-        .with_timed_cancel_requested_txs([(tx.clone(), cancellation_request_timestamp)])
-        .build();
     expected.assert_eq(&l1_provider);
 }
 
@@ -913,11 +947,12 @@ fn add_events_only_cancel_event_unknown_tx() {
     // Setup.
     let unknown_tx_hash = tx_hash!(2);
     let mut l1_provider = L1ProviderContentBuilder::new().build_into_l1_provider();
+    let expected_empty =
+        L1ProviderContentBuilder::new().with_txs([]).with_timed_cancel_requested_txs([]).build();
 
     // Test.
     l1_provider.add_events(vec![cancellation_event(unknown_tx_hash, 0.into())]).unwrap();
-    let expected_empty =
-        L1ProviderContentBuilder::new().with_txs([]).with_timed_cancel_requested_txs([]).build();
+
     expected_empty.assert_eq(&l1_provider);
 }
 
@@ -930,9 +965,12 @@ fn add_events_double_cancellation_only_first_counted() {
     let cancellation_request_timestamp_second = 4;
     let mut l1_provider =
         L1ProviderContentBuilder::new().with_txs([tx.clone()]).build_into_l1_provider();
+    // Only first cancellation counts.
+    let expected = L1ProviderContentBuilder::new()
+        .with_timed_cancel_requested_txs([(tx.clone(), cancellation_request_timestamp_first)])
+        .build();
 
     // Test.
-
     l1_provider.add_events(vec![l1_handler_event(tx_hash)]).unwrap();
     l1_provider
         .add_events(vec![cancellation_event(tx_hash, cancellation_request_timestamp_first.into())])
@@ -940,19 +978,712 @@ fn add_events_double_cancellation_only_first_counted() {
     l1_provider
         .add_events(vec![cancellation_event(tx_hash, cancellation_request_timestamp_second.into())])
         .unwrap();
-    // Only first cancellation counts.
-    let expected = L1ProviderContentBuilder::new()
-        .with_timed_cancel_requested_txs([(tx.clone(), cancellation_request_timestamp_first)])
-        .build();
+
     expected.assert_eq(&l1_provider);
 }
 
 #[test]
-fn validate_tx_unknown_returns_invalid_consumed_or_unknown() {
+fn validate_tx_unknown_returns_invalid_not_found() {
     let mut l1_provider = L1ProviderContentBuilder::new()
         .with_state(ProviderState::Validate)
         .build_into_l1_provider();
     // tx_1 was never added
     let status = l1_provider.validate(tx_hash!(1), l1_provider.current_height).unwrap();
-    assert_eq!(status, InvalidValidationStatus::ConsumedOnL1OrUnknown.into());
+    assert_eq!(status, InvalidValidationStatus::NotFound.into());
+}
+
+#[test]
+fn commit_block_historical_height_short_circuits_non_bootstrap() {
+    // Setup.
+    let l1_provider_builder = L1ProviderContentBuilder::new()
+        .with_height(BlockNumber(5))
+        .with_txs([l1_handler(1)])
+        .with_state(ProviderState::Propose);
+
+    let l1_provider_builder_clone = l1_provider_builder.clone();
+    let expected_unchanged = l1_provider_builder.build();
+
+    // Test.
+    let mut l1_provider = l1_provider_builder_clone.build_into_l1_provider();
+    let old_height = BlockNumber(4);
+    l1_provider.commit_block([tx_hash!(1)].into(), [].into(), old_height).unwrap();
+
+    expected_unchanged.assert_eq(&l1_provider);
+}
+
+#[tokio::test]
+async fn commit_block_historical_height_short_circuits_bootstrap() {
+    // Setup.
+    const STARTUP_HEIGHT: BlockNumber = BlockNumber(5);
+    const TARGET_HEIGHT: BlockNumber = BlockNumber(6);
+
+    let batcher_height_old = 4;
+    let bootstrapper = make_bootstrapper!(backlog: []);
+    let l1_provider_builder =
+        L1ProviderContentBuilder::new().with_bootstrapper(bootstrapper).with_txs([l1_handler(1)]);
+    let l1_provider_builder_clone = l1_provider_builder.clone();
+    let mut l1_provider = l1_provider_builder.clone().build_into_l1_provider();
+    l1_provider.initialize(STARTUP_HEIGHT, vec![]).await.expect("l1 provider initialize failed");
+    commit_block_expect_error_just_to_start_bootstrapping(&mut l1_provider, TARGET_HEIGHT);
+
+    let expected_unchanged = l1_provider_builder_clone
+        .with_height(STARTUP_HEIGHT)
+        .with_state(ProviderState::Bootstrap)
+        .build();
+
+    // Check that the content is the same as expected.
+    expected_unchanged.assert_eq(&l1_provider);
+
+    // Test. This commit_block should not change the provider's content.
+    l1_provider
+        .commit_block([tx_hash!(1)].into(), [].into(), BlockNumber(batcher_height_old))
+        .unwrap();
+
+    expected_unchanged.assert_eq(&l1_provider);
+}
+
+#[test]
+fn consuming_committed_tx() {
+    // Setup.
+    let tx = l1_handler(1);
+    let mut l1_provider =
+        L1ProviderContentBuilder::new().with_committed([tx.clone()]).build_into_l1_provider();
+
+    let expected = L1ProviderContentBuilder::new()
+        .with_consumed_txs([ConsumedTransaction { tx: tx.clone(), timestamp: BlockTimestamp(0) }])
+        .build();
+
+    // Test.
+    l1_provider
+        .add_events(vec![Event::TransactionConsumed {
+            tx_hash: tx.tx_hash,
+            timestamp: BlockTimestamp(0),
+        }])
+        .unwrap();
+
+    expected.assert_eq(&l1_provider);
+}
+
+#[test]
+fn consuming_tx_marked_for_cancellation() {
+    // Setup.
+    let tx = l1_handler(1);
+    let mut l1_provider = L1ProviderContentBuilder::new()
+        .with_nonzero_timelock_setup()
+        .with_cancel_requested_txs([tx.clone()])
+        .build_into_l1_provider();
+    let expected = L1ProviderContentBuilder::new()
+        .with_consumed_txs([ConsumedTransaction { tx: tx.clone(), timestamp: BlockTimestamp(0) }])
+        .build();
+
+    // Test.
+    l1_provider
+        .add_events(vec![Event::TransactionConsumed {
+            tx_hash: tx.tx_hash,
+            timestamp: BlockTimestamp(0),
+        }])
+        .unwrap();
+
+    expected.assert_eq(&l1_provider);
+}
+
+#[test]
+fn consuming_tx_cancelled_on_l2() {
+    // Setup.
+    let tx = l1_handler(1);
+    let mut l1_provider = L1ProviderContentBuilder::new()
+        .with_nonzero_timelock_setup()
+        .with_cancelled_txs([tx.clone()])
+        .build_into_l1_provider();
+
+    let expected = L1ProviderContentBuilder::new()
+        .with_consumed_txs([ConsumedTransaction { tx: tx.clone(), timestamp: BlockTimestamp(0) }])
+        .build();
+
+    // Test.
+    l1_provider
+        .add_events(vec![Event::TransactionConsumed {
+            tx_hash: tx.tx_hash,
+            timestamp: BlockTimestamp(0),
+        }])
+        .unwrap();
+
+    expected.assert_eq(&l1_provider);
+}
+
+#[test]
+fn consuming_pending_tx() {
+    // Setup.
+    let tx = l1_handler(1);
+    let mut l1_provider =
+        L1ProviderContentBuilder::new().with_txs([tx.clone()]).build_into_l1_provider();
+
+    let expected = L1ProviderContentBuilder::new()
+        .with_consumed_txs([ConsumedTransaction { tx: tx.clone(), timestamp: BlockTimestamp(0) }])
+        .build();
+
+    // Test.
+    l1_provider
+        .add_events(vec![Event::TransactionConsumed {
+            tx_hash: tx.tx_hash,
+            timestamp: BlockTimestamp(0),
+        }])
+        .unwrap();
+
+    expected.assert_eq(&l1_provider);
+}
+
+#[test]
+fn consuming_rejected_tx() {
+    // Setup.
+    let tx = l1_handler(1);
+    let mut l1_provider =
+        L1ProviderContentBuilder::new().with_rejected([tx.clone()]).build_into_l1_provider();
+
+    let expected = L1ProviderContentBuilder::new()
+        .with_consumed_txs([ConsumedTransaction { tx: tx.clone(), timestamp: BlockTimestamp(0) }])
+        .build();
+
+    // Test.
+    l1_provider
+        .add_events(vec![Event::TransactionConsumed {
+            tx_hash: tx.tx_hash,
+            timestamp: BlockTimestamp(0),
+        }])
+        .unwrap();
+
+    expected.assert_eq(&l1_provider);
+}
+
+#[test]
+#[should_panic]
+fn consuming_consumed_tx_panics() {
+    // Setup.
+    let tx = l1_handler(1);
+    let consumed_tx = ConsumedTransaction { tx: tx.clone(), timestamp: BlockTimestamp(0) };
+    let timelock = 1000;
+    let config = L1ProviderConfig {
+        l1_handler_consumption_timelock_seconds: Duration::from_secs(timelock),
+        ..Default::default()
+    };
+    let clock = Arc::new(FakeClock::new(5));
+    let mut l1_provider = L1ProviderContentBuilder::new()
+        .with_clock(clock)
+        .with_consumed_txs([consumed_tx])
+        .with_config(config)
+        .build_into_l1_provider();
+
+    assert!(l1_provider.tx_manager.records.contains_key(&tx.tx_hash));
+
+    l1_provider
+        .add_events(vec![Event::TransactionConsumed {
+            tx_hash: tx.tx_hash,
+            timestamp: BlockTimestamp(1),
+        }])
+        .unwrap();
+}
+
+#[test]
+fn consuming_unknown_tx_does_not_change_the_provider_state() {
+    // Setup.
+    let clock = Arc::new(FakeClock::new(50));
+    let timelock = 10;
+    let consumed_tx_timestamp = 45;
+
+    let cancellation_request_tx = l1_handler(1);
+    let cancelled_on_l2_tx = l1_handler(2);
+    let committed_tx = l1_handler(3);
+    let rejected_tx = l1_handler(4);
+    let pending_tx = l1_handler(5);
+    let consumed_tx =
+        ConsumedTransaction { tx: l1_handler(6), timestamp: BlockTimestamp(consumed_tx_timestamp) };
+    let unknown_tx = l1_handler(7);
+
+    let config = L1ProviderConfig {
+        l1_handler_consumption_timelock_seconds: Duration::from_secs(timelock),
+        ..Default::default()
+    };
+
+    // Some of the builder methods call with_nonzero_timelock_setup which sets the timelock to 1
+    // second. To override this, put with_config at the end.
+    let mut l1_provider = L1ProviderContentBuilder::new()
+        .with_clock(clock)
+        .with_nonzero_timelock_setup()
+        .with_cancel_requested_txs([cancellation_request_tx.clone()])
+        .with_cancelled_txs([cancelled_on_l2_tx.clone()])
+        .with_committed([committed_tx.clone()])
+        .with_rejected([rejected_tx.clone()])
+        .with_txs([pending_tx.clone()])
+        .with_consumed_txs([consumed_tx.clone()])
+        .with_config(config)
+        .build_into_l1_provider();
+
+    // The expected provider still has all the txs, the consumed tx is marked as consumed, but not
+    // deleted.
+    let expected = L1ProviderContentBuilder::new()
+        .with_nonzero_timelock_setup()
+        .with_cancel_requested_txs([cancellation_request_tx])
+        .with_cancelled_txs([cancelled_on_l2_tx])
+        .with_committed([committed_tx])
+        .with_rejected([rejected_tx])
+        .with_txs([pending_tx])
+        .with_consumed_txs([consumed_tx])
+        .build();
+
+    // Test.
+    l1_provider
+        .add_events(vec![Event::TransactionConsumed {
+            tx_hash: unknown_tx.tx_hash,
+            timestamp: BlockTimestamp(0),
+        }])
+        .unwrap();
+
+    expected.assert_eq(&l1_provider);
+}
+
+#[test]
+fn consuming_tx_deletes_after_timelock() {
+    // Setup.
+    let tx = l1_handler(1);
+    let dummy_tx = ConsumedTransaction { tx: l1_handler(999), timestamp: BlockTimestamp(1200) }; // tx to consume to trigger the timelock
+    let timelock = 1000;
+    let config = L1ProviderConfig {
+        l1_handler_consumption_timelock_seconds: Duration::from_secs(timelock),
+        ..Default::default()
+    };
+    let clock = Arc::new(FakeClock::new(5));
+
+    // Creating a provider with a pending tx.
+    let mut l1_provider = L1ProviderContentBuilder::new()
+        .with_clock(clock.clone())
+        .with_txs([tx.clone()])
+        .with_config(config)
+        .build_into_l1_provider();
+
+    // The expected provider with a tx marked as consumed, but not deleted.
+    let l1_provider_with_consumed = L1ProviderContentBuilder::new()
+        .with_consumed_txs([ConsumedTransaction { tx: tx.clone(), timestamp: BlockTimestamp(0) }])
+        .build();
+
+    // The expected provider with the tx deleted.
+    let l1_provider_with_consumed_deleted = L1ProviderContentBuilder::new().build();
+
+    // Test.
+    // Marking the tx as consumed.
+    l1_provider
+        .add_events(vec![Event::TransactionConsumed {
+            tx_hash: tx.tx_hash,
+            timestamp: BlockTimestamp(0),
+        }])
+        .unwrap();
+
+    l1_provider_with_consumed.assert_eq(&l1_provider);
+
+    // Advance the clock and assert the tx is deleted.
+    clock.advance(l1_provider.config.l1_handler_consumption_timelock_seconds);
+
+    // Consume the dummy tx to trigger the deletion past the timelock.
+    l1_provider
+        .add_events(vec![Event::TransactionConsumed {
+            tx_hash: dummy_tx.tx.tx_hash,
+            timestamp: dummy_tx.timestamp,
+        }])
+        .unwrap();
+
+    l1_provider_with_consumed_deleted.assert_eq(&l1_provider);
+}
+
+#[test]
+fn consuming_multiple_txs_selective_deletion_after_timelock() {
+    // Test that only transactions past the timelock are deleted, while newer ones remain
+    // - Consume tx1 at timestamp 100
+    // - Consume tx2 at timestamp 1000
+    // - Set timelock to 500 and clock at 1200
+    // - Verify tx1 is deleted but tx2 remains after consuming a dummy tx (to trigger the deletion)
+
+    // Setup.
+    let tx1 = l1_handler(1);
+    let tx2 = l1_handler(2);
+    let dummy_tx = ConsumedTransaction { tx: l1_handler(999), timestamp: BlockTimestamp(1200) }; // tx to consume to trigger the timelock
+    let timelock = 500; // 500 seconds timelock
+    let early_consumption_timestamp = 100;
+    let late_consumption_timestamp = 1000;
+
+    let config = L1ProviderConfig {
+        l1_handler_consumption_timelock_seconds: Duration::from_secs(timelock),
+        ..Default::default()
+    };
+
+    // Start time at 1200, which is past timelock for tx1 but not tx2
+    // tx1 consumed at 100, timelock passes at 100 + 500 = 600
+    // tx2 consumed at 1000, timelock passes at 1000 + 500 = 1500
+    // So at time 1200, only tx1 should be deleted
+    let clock = Arc::new(FakeClock::new(1200));
+
+    let mut l1_provider = L1ProviderContentBuilder::new()
+        .with_clock(clock.clone())
+        .with_txs([dummy_tx.tx.clone()])
+        .with_consumed_txs([
+            ConsumedTransaction {
+                tx: tx1.clone(),
+                timestamp: BlockTimestamp(early_consumption_timestamp),
+            },
+            ConsumedTransaction {
+                tx: tx2.clone(),
+                timestamp: BlockTimestamp(late_consumption_timestamp),
+            },
+        ])
+        .with_config(config)
+        .build_into_l1_provider();
+
+    // Only tx2 should remain consumed, tx1 should be deleted
+    let expected_with_tx1_deleted = L1ProviderContentBuilder::new()
+        .with_consumed_txs([
+            ConsumedTransaction { tx: dummy_tx.tx.clone(), timestamp: dummy_tx.timestamp },
+            ConsumedTransaction {
+                tx: tx2.clone(),
+                timestamp: BlockTimestamp(late_consumption_timestamp),
+            },
+        ])
+        .build();
+
+    // Consume the dummy tx to trigger the deletion past the timelock.
+    l1_provider
+        .add_events(vec![Event::TransactionConsumed {
+            tx_hash: dummy_tx.tx.tx_hash,
+            timestamp: dummy_tx.timestamp,
+        }])
+        .unwrap();
+
+    expected_with_tx1_deleted.assert_eq(&l1_provider);
+}
+
+#[test]
+fn bootstrap_commit_block_received_while_uninitialized() {
+    // Setup.
+    let mut l1_provider = L1ProviderContentBuilder::new().build_into_l1_provider();
+
+    // Test.
+    let result = l1_provider.commit_block([].into(), [].into(), BlockNumber(1));
+    assert!(result.is_err());
+    assert_eq!(l1_provider.state, ProviderState::Uninitialized);
+}
+
+pub fn in_ci() -> bool {
+    std::env::var("CI").is_ok()
+}
+
+const fn height_add(block_number: BlockNumber, k: u64) -> BlockNumber {
+    BlockNumber(block_number.0 + k)
+}
+
+// Can't mock clients in runtime (mockall not applicable), hence mocking sender and receiver.
+async fn send_commit_block(
+    l1_provider_client: &FakeL1ProviderClient,
+    committed: &[TransactionHash],
+    height: BlockNumber,
+) {
+    l1_provider_client
+        .commit_block((committed).iter().copied().collect(), [].into(), height)
+        .await
+        .unwrap();
+}
+
+// Can't mock clients in runtime (mockall not applicable), hence mocking sender and receiver.
+fn receive_commit_block(
+    l1_provider: &mut L1Provider,
+    committed: &IndexSet<TransactionHash>,
+    height: BlockNumber,
+) {
+    l1_provider.commit_block(committed.iter().copied().collect(), [].into(), height).unwrap();
+}
+
+// TODO(Gilad): figure out how To setup anvil on a specific L1 block (through genesis.json?) and
+// with a specified L2 block logged to L1 (hopefully without having to use real backup).
+/// This test simulates a bootstrapping flow, in which 3 blocks are synced from L2, during which two
+/// new blocks from past the catch-up height arrive. The expected behavior is that the synced
+/// commit_blocks are processed as they come, and the two new blocks are backlogged until the synced
+/// blocks are processed, after which they are processed in order.
+#[tokio::test]
+async fn bootstrap_e2e() {
+    if !in_ci() {
+        return;
+    }
+    configure_tracing().await;
+
+    // Setup.
+
+    let l1_provider_client = Arc::new(FakeL1ProviderClient::default());
+    const STARTUP_HEIGHT: BlockNumber = BlockNumber(2);
+    const CATCH_UP_HEIGHT: BlockNumber = BlockNumber(4);
+
+    // Make the mocked sync client try removing from a hashmap as a response to get block.
+    let mut sync_client = MockStateSyncClient::default();
+    let sync_response = Arc::new(Mutex::new(HashMap::<BlockNumber, SyncBlock>::new()));
+    let sync_response_clone = sync_response.clone();
+    sync_client.expect_get_block().returning(move |input| {
+        sync_response_clone
+            .lock()
+            .unwrap()
+            .remove(&input)
+            .ok_or(StateSyncError::BlockNotFound(input).into())
+    });
+
+    let config = L1ProviderConfig {
+        startup_sync_sleep_retry_interval_seconds: Duration::from_millis(10),
+        ..Default::default()
+    };
+
+    let mut l1_provider =
+        L1Provider::new(config, l1_provider_client.clone(), Arc::new(sync_client), None);
+    // Test.
+
+    // Trigger the bootstrapper: this will trigger the sync task to start trying to fetch blocks
+    // from the sync client, which will always return nothing since the hash map above is still
+    // empty. The sync task will busy-wait on the height until we feed the hashmap.
+    // TODO(Gilad): Consider adding txs here and in the commit blocks, might make the test harder to
+    // understand though.
+    let scraped_l1_handler_txs = vec![]; // No txs to scrape in this test.
+    l1_provider.initialize(STARTUP_HEIGHT, scraped_l1_handler_txs).await.unwrap();
+    // TODO(guyn): this test assumes we start in bootstrapping state. The test should be updated to
+    // include the part where the batcher's first commit_block command is what determines the
+    // catchup height and causes the bootstrapping to begin.
+    l1_provider.start_bootstrapping(CATCH_UP_HEIGHT);
+
+    // Load first **Sync** response: the initializer task will pick it up within the specified
+    // interval.
+    sync_response.lock().unwrap().insert(STARTUP_HEIGHT, SyncBlock::default());
+    tokio::time::sleep(config.startup_sync_sleep_retry_interval_seconds).await;
+
+    // **Commit** 2 blocks past catchup height, should be received after the previous sync.
+    let no_txs_committed = vec![]; // Not testing txs in this test.
+
+    send_commit_block(&l1_provider_client, &no_txs_committed, height_add(CATCH_UP_HEIGHT, 1)).await;
+    tokio::time::sleep(config.startup_sync_sleep_retry_interval_seconds).await;
+    send_commit_block(&l1_provider_client, &no_txs_committed, height_add(CATCH_UP_HEIGHT, 2)).await;
+    tokio::time::sleep(config.startup_sync_sleep_retry_interval_seconds).await;
+
+    // Feed sync task the remaining blocks, will be received after the commits above.
+    sync_response.lock().unwrap().insert(height_add(STARTUP_HEIGHT, 1), SyncBlock::default());
+    sync_response.lock().unwrap().insert(height_add(STARTUP_HEIGHT, 2), SyncBlock::default());
+    tokio::time::sleep(2 * config.startup_sync_sleep_retry_interval_seconds).await;
+
+    // Assert that initializer task has received the stubbed responses from the sync client and sent
+    // the corresponding commit blocks to the provider, in the order implied to by the test
+    // structure.
+    let mut commit_blocks = l1_provider_client.commit_blocks_received.lock().unwrap();
+    let received_order = commit_blocks.iter().map(|block| block.height).collect_vec();
+    let expected_order =
+        vec![BlockNumber(2), BlockNumber(5), BlockNumber(6), BlockNumber(3), BlockNumber(4)];
+    assert_eq!(
+        received_order, expected_order,
+        "Sanity check failed: commit block order mismatch. Expected {expected_order:?}, got \
+         {received_order:?}"
+    );
+
+    // Apply commit blocks and assert that correct height commit_blocks are applied, but commit
+    // blocks past catch_up_height are backlogged.
+    // TODO(Gilad): once we are able to create clients on top of channels, this manual'ness won't
+    // be necessary. Right now we cannot create clients without spinning up all servers, so we have
+    // to use a mock.
+
+    let mut commit_blocks = commit_blocks.drain(..);
+
+    // Apply height 2.
+    let next_block = commit_blocks.next().unwrap();
+    receive_commit_block(&mut l1_provider, &next_block.committed_txs, next_block.height);
+    assert_eq!(l1_provider.current_height, BlockNumber(3));
+
+    // Backlog height 5.
+    let next_block = commit_blocks.next().unwrap();
+    receive_commit_block(&mut l1_provider, &next_block.committed_txs, next_block.height);
+    // Assert that this didn't affect height; this commit block is too high so is backlogged.
+    assert_eq!(l1_provider.current_height, BlockNumber(3));
+
+    // Backlog height 6.
+    let next_block = commit_blocks.next().unwrap();
+    receive_commit_block(&mut l1_provider, &next_block.committed_txs, next_block.height);
+    // Assert backlogged, like height 5.
+    assert_eq!(l1_provider.current_height, BlockNumber(3));
+
+    // Apply height 3
+    let next_block = commit_blocks.next().unwrap();
+    receive_commit_block(&mut l1_provider, &next_block.committed_txs, next_block.height);
+    assert_eq!(l1_provider.current_height, BlockNumber(4));
+
+    // Apply height 4 ==> this triggers committing the backlogged heights 5 and 6.
+    let next_block = commit_blocks.next().unwrap();
+    receive_commit_block(&mut l1_provider, &next_block.committed_txs, next_block.height);
+    assert_eq!(l1_provider.current_height, BlockNumber(7));
+
+    // Assert that the bootstrapper has been dropped.
+    assert!(!l1_provider.state.is_bootstrapping());
+}
+
+#[tokio::test]
+async fn bootstrap_delayed_batcher_and_sync_state_with_trivial_catch_up() {
+    if !in_ci() {
+        return;
+    }
+    configure_tracing().await;
+
+    // Setup.
+
+    let l1_provider_client = Arc::new(FakeL1ProviderClient::default());
+    const STARTUP_HEIGHT: BlockNumber = BlockNumber(3);
+
+    let sync_client = MockStateSyncClient::default();
+    let config = L1ProviderConfig {
+        startup_sync_sleep_retry_interval_seconds: Duration::from_millis(10),
+        ..Default::default()
+    };
+
+    let mut l1_provider =
+        L1Provider::new(config, l1_provider_client.clone(), Arc::new(sync_client), None);
+    // Test.
+
+    // Start the sync sequence, should busy-wait until the batcher height is sent.
+    let scraped_l1_handler_txs = []; // No txs to scrape in this test.
+    l1_provider.initialize(STARTUP_HEIGHT, scraped_l1_handler_txs.into()).await.unwrap();
+
+    // **Commit** a few blocks. The height starts from the provider's current height, since this
+    // is a trivial catchup scenario (nothing to catch up).
+    // This checks that the trivial catch_up_height doesn't mess up this flow.
+    let no_txs_committed = []; // Not testing txs in this test.
+    send_commit_block(&l1_provider_client, &no_txs_committed, STARTUP_HEIGHT).await;
+    send_commit_block(&l1_provider_client, &no_txs_committed, height_add(STARTUP_HEIGHT, 1)).await;
+
+    // Forward all messages buffered in the client to the provider.
+    l1_provider_client.flush_messages(&mut l1_provider).await;
+
+    // Commit blocks should have been applied.
+    let start_height_plus_2 = height_add(STARTUP_HEIGHT, 2);
+    assert_eq!(l1_provider.current_height, start_height_plus_2);
+    // TODO(guyn): it is possible that the rest of this test is trivial.
+    // Should still be bootstrapping, since catchup height isn't determined yet.
+    // Technically we could end bootstrapping at this point, but its simpler to let it
+    // terminate gracefully once the batcher and sync are ready.
+    assert_eq!(l1_provider.state, ProviderState::Pending);
+
+    // Let the sync task continue, it should short circuit.
+    tokio::time::sleep(config.startup_sync_sleep_retry_interval_seconds).await;
+    // Assert height is unchanged from last time, no commit block was called from the sync task.
+    assert_eq!(l1_provider.current_height, start_height_plus_2);
+    // Finally, commit a new block to trigger the bootstrapping check, should switch to steady
+    // state.
+    receive_commit_block(&mut l1_provider, &no_txs_committed.into(), start_height_plus_2);
+    assert_eq!(l1_provider.current_height, height_add(start_height_plus_2, 1));
+    // The new commit block triggered the catch-up check, which ended the bootstrapping phase.
+    assert!(!l1_provider.state.is_bootstrapping());
+}
+
+#[tokio::test]
+async fn bootstrap_delayed_sync_state_with_sync_behind_batcher() {
+    if !in_ci() {
+        return;
+    }
+    configure_tracing().await;
+
+    // Setup.
+
+    let l1_provider_client = Arc::new(FakeL1ProviderClient::default());
+    let startup_height = BlockNumber(1);
+    let batcher_height = BlockNumber(3);
+
+    let mut sync_client = MockStateSyncClient::default();
+    // Mock sync response for an arbitrary number of calls to get block.
+    // Later in the test we modify it to become something else.
+    let sync_block_response = Arc::new(Mutex::new(HashMap::<BlockNumber, SyncBlock>::new()));
+    let sync_response_clone = sync_block_response.clone();
+    sync_client.expect_get_block().returning(move |input| {
+        sync_response_clone
+            .lock()
+            .unwrap()
+            .remove(&input)
+            .ok_or(StateSyncError::BlockNotFound(input).into())
+    });
+
+    let config = L1ProviderConfig {
+        startup_sync_sleep_retry_interval_seconds: Duration::from_millis(10),
+        ..Default::default()
+    };
+
+    let mut l1_provider =
+        L1Provider::new(config, l1_provider_client.clone(), Arc::new(sync_client), None);
+
+    // Test.
+
+    // Start the sync sequence, should busy-wait until the sync blocks are sent.
+    let scraped_l1_handler_txs = []; // No txs to scrape in this test.
+    l1_provider.initialize(startup_height, scraped_l1_handler_txs.into()).await.unwrap();
+
+    // **Commit** a few blocks. These should get backlogged since they are post-sync-height.
+    // Sleeps are sprinkled in to give the async task time to get the batcher height and have a
+    // couple shots at attempting to get the sync blocks (see DEBUG log).
+    let no_txs_committed = []; // Not testing txs in this test.
+    send_commit_block(&l1_provider_client, &no_txs_committed, batcher_height).await;
+    tokio::time::sleep(config.startup_sync_sleep_retry_interval_seconds).await;
+    send_commit_block(&l1_provider_client, &no_txs_committed, batcher_height.unchecked_next())
+        .await;
+
+    // Forward all messages buffered in the client to the provider.
+    l1_provider_client.flush_messages(&mut l1_provider).await;
+    tokio::time::sleep(config.startup_sync_sleep_retry_interval_seconds).await;
+
+    // Assert commit blocks are backlogged (didn't affect start height).
+    assert_eq!(l1_provider.current_height, startup_height);
+    // Should still be bootstrapping, since sync hasn't caught up to the batcher height yet.
+    assert!(l1_provider.state.is_bootstrapping());
+
+    // Simulate the state sync service finally being ready, and give the async task enough time to
+    // pick this up and sync up the provider.
+    sync_block_response.lock().unwrap().insert(startup_height, SyncBlock::default());
+    sync_block_response
+        .lock()
+        .unwrap()
+        .insert(startup_height.unchecked_next(), SyncBlock::default());
+    sync_block_response
+        .lock()
+        .unwrap()
+        .insert(startup_height.unchecked_next().unchecked_next(), SyncBlock::default());
+    tokio::time::sleep(config.startup_sync_sleep_retry_interval_seconds).await;
+    // Forward all messages buffered in the client to the provider.
+    l1_provider_client.flush_messages(&mut l1_provider).await;
+
+    // Two things happened here: the async task sent 2 commit blocks it got from the sync_client,
+    // which bumped the provider height to batcher_height, then the backlog was applied which
+    // bumped it twice again.
+    assert_eq!(l1_provider.current_height, batcher_height.unchecked_next().unchecked_next());
+    // Batcher height was reached, bootstrapping was completed.
+    assert!(!l1_provider.state.is_bootstrapping());
+}
+
+#[tokio::test]
+#[should_panic = "Sync task is stuck"]
+async fn test_stuck_sync() {
+    const STARTUP_HEIGHT: BlockNumber = BlockNumber(1);
+    const TARGET_HEIGHT: BlockNumber = BlockNumber(10);
+
+    let mut sync_client = MockStateSyncClient::default();
+    sync_client.expect_get_block().returning(move |_| panic!("CRASH the sync task"));
+    let l1_provider_client = Arc::new(FakeL1ProviderClient::default());
+    let config = L1ProviderConfig {
+        // Override the default retry interval which is way too long for a test.
+        startup_sync_sleep_retry_interval_seconds: Duration::from_millis(10),
+        ..Default::default()
+    };
+
+    let mut l1_provider =
+        L1Provider::new(config, l1_provider_client.clone(), Arc::new(sync_client), None);
+
+    // Test.
+
+    // Start sync.
+    l1_provider.initialize(STARTUP_HEIGHT, Default::default()).await.unwrap();
+    l1_provider.start_bootstrapping(TARGET_HEIGHT);
+
+    for i in 0..=(Bootstrapper::MAX_HEALTH_CHECK_FAILURES + 1) {
+        receive_commit_block(&mut l1_provider, &[].into(), height_add(STARTUP_HEIGHT, i.into()));
+        tokio::time::sleep(config.startup_sync_sleep_retry_interval_seconds).await;
+    }
 }

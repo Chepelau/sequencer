@@ -1,79 +1,32 @@
 use std::any::type_name;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
+use std::sync::Arc;
 
-use apollo_config::dumping::{ser_param, SerializeConfig};
-use apollo_config::{ParamPath, ParamPrivacyInput, SerializedParam};
 use apollo_infra::component_definitions::ComponentStarter;
+use apollo_infra_utils::info_every_n_sec;
+use apollo_l1_gas_price_provider_config::config::L1GasPriceProviderConfig;
 use apollo_l1_gas_price_types::errors::L1GasPriceProviderError;
-use apollo_l1_gas_price_types::{GasPriceData, L1GasPriceProviderResult, PriceInfo};
+use apollo_l1_gas_price_types::{
+    EthToStrkOracleClientTrait,
+    GasPriceData,
+    L1GasPriceProviderResult,
+    PriceInfo,
+};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use starknet_api::block::BlockTimestamp;
-use tracing::{debug, info, warn};
-use validator::Validate;
+use tracing::{info, trace, warn};
 
-use crate::metrics::{register_provider_metrics, L1_GAS_PRICE_PROVIDER_INSUFFICIENT_HISTORY};
+use crate::eth_to_strk_oracle::EthToStrkOracleClient;
+use crate::metrics::{
+    register_provider_metrics,
+    L1_DATA_GAS_PRICE_LATEST_MEAN_VALUE,
+    L1_GAS_PRICE_LATEST_MEAN_VALUE,
+    L1_GAS_PRICE_PROVIDER_INSUFFICIENT_HISTORY,
+};
 
 #[cfg(test)]
 #[path = "l1_gas_price_provider_test.rs"]
 pub mod l1_gas_price_provider_test;
-
-#[derive(Clone, Debug, Serialize, Deserialize, Validate, PartialEq)]
-pub struct L1GasPriceProviderConfig {
-    // TODO(guyn): these two fields need to go into VersionedConstants.
-    pub number_of_blocks_for_mean: u64,
-    // Use seconds not Duration since seconds is the basic quanta of time for both Starknet and
-    // Ethereum.
-    pub lag_margin_seconds: u64,
-    pub storage_limit: usize,
-    // Maximum valid time gap between the requested timestamp and the last price sample in seconds.
-    pub max_time_gap_seconds: u64,
-}
-
-impl Default for L1GasPriceProviderConfig {
-    fn default() -> Self {
-        const MEAN_NUMBER_OF_BLOCKS: u64 = 300;
-        Self {
-            number_of_blocks_for_mean: MEAN_NUMBER_OF_BLOCKS,
-            lag_margin_seconds: 60,
-            storage_limit: usize::try_from(10 * MEAN_NUMBER_OF_BLOCKS).unwrap(),
-            max_time_gap_seconds: 900, // 15 minutes
-        }
-    }
-}
-
-impl SerializeConfig for L1GasPriceProviderConfig {
-    fn dump(&self) -> BTreeMap<ParamPath, SerializedParam> {
-        BTreeMap::from([
-            ser_param(
-                "number_of_blocks_for_mean",
-                &self.number_of_blocks_for_mean,
-                "Number of blocks to use for the mean gas price calculation",
-                ParamPrivacyInput::Public,
-            ),
-            ser_param(
-                "lag_margin_seconds",
-                &self.lag_margin_seconds,
-                "Difference between the time of the block from L1 used to calculate the gas price \
-                 and the time of the L2 block this price is used in",
-                ParamPrivacyInput::Public,
-            ),
-            ser_param(
-                "storage_limit",
-                &self.storage_limit,
-                "Maximum number of L1 blocks to keep cached",
-                ParamPrivacyInput::Public,
-            ),
-            ser_param(
-                "max_time_gap_seconds",
-                &self.max_time_gap_seconds,
-                "Maximum valid time gap between the requested timestamp and the last price sample \
-                 in seconds",
-                ParamPrivacyInput::Public,
-            ),
-        ])
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RingBuffer<T>(VecDeque<T>);
@@ -105,11 +58,21 @@ pub struct L1GasPriceProvider {
     config: L1GasPriceProviderConfig,
     // If received data before initialization (is None), it means the scraper has restarted.
     price_samples_by_block: Option<RingBuffer<GasPriceData>>,
+    eth_to_strk_oracle_client: Arc<dyn EthToStrkOracleClientTrait>,
 }
 
 impl L1GasPriceProvider {
-    pub fn new(config: L1GasPriceProviderConfig) -> Self {
-        Self { config, price_samples_by_block: None }
+    pub fn new(
+        config: L1GasPriceProviderConfig,
+        eth_to_strk_oracle_client: Arc<dyn EthToStrkOracleClientTrait>,
+    ) -> Self {
+        Self { config, price_samples_by_block: None, eth_to_strk_oracle_client }
+    }
+
+    pub fn new_with_oracle(config: L1GasPriceProviderConfig) -> Self {
+        let eth_to_strk_oracle_client =
+            EthToStrkOracleClient::new(config.eth_to_strk_oracle_config.clone());
+        Self::new(config, Arc::new(eth_to_strk_oracle_client))
     }
 
     pub fn initialize(&mut self) -> L1GasPriceProviderResult<()> {
@@ -133,7 +96,8 @@ impl L1GasPriceProvider {
                 });
             }
         }
-        debug!("Received price sample for L2 block: {:?}", new_data);
+        trace!("Received price sample for L1 block: {:?}", new_data);
+        info_every_n_sec!(1, "Received price sample for L1 block: {:?}", new_data);
         samples.push(new_data);
         Ok(())
     }
@@ -147,7 +111,7 @@ impl L1GasPriceProvider {
             .back()
             .ok_or(L1GasPriceProviderError::MissingDataError {
                 timestamp: timestamp.0,
-                lag: self.config.lag_margin_seconds,
+                lag: self.config.lag_margin_seconds.as_secs(),
             })?
             .timestamp;
 
@@ -161,14 +125,14 @@ impl L1GasPriceProvider {
 
         // This index is for the last block in the mean (inclusive).
         let index_last_timestamp_rev = samples.iter().rev().position(|data| {
-            data.timestamp <= timestamp.saturating_sub(&self.config.lag_margin_seconds)
+            data.timestamp <= timestamp.saturating_sub(&self.config.lag_margin_seconds.as_secs())
         });
 
         // Could not find a block with the requested timestamp and lag.
         let Some(last_index_rev) = index_last_timestamp_rev else {
             return Err(L1GasPriceProviderError::MissingDataError {
                 timestamp: timestamp.0,
-                lag: self.config.lag_margin_seconds,
+                lag: self.config.lag_margin_seconds.as_secs(),
             });
         };
         // Convert the index to the forward direction.
@@ -184,9 +148,10 @@ impl L1GasPriceProvider {
             last_index - num_blocks
         } else {
             warn!(
-                "Not enough history to calculate the mean gas price. Using only {} blocks instead \
-                 of {}.",
-                last_index, num_blocks
+                "Not enough history to calculate the mean gas price. Using blocks {}-{}, \
+                 inclusive.",
+                samples[0].block_number,
+                samples[last_index - 1].block_number,
             );
             L1_GAS_PRICE_PROVIDER_INSUFFICIENT_HISTORY.increment(1);
             0
@@ -206,7 +171,24 @@ impl L1GasPriceProvider {
         let price_info_out = price_info_summed
             .checked_div(actual_number_of_blocks)
             .expect("Actual number of blocks should be non-zero");
+        info_every_n_sec!(
+            1,
+            "Calculated L1 gas price for timestamp {}: {:?} (based on blocks {}-{}, inclusive)",
+            timestamp.0,
+            price_info_out,
+            samples[first_index].block_number,
+            samples[last_index - 1].block_number,
+        );
+        L1_GAS_PRICE_LATEST_MEAN_VALUE.set_lossy(price_info_out.base_fee_per_gas.0);
+        L1_DATA_GAS_PRICE_LATEST_MEAN_VALUE.set_lossy(price_info_out.blob_fee.0);
         Ok(price_info_out)
+    }
+
+    pub async fn eth_to_fri_rate(&self, timestamp: u64) -> L1GasPriceProviderResult<u128> {
+        self.eth_to_strk_oracle_client
+            .eth_to_fri_rate(timestamp)
+            .await
+            .map_err(L1GasPriceProviderError::EthToStrkOracleClientError)
     }
 }
 

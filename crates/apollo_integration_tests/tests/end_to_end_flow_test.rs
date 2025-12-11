@@ -6,29 +6,28 @@ use apollo_integration_tests::utils::{
     ACCOUNT_ID_1,
     UNDEPLOYED_ACCOUNT_ID,
 };
+use blockifier::bouncer::BouncerWeights;
 use mempool_test_utils::starknet_api_test_utils::MultiAccountTransactionGenerator;
-use papyrus_base_layer::ethereum_base_layer_contract::L1ToL2MessageArgs;
-use starknet_api::execution_resources::GasAmount;
 use starknet_api::rpc_transaction::RpcTransaction;
-use starknet_api::transaction::TransactionHash;
+use starknet_api::transaction::{L1HandlerTransaction, TransactionHash};
 
-use crate::common::{end_to_end_flow, test_single_tx, TestScenario};
+use crate::common::{end_to_end_flow, test_single_tx, EndToEndFlowArgs, TestScenario};
 
 mod common;
 
-#[tokio::test]
+// TODO(Meshi): Fail the test if no class have migrated.
+/// Number of threads is 3 = Num of sequencer + 1 for the test thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn test_end_to_end_flow() {
-    end_to_end_flow(
+    end_to_end_flow(EndToEndFlowArgs::new(
         TestIdentifier::EndToEndFlowTest,
         create_test_scenarios(),
-        GasAmount(29000000),
-        false,
-        false,
-    )
+        BouncerWeights::default().proving_gas,
+    ))
     .await
 }
 
-pub fn create_test_scenarios() -> Vec<TestScenario> {
+fn create_test_scenarios() -> Vec<TestScenario> {
     vec![
         // This block should be the first to be tested, as the addition of L1 handler transaction
         // does not work smoothly with the current architecture of the test.
@@ -63,9 +62,10 @@ pub fn create_test_scenarios() -> Vec<TestScenario> {
 
 fn create_l1_to_l2_message_args(
     tx_generator: &mut MultiAccountTransactionGenerator,
-) -> Vec<L1ToL2MessageArgs> {
+) -> Vec<L1HandlerTransaction> {
     const N_TXS: usize = 1;
-    create_l1_to_l2_messages_args(tx_generator, N_TXS)
+    const SHOULD_REVERT: bool = false;
+    create_l1_to_l2_messages_args(tx_generator, N_TXS, SHOULD_REVERT)
 }
 
 fn create_multiple_account_txs(
@@ -73,11 +73,11 @@ fn create_multiple_account_txs(
 ) -> Vec<RpcTransaction> {
     // Create RPC transactions.
     let account0_invoke_nonce1 =
-        tx_generator.account_with_id_mut(ACCOUNT_ID_0).generate_invoke_with_tip(2);
+        tx_generator.account_with_id_mut(ACCOUNT_ID_0).generate_trivial_rpc_invoke_tx(2);
     let account0_invoke_nonce2 =
-        tx_generator.account_with_id_mut(ACCOUNT_ID_0).generate_invoke_with_tip(3);
+        tx_generator.account_with_id_mut(ACCOUNT_ID_0).generate_trivial_rpc_invoke_tx(3);
     let account1_invoke_nonce1 =
-        tx_generator.account_with_id_mut(ACCOUNT_ID_1).generate_invoke_with_tip(4);
+        tx_generator.account_with_id_mut(ACCOUNT_ID_1).generate_trivial_rpc_invoke_tx(4);
 
     vec![account0_invoke_nonce1, account0_invoke_nonce2, account1_invoke_nonce1]
 }
@@ -120,6 +120,6 @@ fn test_two_txs(tx_hashes: &[TransactionHash]) -> Vec<TransactionHash> {
 
 fn create_declare_tx(tx_generator: &mut MultiAccountTransactionGenerator) -> Vec<RpcTransaction> {
     let account_tx_generator = tx_generator.account_with_id_mut(ACCOUNT_ID_0);
-    let declare_tx = account_tx_generator.generate_declare();
+    let declare_tx = account_tx_generator.generate_declare_of_contract_class();
     vec![declare_tx]
 }

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use starknet_api::block::BlockInfo;
 use starknet_api::core::{ContractAddress, Nonce};
 use starknet_api::executable_transaction::AccountTransaction as ApiTransaction;
 use starknet_api::execution_resources::GasAmount;
@@ -41,6 +42,29 @@ pub enum StatefulValidatorError {
 
 pub type StatefulValidatorResult<T> = Result<T, StatefulValidatorError>;
 
+#[cfg_attr(any(test, feature = "mocks"), mockall::automock)]
+pub trait StatefulValidatorTrait {
+    #[allow(clippy::result_large_err)]
+    fn validate(&mut self, account_tx: AccountTransaction) -> StatefulValidatorResult<()>;
+    fn block_info(&self) -> &BlockInfo;
+    #[allow(clippy::result_large_err)]
+    fn get_nonce(&mut self, account_address: ContractAddress) -> StatefulValidatorResult<Nonce>;
+}
+
+impl<S: StateReader> StatefulValidatorTrait for StatefulValidator<S> {
+    fn validate(&mut self, account_tx: AccountTransaction) -> StatefulValidatorResult<()> {
+        self.perform_validations(account_tx)
+    }
+
+    fn block_info(&self) -> &BlockInfo {
+        StatefulValidator::block_info(self)
+    }
+
+    fn get_nonce(&mut self, account_address: ContractAddress) -> StatefulValidatorResult<Nonce> {
+        StatefulValidator::get_nonce(self, account_address)
+    }
+}
+
 /// Manages state related transaction validations for pre-execution flows.
 pub struct StatefulValidator<S: StateReader> {
     tx_executor: TransactionExecutor<S>,
@@ -53,43 +77,50 @@ impl<S: StateReader> StatefulValidator<S> {
         Self { tx_executor }
     }
 
-    #[allow(clippy::result_large_err)]
     pub fn perform_validations(&mut self, tx: AccountTransaction) -> StatefulValidatorResult<()> {
         // Deploy account transaction should be fully executed, since the constructor must run
         // before `__validate_deploy__`. The execution already includes all necessary validations,
         // so they are skipped here.
         // Declare transaction should also be fully executed - otherwise, if we only go through
         // the validate phase, we would miss the check that the class was not declared before.
-        if let ApiTransaction::DeployAccount(_) | ApiTransaction::Declare(_) = tx.tx {
-            return self.execute(tx);
+        match tx.tx {
+            ApiTransaction::DeployAccount(_) | ApiTransaction::Declare(_) => self.execute(tx),
+            ApiTransaction::Invoke(_) => {
+                let tx_context = Arc::new(self.tx_executor.block_context.to_tx_context(&tx));
+                tx.perform_pre_validation_stage(self.state(), &tx_context)?;
+                if !tx.execution_flags.validate {
+                    return Ok(());
+                }
+
+                // `__validate__` call.
+                let (_optional_call_info, actual_cost) = self.validate(&tx, tx_context.clone())?;
+
+                // Post validations.
+                PostValidationReport::verify(
+                    &tx_context,
+                    &actual_cost,
+                    tx.execution_flags.charge_fee,
+                )?;
+
+                Ok(())
+            }
         }
+    }
 
-        let tx_context = Arc::new(self.tx_executor.block_context.to_tx_context(&tx));
-        tx.perform_pre_validation_stage(self.state(), &tx_context)?;
-        if !tx.execution_flags.validate {
-            return Ok(());
-        }
-
-        // `__validate__` call.
-        let (_optional_call_info, actual_cost) = self.validate(&tx, tx_context.clone())?;
-
-        // Post validations.
-        PostValidationReport::verify(&tx_context, &actual_cost, tx.execution_flags.charge_fee)?;
-
-        Ok(())
+    /// TODO(tzahi): move to the GW TX validator.
+    pub fn block_info(&self) -> &BlockInfo {
+        self.tx_executor.block_context.as_ref().block_info()
     }
 
     fn state(&mut self) -> &mut CachedState<S> {
         self.tx_executor.block_state.as_mut().expect(BLOCK_STATE_ACCESS_ERR)
     }
 
-    #[allow(clippy::result_large_err)]
     fn execute(&mut self, tx: AccountTransaction) -> StatefulValidatorResult<()> {
         self.tx_executor.execute(&Transaction::Account(tx))?;
         Ok(())
     }
 
-    #[allow(clippy::result_large_err)]
     fn validate(
         &mut self,
         tx: &AccountTransaction,
@@ -116,7 +147,7 @@ impl<S: StateReader> StatefulValidator<S> {
         Ok((validate_call_info, tx_receipt))
     }
 
-    #[allow(clippy::result_large_err)]
+    /// TODO(tzahi): Used only in native blockifier, remove after it is deleted.
     pub fn get_nonce(
         &mut self,
         account_address: ContractAddress,

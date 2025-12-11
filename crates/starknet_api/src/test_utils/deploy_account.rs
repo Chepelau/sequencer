@@ -56,7 +56,7 @@ impl Default for DeployAccountTxArgs {
             max_fee: Fee::default(),
             signature: TransactionSignature::default(),
             version: TransactionVersion::THREE,
-            resource_bounds: ValidResourceBounds::create_for_testing_no_fee_enforcement(),
+            resource_bounds: ValidResourceBounds::create_for_testing(),
             tip: Tip::default(),
             nonce_data_availability_mode: DataAvailabilityMode::L1,
             fee_data_availability_mode: DataAvailabilityMode::L1,
@@ -123,7 +123,8 @@ pub fn deploy_account_tx(
 // function. We don't use it now to avoid tx_hash calculation.
 pub fn executable_deploy_account_tx(deploy_tx_args: DeployAccountTxArgs) -> AccountTransaction {
     let tx_hash = deploy_tx_args.tx_hash;
-    let tx = deploy_account_tx(deploy_tx_args, Nonce(Felt::ZERO));
+    let tx_nonce = deploy_tx_args.nonce;
+    let tx = deploy_account_tx(deploy_tx_args, tx_nonce);
     let contract_address = tx.calculate_contract_address().unwrap();
     let deploy_account_tx = ExecutableDeployAccountTransaction { tx, tx_hash, contract_address };
 
@@ -191,5 +192,9 @@ impl TestingTxArgs for DeployAccountTxArgs {
 
     fn get_internal_tx(&self) -> InternalRpcTransaction {
         internal_deploy_account_tx(self.clone())
+    }
+
+    fn get_executable_tx(&self) -> AccountTransaction {
+        executable_deploy_account_tx(self.clone())
     }
 }

@@ -1,7 +1,11 @@
+use std::fmt::Display;
+
 #[cfg(any(feature = "testing", test))]
 use enum_iterator::Sequence;
 use serde::de::Error;
 use serde::{Deserialize, Deserializer, Serialize};
+use starknet_api::transaction::fields::TransactionSignature;
+use tracing::error;
 
 /// Error codes returned by the starknet gateway.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -55,6 +59,8 @@ pub enum KnownStarknetErrorCode {
     ValidateFailure,
     #[serde(rename = "StarknetErrorCode.TRANSACTION_LIMIT_EXCEEDED")]
     TransactionLimitExceeded,
+    #[serde(rename = "StarknetErrorCode.UNAUTHORIZED_DECLARE")]
+    UnauthorizedDeclare,
 }
 
 /// A client error wrapping error codes returned by the starknet gateway.
@@ -65,8 +71,18 @@ pub struct StarknetError {
 }
 
 impl StarknetError {
-    pub fn internal(message: &str) -> Self {
-        Self { code: Self::internal_error_code(), message: message.to_string() }
+    pub fn internal_with_logging(log_message: &str, err: impl std::error::Error) -> Self {
+        error!("Internal error: {log_message}: {err}.");
+        Self { code: Self::internal_error_code(), message: "Internal error".to_string() }
+    }
+
+    pub fn internal_with_signature_logging(
+        log_message: impl Display,
+        tx_signature: &TransactionSignature,
+        err: impl std::error::Error,
+    ) -> Self {
+        let log_message = format!("{log_message}: Transaction signature: {tx_signature:?}");
+        Self::internal_with_logging(&log_message, err)
     }
 
     pub fn is_internal(&self) -> bool {

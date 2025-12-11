@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use cairo_lang_casm::hints::{Hint as Cairo1Hint, StarknetHint};
-use cairo_lang_runner::casm_run::execute_core_hint_base;
+use cairo_lang_casm::hints::{CoreHint, CoreHintBase, Hint as Cairo1Hint, StarknetHint};
+use cairo_lang_runner::casm_run::{cell_ref_to_relocatable, execute_core_hint_base};
 use cairo_vm::hint_processor::builtin_hint_processor::builtin_hint_processor_definition::{
     BuiltinHintProcessor,
     HintProcessorData as Cairo0Hint,
@@ -9,13 +9,15 @@ use cairo_vm::hint_processor::builtin_hint_processor::builtin_hint_processor_def
 use cairo_vm::hint_processor::hint_processor_definition::{HintExtension, HintProcessorLogic};
 use cairo_vm::stdlib::any::Any;
 use cairo_vm::stdlib::boxed::Box;
-use cairo_vm::stdlib::collections::HashMap;
 use cairo_vm::types::exec_scope::ExecutionScopes;
 use cairo_vm::types::program::Program;
 use cairo_vm::vm::errors::hint_errors::HintError as VmHintError;
+use cairo_vm::vm::runners::cairo_runner::ResourceTracker;
 use cairo_vm::vm::vm_core::VirtualMachine;
+use rand::Rng;
 use serde::Deserialize;
 use starknet_types_core::felt::Felt;
+use tracing::level_filters::LevelFilter;
 
 use crate::hint_processor::common_hint_processor::{
     CommonHintProcessor,
@@ -38,9 +40,21 @@ pub enum DataAvailability {
 
 #[derive(Deserialize, Debug)]
 pub struct AggregatorInput {
-    pub bootloader_output: Vec<Felt>,
+    // The input data. Wrapped with an Option to allow it to be consumed once by the
+    // get_os_output_for_inner_blocks hint.
+    pub bootloader_output: Option<Vec<Felt>>,
     pub full_output: bool,
     pub da: DataAvailability,
+    pub debug_mode: bool,
+    pub fee_token_address: Felt,
+    pub chain_id: Felt,
+    pub public_keys: Option<Vec<Felt>>,
+}
+
+impl AggregatorInput {
+    pub fn log_level(&self) -> LevelFilter {
+        if self.debug_mode { LevelFilter::DEBUG } else { LevelFilter::INFO }
+    }
 }
 
 pub struct AggregatorHintProcessor<'a> {
@@ -73,12 +87,19 @@ impl<'a> AggregatorHintProcessor<'a> {
     }
 }
 
+/// Default implementation (required for the VM to use the type as a hint processor).
+impl ResourceTracker for AggregatorHintProcessor<'_> {}
+
 impl HintProcessorLogic for AggregatorHintProcessor<'_> {
     impl_common_hint_processor_logic!();
 }
 
 impl<'program> CommonHintProcessor<'program> for AggregatorHintProcessor<'program> {
     impl_common_hint_processor_getters!();
+
+    fn get_rng(&mut self) -> &mut rand::rngs::StdRng {
+        panic!("Aggregator should not use randomness.");
+    }
 
     fn execute_cairo0_unique_hint(
         &mut self,

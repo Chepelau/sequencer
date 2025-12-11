@@ -1,57 +1,39 @@
+use apollo_class_manager::metrics::{CLASS_SIZES, N_CLASSES};
 use apollo_compile_to_casm::metrics::COMPILATION_DURATION;
-use apollo_infra::metrics::{
-    SIERRA_COMPILER_LOCAL_MSGS_PROCESSED,
-    SIERRA_COMPILER_LOCAL_MSGS_RECEIVED,
-    SIERRA_COMPILER_LOCAL_QUEUE_DEPTH,
-    SIERRA_COMPILER_REMOTE_CLIENT_SEND_ATTEMPTS,
-    SIERRA_COMPILER_REMOTE_MSGS_PROCESSED,
-    SIERRA_COMPILER_REMOTE_MSGS_RECEIVED,
-    SIERRA_COMPILER_REMOTE_VALID_MSGS_RECEIVED,
-};
 
-use crate::dashboard::{Panel, PanelType, Row};
-
-fn get_panel_sierra_compiler_local_msgs_received() -> Panel {
-    Panel::from_counter(SIERRA_COMPILER_LOCAL_MSGS_RECEIVED, PanelType::TimeSeries)
-}
-fn get_panel_sierra_compiler_local_msgs_processed() -> Panel {
-    Panel::from_counter(SIERRA_COMPILER_LOCAL_MSGS_PROCESSED, PanelType::TimeSeries)
-}
-fn get_panel_sierra_compiler_remote_msgs_received() -> Panel {
-    Panel::from_counter(SIERRA_COMPILER_REMOTE_MSGS_RECEIVED, PanelType::TimeSeries)
-}
-fn get_panel_sierra_compiler_remote_valid_msgs_received() -> Panel {
-    Panel::from_counter(SIERRA_COMPILER_REMOTE_VALID_MSGS_RECEIVED, PanelType::TimeSeries)
-}
-fn get_panel_sierra_compiler_remote_msgs_processed() -> Panel {
-    Panel::from_counter(SIERRA_COMPILER_REMOTE_MSGS_PROCESSED, PanelType::TimeSeries)
-}
-fn get_panel_sierra_compiler_local_queue_depth() -> Panel {
-    Panel::from_gauge(SIERRA_COMPILER_LOCAL_QUEUE_DEPTH, PanelType::TimeSeries)
-}
-fn get_panel_sierra_compiler_remote_client_send_attempts() -> Panel {
-    Panel::from_hist(SIERRA_COMPILER_REMOTE_CLIENT_SEND_ATTEMPTS, PanelType::TimeSeries)
-}
+use crate::dashboard::{Panel, PanelType, Row, Unit};
+use crate::query_builder::{sum_by_label, DisplayMethod, DEFAULT_DURATION};
 
 fn get_panel_compilation_duration() -> Panel {
-    Panel::from_hist(COMPILATION_DURATION, PanelType::TimeSeries)
-}
-
-pub(crate) fn get_sierra_compiler_infra_row() -> Row {
-    Row::new(
-        "SierraCompilerInfra",
-        vec![
-            get_panel_sierra_compiler_local_msgs_received(),
-            get_panel_sierra_compiler_local_msgs_processed(),
-            get_panel_sierra_compiler_local_queue_depth(),
-            get_panel_sierra_compiler_remote_msgs_received(),
-            get_panel_sierra_compiler_remote_valid_msgs_received(),
-            get_panel_sierra_compiler_remote_msgs_processed(),
-            get_panel_sierra_compiler_remote_client_send_attempts(),
-        ],
+    Panel::from_hist(
+        &COMPILATION_DURATION,
+        "Compile to Casm Compilation Duration",
+        "Server-side compilation of Sierra to Casm duration",
     )
+    .with_unit(Unit::Seconds)
+}
+fn get_panel_n_classes() -> Panel {
+    Panel::new(
+        "Number of Classes",
+        format!(
+            "Number of classes, labeled by type (regular, deprecated) ({DEFAULT_DURATION} window)"
+        ),
+        sum_by_label(&N_CLASSES, "class_type", DisplayMethod::Increase(DEFAULT_DURATION), false),
+        PanelType::Stat,
+    )
+}
+fn get_panel_class_sizes() -> Panel {
+    Panel::from_labeled_hist(
+        &CLASS_SIZES,
+        "Class Sizes",
+        "Size of the classes in bytes, labeled by type (sierra, casm, deprecated casm)",
+    )
+    .with_unit(Unit::MB)
 }
 
 pub(crate) fn get_compile_to_casm_row() -> Row {
-    Row::new("Compile sierra to casm", vec![get_panel_compilation_duration()])
+    Row::new(
+        "Class Manager",
+        vec![get_panel_compilation_duration(), get_panel_n_classes(), get_panel_class_sizes()],
+    )
 }

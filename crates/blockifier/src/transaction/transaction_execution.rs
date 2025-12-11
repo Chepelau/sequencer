@@ -6,6 +6,7 @@ use starknet_api::executable_transaction::{
     DeployAccountTransaction,
     InvokeTransaction,
     L1HandlerTransaction,
+    Transaction as StarknetApiExecutableTransaction,
 };
 use starknet_api::transaction::fields::Fee;
 use starknet_api::transaction::{
@@ -71,7 +72,6 @@ impl Transaction {
         }
     }
 
-    #[allow(clippy::result_large_err)]
     pub fn from_api(
         tx: StarknetApiTransaction,
         tx_hash: TransactionHash,
@@ -119,6 +119,15 @@ impl Transaction {
     }
 }
 
+impl From<Transaction> for StarknetApiExecutableTransaction {
+    fn from(tx: Transaction) -> Self {
+        match tx {
+            Transaction::Account(account_tx) => Self::Account(account_tx.tx),
+            Transaction::L1Handler(l1_handler_tx) => Self::L1Handler(l1_handler_tx),
+        }
+    }
+}
+
 impl TransactionInfoCreator for Transaction {
     fn create_tx_info(&self) -> TransactionInfo {
         match self {
@@ -129,7 +138,6 @@ impl TransactionInfoCreator for Transaction {
 }
 
 impl<U: UpdatableState> ExecutableTransaction<U> for Transaction {
-    #[allow(clippy::result_large_err)]
     fn execute_raw(
         &self,
         state: &mut TransactionalState<'_, U>,
@@ -149,6 +157,7 @@ impl<U: UpdatableState> ExecutableTransaction<U> for Transaction {
         // Check if the transaction is too large to fit any block.
         // TODO(Yoni, 1/8/2024): consider caching these two.
         let tx_execution_summary = tx_execution_info.summarize(&block_context.versioned_constants);
+        let tx_builtin_counters = tx_execution_info.summarize_builtins();
         let mut tx_state_changes_keys = state.to_state_diff()?.state_maps.keys();
         tx_state_changes_keys.update_sequencer_key_in_storage(
             &block_context.to_tx_context(self),
@@ -158,6 +167,7 @@ impl<U: UpdatableState> ExecutableTransaction<U> for Transaction {
         verify_tx_weights_within_max_capacity(
             state,
             &tx_execution_summary,
+            &tx_builtin_counters,
             &tx_execution_info.receipt.resources,
             &tx_state_changes_keys,
             &block_context.bouncer_config,

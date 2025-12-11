@@ -1,3 +1,5 @@
+use apollo_gateway_config::compiler_version::VersionId;
+use apollo_gateway_config::config::StatelessTransactionValidatorConfig;
 use starknet_api::data_availability::DataAvailabilityMode;
 use starknet_api::rpc_transaction::{
     RpcDeclareTransaction,
@@ -10,13 +12,16 @@ use starknet_api::transaction::fields::{Fee, Tip, ValidResourceBounds};
 use starknet_types_core::felt::Felt;
 use tracing::{instrument, Level};
 
-use crate::compiler_version::VersionId;
-use crate::config::StatelessTransactionValidatorConfig;
 use crate::errors::{StatelessTransactionValidatorError, StatelessTransactionValidatorResult};
 
 #[cfg(test)]
 #[path = "stateless_transaction_validator_test.rs"]
 mod stateless_transaction_validator_test;
+
+#[cfg_attr(test, mockall::automock)]
+pub trait StatelessTransactionValidatorTrait: Send + Sync {
+    fn validate(&self, tx: &RpcTransaction) -> StatelessTransactionValidatorResult<()>;
+}
 
 #[derive(Clone)]
 pub struct StatelessTransactionValidator {
@@ -24,7 +29,7 @@ pub struct StatelessTransactionValidator {
 }
 
 impl StatelessTransactionValidator {
-    #[instrument(skip(self), level = Level::INFO, err)]
+    #[instrument(skip(self), level = Level::INFO)]
     pub fn validate(&self, tx: &RpcTransaction) -> StatelessTransactionValidatorResult<()> {
         // TODO(Arni, 1/5/2024): Add a mechanism that validate the sender address is not blocked.
         // TODO(Arni, 1/5/2024): Validate transaction version.
@@ -36,6 +41,7 @@ impl StatelessTransactionValidator {
         self.validate_tx_size(tx)?;
         self.validate_nonce_data_availability_mode(tx)?;
         self.validate_fee_data_availability_mode(tx)?;
+        self.validate_proof(tx)?;
 
         if let RpcTransaction::Declare(declare_tx) = tx {
             self.validate_declare_tx(declare_tx)?;
@@ -47,7 +53,7 @@ impl StatelessTransactionValidator {
         &self,
         tx: &RpcTransaction,
     ) -> StatelessTransactionValidatorResult<()> {
-        if !self.config.validate_non_zero_resource_bounds {
+        if !self.config.validate_resource_bounds {
             return Ok(());
         }
 
@@ -62,6 +68,15 @@ impl StatelessTransactionValidator {
             return Err(StatelessTransactionValidatorError::MaxGasPriceTooLow {
                 gas_price: resource_bounds.l2_gas.max_price_per_unit,
                 min_gas_price: self.config.min_gas_price,
+            });
+        }
+
+        // TODO(Arni): Consider adding a validation for max_l2_gas_amount for declare.
+        if let RpcTransaction::Declare(_) = tx {
+        } else if resource_bounds.l2_gas.max_amount.0 > self.config.max_l2_gas_amount {
+            return Err(StatelessTransactionValidatorError::MaxGasAmountTooHigh {
+                gas_amount: resource_bounds.l2_gas.max_amount,
+                max_gas_amount: self.config.max_l2_gas_amount,
             });
         }
 
@@ -204,6 +219,11 @@ impl StatelessTransactionValidator {
         Ok(())
     }
 
+    fn validate_proof(&self, _: &RpcTransaction) -> StatelessTransactionValidatorResult<()> {
+        // TODO(Einat): Implement proof validation.
+        Ok(())
+    }
+
     fn validate_declare_tx(
         &self,
         declare_tx: &RpcDeclareTransaction,
@@ -279,5 +299,11 @@ impl StatelessTransactionValidator {
         }
 
         Err(StatelessTransactionValidatorError::EntryPointsNotUniquelySorted)
+    }
+}
+
+impl StatelessTransactionValidatorTrait for StatelessTransactionValidator {
+    fn validate(&self, tx: &RpcTransaction) -> StatelessTransactionValidatorResult<()> {
+        Self::validate(self, tx)
     }
 }

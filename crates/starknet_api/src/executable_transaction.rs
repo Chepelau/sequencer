@@ -10,6 +10,7 @@ use starknet_types_core::felt::Felt;
 use strum_macros::EnumIter;
 use thiserror::Error;
 
+use crate::contract_class::compiled_class_hash::{HashVersion, HashableCompiledClass};
 use crate::contract_class::{ClassInfo, ContractClass};
 use crate::core::{ChainId, ClassHash, CompiledClassHash, ContractAddress, Nonce};
 use crate::data_availability::DataAvailabilityMode;
@@ -29,7 +30,7 @@ use crate::transaction::{
     TransactionHasher,
     TransactionVersion,
 };
-use crate::StarknetApiError;
+use crate::{CasmHashMismatch, StarknetApiError};
 
 macro_rules! implement_inner_tx_getter_calls {
     ($(($field:ident, $field_type:ty)),*) => {
@@ -200,6 +201,26 @@ impl DeclareTransaction {
         &versioned_casm.0
     }
 
+    /// Verifies that the compiled class hash field in the declare tx,
+    /// is compiled_class_hash_v2 of the compiled contract.
+    pub fn check_compile_class_hash_v2_declaration(&self) -> Result<(), StarknetApiError> {
+        let compiled_class = &self.class_info.contract_class;
+        let compiled_class_hash_v2 = match &compiled_class {
+            ContractClass::V0(_) => return Ok(()),
+            ContractClass::V1((casm, _)) => casm.hash(&HashVersion::V2),
+        };
+        let compiled_class_hash = self.compiled_class_hash();
+        if compiled_class_hash_v2 != compiled_class_hash {
+            let err_var = CasmHashMismatch {
+                hash: self.class_hash(),
+                actual: compiled_class_hash,
+                expected: compiled_class_hash_v2,
+            };
+            return Err(StarknetApiError::DeclareTransactionCasmHashMissMatch(Box::new(err_var)));
+        }
+        Ok(())
+    }
+
     // Returns whether the declare transaction is for bootstrapping.
     // In this case, no account-related actions should be made besides the declaration.
     pub fn is_bootstrap_declare(&self, charge_fee: bool) -> bool {
@@ -223,8 +244,8 @@ impl DeclareTransaction {
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum ValidateCompiledClassHashError {
     #[error(
-        "Computed compiled class hash: {computed_class_hash} does not match the given value: \
-         {supplied_class_hash}."
+        "Computed compiled class hash: {:#x} does not match the given value: {:#x}.",
+        computed_class_hash.0, supplied_class_hash.0
     )]
     CompiledClassHashMismatch {
         computed_class_hash: CompiledClassHash,

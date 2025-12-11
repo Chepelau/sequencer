@@ -24,7 +24,7 @@ pub type ContractClassMapping = HashMap<ClassHash, RunnableCompiledClass>;
 ///
 /// Writer functionality is builtin, whereas Reader functionality is injected through
 /// initialization.
-#[cfg_attr(any(test, feature = "reexecution"), derive(Clone))]
+#[cfg_attr(any(test, feature = "reexecution", feature = "testing"), derive(Clone))]
 #[derive(Debug)]
 pub struct CachedState<S: StateReader> {
     pub state: S,
@@ -213,6 +213,14 @@ impl<S: StateReader> StateReader for CachedState<S> {
             .unwrap_or_else(|| panic!("Cannot retrieve '{class_hash:?}' from the cache."));
         Ok(*compiled_class_hash)
     }
+
+    fn get_compiled_class_hash_v2(
+        &self,
+        class_hash: ClassHash,
+        compiled_class: &RunnableCompiledClass,
+    ) -> StateResult<CompiledClassHash> {
+        self.state.get_compiled_class_hash_v2(class_hash, compiled_class)
+    }
 }
 
 impl<S: StateReader> State for CachedState<S> {
@@ -368,6 +376,16 @@ impl StateMaps {
             compiled_class_hash_keys: self.compiled_class_hashes.keys().cloned().collect(),
         }
     }
+
+    /// Returns the set of keys that aliases were potentially allocated for.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn alias_keys(&self) -> HashSet<crate::state::stateful_compression::AliasKey> {
+        let mut keys = HashSet::from_iter(
+            self.get_contract_addresses().into_iter().map(|address| StorageKey(address.0)),
+        );
+        keys.extend(self.storage.keys().map(|(_address, storage_key)| *storage_key));
+        keys
+    }
 }
 
 /// Caches read and write requests.
@@ -429,6 +447,13 @@ impl StateCache {
             merged_state_changes.allocated_keys.0.extend(&state_change.allocated_keys.0);
         }
         merged_state_changes
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn extended_state_diff(&self) -> StateMaps {
+        let mut reads = self.initial_reads.clone();
+        reads.extend(&self.writes);
+        reads
     }
 
     fn declare_contract(&mut self, class_hash: ClassHash) {
@@ -560,6 +585,14 @@ impl<S: StateReader + ?Sized> StateReader for MutRefState<'_, S> {
     fn get_compiled_class_hash(&self, class_hash: ClassHash) -> StateResult<CompiledClassHash> {
         self.0.get_compiled_class_hash(class_hash)
     }
+
+    fn get_compiled_class_hash_v2(
+        &self,
+        class_hash: ClassHash,
+        compiled_class: &RunnableCompiledClass,
+    ) -> StateResult<CompiledClassHash> {
+        self.0.get_compiled_class_hash_v2(class_hash, compiled_class)
+    }
 }
 
 pub type TransactionalState<'a, U> = CachedState<MutRefState<'a, U>>;
@@ -621,13 +654,13 @@ impl From<StateMaps> for CommitmentStateDiff {
 #[cfg_attr(any(feature = "testing", test), derive(Clone))]
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct StateChangesKeys {
-    nonce_keys: HashSet<ContractAddress>,
-    class_hash_keys: HashSet<ContractAddress>,
-    storage_keys: HashSet<StorageEntry>,
-    compiled_class_hash_keys: HashSet<ClassHash>,
+    pub(crate) nonce_keys: HashSet<ContractAddress>,
+    pub(crate) class_hash_keys: HashSet<ContractAddress>,
+    pub(crate) storage_keys: HashSet<StorageEntry>,
+    pub(crate) compiled_class_hash_keys: HashSet<ClassHash>,
     // Note: this field may not be consistent with the above keys; specifically, it may be
     // strictlly contained in them. For example, as a result of a `difference` operation.
-    modified_contracts: HashSet<ContractAddress>,
+    pub(crate) modified_contracts: HashSet<ContractAddress>,
 }
 
 impl StateChangesKeys {

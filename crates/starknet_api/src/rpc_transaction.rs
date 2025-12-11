@@ -4,9 +4,9 @@ mod rpc_transaction_test;
 
 use std::collections::HashMap;
 
+use apollo_sizeof::SizeOf;
 use cairo_lang_starknet_classes::contract_class::ContractEntryPoints as CairoLangContractEntryPoints;
 use serde::{Deserialize, Serialize};
-use size_of::SizeOf;
 use strum::EnumVariantNames;
 use strum_macros::{EnumDiscriminants, EnumIter, IntoStaticStr};
 
@@ -20,6 +20,7 @@ use crate::transaction::fields::{
     Calldata,
     ContractAddressSalt,
     PaymasterData,
+    ProofFacts,
     Tip,
     TransactionSignature,
     ValidResourceBounds,
@@ -216,6 +217,7 @@ impl InternalRpcTransaction {
     implement_internal_getters_for_internal_rpc!(
         (nonce, Nonce),
         (resource_bounds, AllResourceBounds),
+        (signature, TransactionSignature),
         (tip, Tip),
     );
 
@@ -230,8 +232,7 @@ impl InternalRpcTransaction {
     }
 
     pub fn total_bytes(&self) -> u64 {
-        self.size_of()
-            .total_bytes()
+        self.size_bytes()
             .try_into()
             .expect("The transaction size in bytes should fit in a u64 value.")
     }
@@ -573,6 +574,7 @@ pub struct RpcInvokeTransactionV3 {
     pub account_deployment_data: AccountDeploymentData,
     pub nonce_data_availability_mode: DataAvailabilityMode,
     pub fee_data_availability_mode: DataAvailabilityMode,
+    // TODO(AvivG): Add proof facts.
 }
 
 impl InvokeTransactionV3Trait for RpcInvokeTransactionV3 {
@@ -628,6 +630,8 @@ impl From<RpcInvokeTransactionV3> for InvokeTransactionV3 {
             fee_data_availability_mode: tx.fee_data_availability_mode,
             paymaster_data: tx.paymaster_data,
             account_deployment_data: tx.account_deployment_data,
+            // TODO(AvivG): Get from RpcInvokeTransactionV3 once supported.
+            proof_facts: ProofFacts::default(),
         }
     }
 }

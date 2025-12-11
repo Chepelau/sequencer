@@ -1,115 +1,146 @@
 use apollo_gateway::metrics::{
+    GATEWAY_ADD_TX_FAILURE,
     GATEWAY_ADD_TX_LATENCY,
     GATEWAY_TRANSACTIONS_FAILED,
     GATEWAY_TRANSACTIONS_RECEIVED,
     GATEWAY_TRANSACTIONS_SENT_TO_MEMPOOL,
+    GATEWAY_VALIDATE_STATEFUL_TX_STORAGE_OPERATIONS,
+    GATEWAY_VALIDATE_STATEFUL_TX_STORAGE_TIME,
     GATEWAY_VALIDATE_TX_LATENCY,
+    LABEL_NAME_ADD_TX_FAILURE_REASON,
     LABEL_NAME_SOURCE,
     LABEL_NAME_TX_TYPE as GATEWAY_LABEL_NAME_TX_TYPE,
 };
-use apollo_infra::metrics::{
-    GATEWAY_LOCAL_MSGS_PROCESSED,
-    GATEWAY_LOCAL_MSGS_RECEIVED,
-    GATEWAY_LOCAL_QUEUE_DEPTH,
-    GATEWAY_REMOTE_CLIENT_SEND_ATTEMPTS,
-    GATEWAY_REMOTE_MSGS_PROCESSED,
-    GATEWAY_REMOTE_MSGS_RECEIVED,
-    GATEWAY_REMOTE_VALID_MSGS_RECEIVED,
-};
+use apollo_metrics::metrics::MetricQueryName;
 
-use crate::dashboard::{Panel, PanelType, Row};
+use crate::dashboard::{Panel, PanelType, Row, Unit};
+use crate::query_builder::{sum_by_label, DisplayMethod, RANGE_DURATION};
 
 fn get_panel_gateway_transactions_received_by_type() -> Panel {
     Panel::new(
-        GATEWAY_TRANSACTIONS_RECEIVED.get_name(),
-        GATEWAY_TRANSACTIONS_RECEIVED.get_description(),
-        vec![format!(
-            "sum  by ({}) ({}) ",
+        "Transactions Received by Type",
+        "The number of transactions received by type (over the selected time range)",
+        sum_by_label(
+            &GATEWAY_TRANSACTIONS_RECEIVED,
             GATEWAY_LABEL_NAME_TX_TYPE,
-            GATEWAY_TRANSACTIONS_RECEIVED.get_name_with_filter()
-        )],
+            DisplayMethod::Increase(RANGE_DURATION),
+            false,
+        ),
         PanelType::Stat,
     )
-}
-
-fn get_panel_gateway_local_msgs_received() -> Panel {
-    Panel::from_counter(GATEWAY_LOCAL_MSGS_RECEIVED, PanelType::TimeSeries)
-}
-fn get_panel_gateway_local_msgs_processed() -> Panel {
-    Panel::from_counter(GATEWAY_LOCAL_MSGS_PROCESSED, PanelType::TimeSeries)
-}
-fn get_panel_gateway_remote_msgs_received() -> Panel {
-    Panel::from_counter(GATEWAY_REMOTE_MSGS_RECEIVED, PanelType::TimeSeries)
-}
-fn get_panel_gateway_remote_valid_msgs_received() -> Panel {
-    Panel::from_counter(GATEWAY_REMOTE_VALID_MSGS_RECEIVED, PanelType::TimeSeries)
-}
-fn get_panel_gateway_remote_msgs_processed() -> Panel {
-    Panel::from_counter(GATEWAY_REMOTE_MSGS_PROCESSED, PanelType::TimeSeries)
-}
-fn get_panel_gateway_local_queue_depth() -> Panel {
-    Panel::from_gauge(GATEWAY_LOCAL_QUEUE_DEPTH, PanelType::TimeSeries)
-}
-fn get_panel_gateway_remote_client_send_attempts() -> Panel {
-    Panel::from_hist(GATEWAY_REMOTE_CLIENT_SEND_ATTEMPTS, PanelType::TimeSeries)
+    .with_log_query("\"Processing tx\"")
 }
 
 fn get_panel_gateway_transactions_received_by_source() -> Panel {
     Panel::new(
-        GATEWAY_TRANSACTIONS_RECEIVED.get_name(),
-        GATEWAY_TRANSACTIONS_RECEIVED.get_description(),
-        vec![format!(
-            "sum  by ({}) ({}) ",
+        "Transactions Received by Source",
+        "The number of transactions received by source (over the selected time range)",
+        sum_by_label(
+            &GATEWAY_TRANSACTIONS_RECEIVED,
             LABEL_NAME_SOURCE,
-            GATEWAY_TRANSACTIONS_RECEIVED.get_name_with_filter()
-        )],
+            DisplayMethod::Increase(RANGE_DURATION),
+            false,
+        ),
         PanelType::Stat,
     )
+    .with_log_query("\"Processing tx\" AND \"is_p2p=\"")
 }
 
 fn get_panel_gateway_transactions_received_rate() -> Panel {
     Panel::new(
-        "gateway_transactions_received_rate (TPS)",
-        "The rate of transactions received by the gateway during the last 20 minutes",
-        vec![format!(
-            "sum(rate({}[20m])) or vector(0)",
+        "Gateway Transactions Received Rate (TPS)",
+        "The rate of transactions received by the gateway (1m window)",
+        format!(
+            "sum(rate({}[1m])) or vector(0)",
             GATEWAY_TRANSACTIONS_RECEIVED.get_name_with_filter()
-        )],
+        ),
         PanelType::TimeSeries,
     )
 }
 
 fn get_panel_gateway_add_tx_latency() -> Panel {
-    Panel::from_hist(GATEWAY_ADD_TX_LATENCY, PanelType::TimeSeries)
+    Panel::from_hist(
+        &GATEWAY_ADD_TX_LATENCY,
+        "Add Tx Latency",
+        "The time it takes the gateway to add a transaction to the mempool",
+    )
+    .with_unit(Unit::Seconds)
 }
 
 fn get_panel_gateway_validate_tx_latency() -> Panel {
-    Panel::from_hist(GATEWAY_VALIDATE_TX_LATENCY, PanelType::TimeSeries)
+    Panel::from_hist(
+        &GATEWAY_VALIDATE_TX_LATENCY,
+        "Validate Tx Latency",
+        "The time it takes to validate a transaction",
+    )
+    .with_unit(Unit::Seconds)
 }
 
-fn get_panel_gateway_transactions_failed() -> Panel {
+pub(crate) fn get_panel_gateway_add_tx_failure_by_reason() -> Panel {
     Panel::new(
-        GATEWAY_TRANSACTIONS_FAILED.get_name(),
-        GATEWAY_TRANSACTIONS_FAILED.get_description(),
-        vec![format!(
-            "sum  by ({}) ({})",
-            GATEWAY_LABEL_NAME_TX_TYPE,
-            GATEWAY_TRANSACTIONS_FAILED.get_name_with_filter()
-        )],
+        "Transactions Failed by Reason",
+        "The number of transactions failed by reason (over the selected time range)",
+        sum_by_label(
+            &GATEWAY_ADD_TX_FAILURE,
+            LABEL_NAME_ADD_TX_FAILURE_REASON,
+            DisplayMethod::Increase(RANGE_DURATION),
+            true,
+        ),
         PanelType::Stat,
     )
 }
 
+fn get_panel_gateway_transactions_failure_rate() -> Panel {
+    let sum_failed = sum_by_label(
+        &GATEWAY_TRANSACTIONS_FAILED,
+        GATEWAY_LABEL_NAME_TX_TYPE,
+        DisplayMethod::Increase(RANGE_DURATION),
+        false,
+    );
+    let sum_received = sum_by_label(
+        &GATEWAY_TRANSACTIONS_RECEIVED,
+        GATEWAY_LABEL_NAME_TX_TYPE,
+        DisplayMethod::Increase(RANGE_DURATION),
+        false,
+    );
+    Panel::new(
+        "Transaction Failure Rate by Type",
+        "The rate of failed transactions vs received transactions by type (over the selected time \
+         range)",
+        format!("({sum_failed} / {sum_received})",),
+        PanelType::Stat,
+    )
+    .with_unit(Unit::PercentUnit)
+}
+
 fn get_panel_gateway_transactions_sent_to_mempool() -> Panel {
     Panel::new(
-        GATEWAY_TRANSACTIONS_SENT_TO_MEMPOOL.get_name(),
-        GATEWAY_TRANSACTIONS_SENT_TO_MEMPOOL.get_description(),
-        vec![format!(
-            "sum  by ({}) ({})",
+        "Transactions Sent to Mempool by Type",
+        "The number of transactions sent to mempool by type (over the selected time range)",
+        sum_by_label(
+            &GATEWAY_TRANSACTIONS_SENT_TO_MEMPOOL,
             GATEWAY_LABEL_NAME_TX_TYPE,
-            GATEWAY_TRANSACTIONS_SENT_TO_MEMPOOL.get_name_with_filter()
-        )],
+            DisplayMethod::Increase(RANGE_DURATION),
+            false,
+        ),
         PanelType::Stat,
+    )
+}
+
+fn get_panel_gateway_validate_stateful_tx_storage_time() -> Panel {
+    Panel::from_hist(
+        &GATEWAY_VALIDATE_STATEFUL_TX_STORAGE_TIME,
+        "Gateway Validate Stateful Tx Storage Access Time",
+        "Total time spent in storage operations during stateful tx validation",
+    )
+    .with_unit(Unit::Seconds)
+}
+
+fn get_panel_gateway_validate_stateful_tx_storage_operations() -> Panel {
+    Panel::from_hist(
+        &GATEWAY_VALIDATE_STATEFUL_TX_STORAGE_OPERATIONS,
+        "Gateway Validate Stateful Tx Storage Operations",
+        "Total number of storage operations during stateful tx validation",
     )
 }
 
@@ -117,28 +148,16 @@ pub(crate) fn get_gateway_row() -> Row {
     Row::new(
         "Gateway",
         vec![
-            get_panel_gateway_transactions_received_by_type(),
-            get_panel_gateway_transactions_received_by_source(),
             get_panel_gateway_transactions_received_rate(),
             get_panel_gateway_add_tx_latency(),
             get_panel_gateway_validate_tx_latency(),
-            get_panel_gateway_transactions_failed(),
+            get_panel_gateway_transactions_received_by_source(),
+            get_panel_gateway_transactions_received_by_type(),
+            get_panel_gateway_transactions_failure_rate(),
+            get_panel_gateway_add_tx_failure_by_reason(),
             get_panel_gateway_transactions_sent_to_mempool(),
-        ],
-    )
-}
-
-pub(crate) fn get_gateway_infra_row() -> Row {
-    Row::new(
-        "Gateway Infra",
-        vec![
-            get_panel_gateway_local_msgs_received(),
-            get_panel_gateway_local_msgs_processed(),
-            get_panel_gateway_local_queue_depth(),
-            get_panel_gateway_remote_msgs_received(),
-            get_panel_gateway_remote_valid_msgs_received(),
-            get_panel_gateway_remote_msgs_processed(),
-            get_panel_gateway_remote_client_send_attempts(),
+            get_panel_gateway_validate_stateful_tx_storage_time(),
+            get_panel_gateway_validate_stateful_tx_storage_operations(),
         ],
     )
 }

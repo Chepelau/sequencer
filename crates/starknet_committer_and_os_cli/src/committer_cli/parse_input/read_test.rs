@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use assert_matches::assert_matches;
 use pretty_assertions::assert_eq;
 use starknet_api::core::{ClassHash, ContractAddress, Nonce};
+use starknet_api::hash::HashOutput;
 use starknet_committer::block_committer::input::{
     ConfigImpl,
     Input,
@@ -11,13 +12,14 @@ use starknet_committer::block_committer::input::{
     StateDiff,
 };
 use starknet_committer::patricia_merkle_tree::types::CompiledClassHash;
-use starknet_patricia::hash::hash_trait::HashOutput;
 use starknet_patricia_storage::errors::DeserializationError;
-use starknet_patricia_storage::storage_trait::{DbKey, DbValue};
+use starknet_patricia_storage::map_storage::MapStorage;
+use starknet_patricia_storage::storage_trait::{DbHashMap, DbKey, DbValue};
 use starknet_types_core::felt::Felt;
 use tracing::level_filters::LevelFilter;
 
 use super::parse_input;
+use crate::committer_cli::parse_input::cast::CommitterInputImpl;
 
 #[test]
 fn test_simple_input_parsing() {
@@ -88,7 +90,7 @@ fn test_simple_input_parsing() {
 ]
 
 "#;
-    let expected_storage = HashMap::from([
+    let expected_storage = DbHashMap::from([
         (DbKey([14, 6, 78, 90].to_vec()), DbValue([245, 90, 0, 0, 1].to_vec())),
         (DbKey([14, 6, 43, 90].to_vec()), DbValue([9, 0, 0, 0, 1].to_vec())),
     ]);
@@ -174,20 +176,28 @@ fn test_simple_input_parsing() {
         .unwrap(),
         HashMap::from([
             (
-                StarknetStorageKey(Felt::from_bytes_be_slice(&[
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 1, 0, 89, 0,
-                    0, 0, 0, 0, 0, 0,
-                ])),
+                StarknetStorageKey(
+                    Felt::from_bytes_be_slice(&[
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 1, 0, 89,
+                        0, 0, 0, 0, 0, 0, 0,
+                    ])
+                    .try_into()
+                    .unwrap(),
+                ),
                 StarknetStorageValue(Felt::from_bytes_be_slice(&[
                     0, 0, 0, 0, 0, 14, 0, 0, 0, 45, 77, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                     0, 0, 0, 0, 0, 0, 0,
                 ])),
             ),
             (
-                StarknetStorageKey(Felt::from_bytes_be_slice(&[
-                    0, 0, 0, 0, 0, 98, 0, 0, 0, 156, 0, 0, 0, 0, 0, 11, 5, 0, 0, 0, 0, 0, 1, 0, 89,
-                    0, 0, 0, 0, 0, 0, 0,
-                ])),
+                StarknetStorageKey(
+                    Felt::from_bytes_be_slice(&[
+                        0, 0, 0, 0, 0, 98, 0, 0, 0, 156, 0, 0, 0, 0, 0, 11, 5, 0, 0, 0, 0, 0, 1, 0,
+                        89, 0, 0, 0, 0, 0, 0, 0,
+                    ])
+                    .try_into()
+                    .unwrap(),
+                ),
                 StarknetStorageValue(Felt::from_bytes_be_slice(&[
                     0, 0, 0, 0, 0, 0, 0, 0, 0, 45, 77, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                     0, 0, 0, 0, 0, 0,
@@ -199,7 +209,6 @@ fn test_simple_input_parsing() {
     let expected_contracts_trie_root_hash = HashOutput(Felt::from(19_u128));
     let expected_classes_trie_root_hash = HashOutput(Felt::from(256_u128));
     let expected_input = Input {
-        storage: expected_storage,
         state_diff: StateDiff {
             address_to_class_hash: expected_address_to_class_hash,
             address_to_nonce: expected_address_to_nonce,
@@ -210,7 +219,10 @@ fn test_simple_input_parsing() {
         classes_trie_root_hash: expected_classes_trie_root_hash,
         config: ConfigImpl::new(true, LevelFilter::DEBUG),
     };
-    assert_eq!(parse_input(input).unwrap(), expected_input);
+    assert_eq!(
+        parse_input(input).unwrap(),
+        CommitterInputImpl { input: expected_input, storage: MapStorage(expected_storage) }
+    );
 }
 
 #[test]

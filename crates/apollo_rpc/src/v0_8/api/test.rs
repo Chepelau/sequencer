@@ -87,7 +87,6 @@ use starknet_api::block::{
 use starknet_api::contract_class::SierraVersion;
 use starknet_api::core::{
     ClassHash,
-    CompiledClassHash,
     ContractAddress,
     GlobalRoot,
     Nonce,
@@ -113,7 +112,7 @@ use starknet_api::transaction::{
     TransactionOffsetInBlock,
     TransactionOutput as StarknetApiTransactionOutput,
 };
-use starknet_api::{class_hash, contract_address, felt, storage_key, tx_hash};
+use starknet_api::{class_hash, compiled_class_hash, contract_address, felt, storage_key, tx_hash};
 use starknet_types_core::felt::Felt;
 
 use super::super::api::EventsChunk;
@@ -1511,7 +1510,7 @@ async fn get_class_at() {
     let (mut diff, classes, deprecated_classes) =
         starknet_api::state::ThinStateDiff::from_state_diff(get_test_state_diff());
     // Add a deployed contract with Cairo 1 class.
-    let new_class_hash = diff.declared_classes.get_index(0).unwrap().0;
+    let new_class_hash = diff.class_hash_to_compiled_class_hash.get_index(0).unwrap().0;
     diff.deployed_contracts.insert(contract_address!("0x2"), *new_class_hash);
     storage_writer
         .begin_rw_txn()
@@ -1591,7 +1590,7 @@ async fn get_class_at() {
     assert_eq!(res, expected_contract_class);
 
     // New Class
-    let class_hash = diff.declared_classes.get_index(0).unwrap().0;
+    let class_hash = diff.class_hash_to_compiled_class_hash.get_index(0).unwrap().0;
     let expected_contract_class = classes.get(class_hash).unwrap().clone().into();
     assert_eq!(diff.deployed_contracts.get_index(1).unwrap().1, class_hash);
     let address = diff.deployed_contracts.get_index(1).unwrap().0;
@@ -2600,6 +2599,7 @@ async fn get_state_update() {
                     ClientDeclaredClassHashEntry { class_hash, compiled_class_hash }
                 })
                 .collect(),
+            migrated_compiled_classes: vec![],
             old_declared_contracts: expected_state_diff.deprecated_declared_classes,
             nonces: IndexMap::from_iter(
                 expected_state_diff
@@ -3637,7 +3637,7 @@ async fn validate_block(header: &BlockHeader, server_address: SocketAddr, schema
     let res = send_request(
         server_address,
         "starknet_getBlockWithTxHashes",
-        format!(r#"{{"block_hash": "0x{}"}}"#, hex::encode(header.block_hash.0.to_bytes_be()))
+        format!(r#"{{"block_hash": "0x{}"}}"#, hex::encode(header.block_hash.to_bytes_be()))
             .as_str(),
         VERSION.name,
     )
@@ -3786,9 +3786,9 @@ async fn get_compiled_class() {
         .append_state_diff(
             BlockNumber(0),
             starknet_api::state::ThinStateDiff {
-                declared_classes: IndexMap::from([(
+                class_hash_to_compiled_class_hash: IndexMap::from([(
                     cairo1_class_hash,
-                    CompiledClassHash::default(),
+                    compiled_class_hash!(1_u8),
                 )]),
                 deprecated_declared_classes: vec![cairo0_class_hash],
                 ..Default::default()
@@ -3815,7 +3815,7 @@ async fn get_compiled_class() {
         res,
         (
             CompiledContractClass::V1(cairo1_contract_class),
-            SierraVersion::extract_from_program(&sierra_contract_class.sierra_program).unwrap()
+            sierra_contract_class.get_sierra_version().unwrap()
         )
     );
 
@@ -4171,9 +4171,8 @@ fn spec_api_methods_coverage() {
     // Methods in the spec are a subset of the implemented methods.
     assert!(
         method_names_in_spec.iter().all(|method| implemented_method_names.contains(method)),
-        "Implemented methods: {:#?}, methods in spec: {:#?}",
-        implemented_method_names,
-        method_names_in_spec
+        "Implemented methods: {implemented_method_names:#?}, methods in spec: \
+         {method_names_in_spec:#?}"
     );
 }
 

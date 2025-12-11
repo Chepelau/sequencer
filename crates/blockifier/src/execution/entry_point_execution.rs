@@ -95,7 +95,6 @@ impl ExecutionRunnerMode {
 }
 
 /// Executes a specific call to a contract entry point and returns its output.
-#[allow(clippy::result_large_err)]
 pub fn execute_entry_point_call(
     call: ExecutableCallEntryPoint,
     compiled_class: CompiledClassV1,
@@ -298,7 +297,6 @@ pub fn prepare_call_arguments(
 }
 
 /// Runs the runner from the given PC.
-#[allow(clippy::result_large_err)]
 pub fn run_entry_point<HP: HintProcessor>(
     runner: &mut CairoRunner,
     hint_processor: &mut HP,
@@ -309,25 +307,26 @@ pub fn run_entry_point<HP: HintProcessor>(
     // Note that we run `verify_secure_runner` manually after filling the holes in the rc96 segment.
     let verify_secure = false;
     let args: Vec<&CairoArg> = args.iter().collect();
-    runner.run_from_entrypoint(
-        entry_point.pc(),
-        &args,
-        verify_secure,
-        Some(program_segment_size),
-        hint_processor,
-    )?;
+    runner
+        .run_from_entrypoint(
+            entry_point.pc(),
+            &args,
+            verify_secure,
+            Some(program_segment_size),
+            hint_processor,
+        )
+        .map_err(Box::new)?;
 
     maybe_fill_holes(entry_point, runner)?;
 
     verify_secure_runner(runner, false, Some(program_segment_size))
-        .map_err(CairoRunError::VirtualMachine)?;
+        .map_err(|error| Box::new(CairoRunError::VirtualMachine(error)))?;
 
     Ok(())
 }
 
 /// Fills the holes after running the entry point.
 /// Currently only fills the holes in the rc96 segment.
-#[allow(clippy::result_large_err)]
 fn maybe_fill_holes(
     entry_point: EntryPointV1,
     runner: &mut CairoRunner,
@@ -354,14 +353,16 @@ fn maybe_fill_holes(
     // So the last implicit is at offset 5 + 1.
     const IMPLICITS_OFFSET: usize = 6;
     let rc_96_stop_ptr = (runner.vm.get_ap() - (IMPLICITS_OFFSET + rc96_offset))
-        .map_err(|err| CairoRunError::VirtualMachine(VirtualMachineError::Math(err)))?;
+        .map_err(|err| Box::new(CairoRunError::VirtualMachine(VirtualMachineError::Math(err))))?;
 
     let rc96_base = rc96_builtin_runner.base();
     let rc96_segment: isize =
         rc96_base.try_into().expect("Builtin segment index must fit in isize.");
 
-    let Relocatable { segment_index: rc96_stop_segment, offset: stop_offset } =
-        runner.vm.get_relocatable(rc_96_stop_ptr).map_err(CairoRunError::MemoryError)?;
+    let Relocatable { segment_index: rc96_stop_segment, offset: stop_offset } = runner
+        .vm
+        .get_relocatable(rc_96_stop_ptr)
+        .map_err(|error| Box::new(CairoRunError::MemoryError(error)))?;
     assert_eq!(rc96_stop_segment, rc96_segment);
 
     // Update `segment_used_sizes` to include the holes.
@@ -425,8 +426,8 @@ pub fn extract_vm_resources(
             .map_or_else(|| {}, |val| *val *= SEGMENT_ARENA_BUILTIN_SIZE);
     }
     // Take into account the syscall resources of the current call.
-    vm_resources_without_inner_calls +=
-        &versioned_constants.get_additional_os_syscall_resources(&syscall_handler.syscalls_usage);
+    vm_resources_without_inner_calls += &versioned_constants
+        .get_additional_os_syscall_resources(&syscall_handler.base.syscalls_usage);
     Ok(vm_resources_without_inner_calls)
 }
 
@@ -482,10 +483,11 @@ pub fn finalize_execution(
         resources: vm_resources,
         storage_access_tracker: syscall_handler_base.storage_access_tracker,
         builtin_counters: vm_resources_without_inner_calls.prover_builtins(),
+        syscalls_usage: syscall_handler_base.syscalls_usage,
     })
 }
 
-fn get_call_result(
+pub fn get_call_result(
     runner: &CairoRunner,
     syscall_handler: &SyscallHintProcessor<'_>,
     tracked_resource: &TrackedResource,

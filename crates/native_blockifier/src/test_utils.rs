@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use starknet_api::core::{ClassHash, CompiledClassHash};
+
 use crate::errors::NativeBlockifierResult;
 use crate::storage::Storage;
 
@@ -13,22 +15,18 @@ impl Storage for MockStorage {
         Ok(self.block_number_to_class_hash.get(&block_number).cloned())
     }
 
-    #[allow(clippy::result_large_err)]
     fn get_state_marker(&self) -> NativeBlockifierResult<u64> {
         todo!()
     }
 
-    #[allow(clippy::result_large_err)]
     fn get_header_marker(&self) -> NativeBlockifierResult<u64> {
         todo!()
     }
 
-    #[allow(clippy::result_large_err)]
     fn revert_block(&mut self, _block_number: u64) -> NativeBlockifierResult<()> {
         todo!()
     }
 
-    #[allow(clippy::result_large_err)]
     fn append_block(
         &mut self,
         _block_id: u64,
@@ -54,6 +52,14 @@ impl Storage for MockStorage {
     }
 
     fn close(&mut self) {
+        todo!()
+    }
+
+    fn set_executable_class_hash_v2(
+        &mut self,
+        _class_hash: &ClassHash,
+        _compiled_class_hash_v2: CompiledClassHash,
+    ) -> NativeBlockifierResult<()> {
         todo!()
     }
 }

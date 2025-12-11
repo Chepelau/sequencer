@@ -1,12 +1,16 @@
+use apollo_gateway_config::config::RpcStateReaderConfig;
 use apollo_rpc::CompiledContractClass;
 use apollo_state_sync_types::communication::StateSyncClientResult;
+use async_trait::async_trait;
 use blockifier::execution::contract_class::{
     CompiledClassV0,
     CompiledClassV1,
     RunnableCompiledClass,
 };
 use blockifier::state::errors::StateError;
+use blockifier::state::global_cache::CompiledClasses;
 use blockifier::state::state_api::{StateReader as BlockifierStateReader, StateResult};
+use blockifier::state::state_reader_and_contract_manager::FetchCompiledClasses;
 use reqwest::blocking::Client as BlockingClient;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -16,7 +20,6 @@ use starknet_api::core::{ClassHash, CompiledClassHash, ContractAddress, Nonce};
 use starknet_api::state::StorageKey;
 use starknet_types_core::felt::Felt;
 
-use crate::config::RpcStateReaderConfig;
 use crate::errors::{serde_err_to_state_err, RPCStateReaderError, RPCStateReaderResult};
 use crate::rpc_objects::{
     BlockHeader,
@@ -32,7 +35,11 @@ use crate::rpc_objects::{
     RPC_ERROR_CONTRACT_ADDRESS_NOT_FOUND,
     RPC_ERROR_INVALID_PARAMS,
 };
-use crate::state_reader::{MempoolStateReader, StateReaderFactory};
+use crate::state_reader::{
+    GatewayStateReaderWithCompiledClasses,
+    MempoolStateReader,
+    StateReaderFactory,
+};
 
 #[derive(Clone)]
 pub struct RpcStateReader {
@@ -93,15 +100,20 @@ impl RpcStateReader {
     }
 }
 
+#[async_trait]
 impl MempoolStateReader for RpcStateReader {
-    fn get_block_info(&self) -> StateResult<BlockInfo> {
+    async fn get_block_info(&self) -> StateResult<BlockInfo> {
         let get_block_params = GetBlockWithTxHashesParams { block_id: self.block_id };
+        let reader = self.clone();
 
-        // The response from the rpc is a full block but we only deserialize the header.
-        let block_header: BlockHeader = serde_json::from_value(
-            self.send_rpc_request("starknet_getBlockWithTxHashes", get_block_params)?,
-        )
-        .map_err(serde_err_to_state_err)?;
+        let get_block_with_tx_hashes_result = tokio::task::spawn_blocking(move || {
+            reader.send_rpc_request("starknet_getBlockWithTxHashes", get_block_params)
+        })
+        .await
+        .map_err(|e| StateError::StateReadError(format!("JoinError: {e}")))??;
+
+        let block_header: BlockHeader = serde_json::from_value(get_block_with_tx_hashes_result)
+            .map_err(serde_err_to_state_err)?;
         let block_info = block_header.try_into()?;
         Ok(block_info)
     }
@@ -185,14 +197,23 @@ pub struct RpcStateReaderFactory {
     pub config: RpcStateReaderConfig,
 }
 
-impl StateReaderFactory for RpcStateReaderFactory {
-    fn get_state_reader_from_latest_block(
-        &self,
-    ) -> StateSyncClientResult<Box<dyn MempoolStateReader>> {
-        Ok(Box::new(RpcStateReader::from_latest(&self.config)))
+impl FetchCompiledClasses for RpcStateReader {
+    fn get_compiled_classes(&self, _class_hash: ClassHash) -> StateResult<CompiledClasses> {
+        todo!()
     }
 
-    fn get_state_reader(&self, block_number: BlockNumber) -> Box<dyn MempoolStateReader> {
-        Box::new(RpcStateReader::from_number(&self.config, block_number))
+    fn is_declared(&self, _class_hash: ClassHash) -> StateResult<bool> {
+        todo!()
+    }
+}
+
+impl GatewayStateReaderWithCompiledClasses for RpcStateReader {}
+
+#[async_trait]
+impl StateReaderFactory for RpcStateReaderFactory {
+    async fn get_state_reader_from_latest_block(
+        &self,
+    ) -> StateSyncClientResult<Box<dyn GatewayStateReaderWithCompiledClasses>> {
+        Ok(Box::new(RpcStateReader::from_latest(&self.config)))
     }
 }

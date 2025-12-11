@@ -11,7 +11,7 @@ use starknet_api::rpc_transaction::InternalRpcTransaction;
 use starknet_api::transaction::TransactionHash;
 
 use crate::mempool::TransactionReference;
-use crate::metrics::TRANSACTION_TIME_SPENT_IN_MEMPOOL;
+use crate::metrics::TRANSACTION_TIME_SPENT_UNTIL_COMMITTED;
 use crate::utils::try_increment_nonce;
 
 #[cfg(test)]
@@ -105,8 +105,25 @@ impl TransactionPool {
         Ok(tx)
     }
 
-    pub fn remove_up_to_nonce(&mut self, address: ContractAddress, nonce: Nonce) -> usize {
+    // Note: Use this function only for commit flow. Using elsewhere will record incorrect commit
+    // times.
+    pub fn remove_up_to_nonce_when_committed(
+        &mut self,
+        address: ContractAddress,
+        nonce: Nonce,
+    ) -> usize {
         let removed_txs = self.txs_by_account.remove_up_to_nonce(address, nonce);
+
+        for tx_ref in &removed_txs {
+            let submission_time = self
+                .get_submission_time(tx_ref.tx_hash)
+                .expect("Transaction must still be in Mempool when recording commit latency");
+            let time_spent = (self.txs_by_submission_time.clock.now() - submission_time)
+                .to_std()
+                .unwrap()
+                .as_secs_f64();
+            TRANSACTION_TIME_SPENT_UNTIL_COMMITTED.record(time_spent);
+        }
 
         self.remove_from_main_mapping(&removed_txs);
         self.remove_from_timed_mapping(&removed_txs);
@@ -360,9 +377,6 @@ impl TimedTransactionMap {
     /// Returns the removed transaction reference if it exists in the mapping.
     fn remove(&mut self, tx_hash: TransactionHash) -> Option<TransactionReference> {
         let submission_id = self.hash_to_submission_id.remove(&tx_hash)?;
-        TRANSACTION_TIME_SPENT_IN_MEMPOOL.record(
-            (self.clock.now() - submission_id.submission_time).to_std().unwrap().as_secs_f64(),
-        );
         self.txs_by_submission_time.remove(&submission_id)
     }
 
@@ -386,18 +400,11 @@ impl TimedTransactionMap {
                 // The transaction should be preserved. Add it back.
                 self.txs_by_submission_time.insert(submission_id, tx);
             } else {
-                let submission_id = self.hash_to_submission_id.remove(&tx.tx_hash).expect(
+                self.hash_to_submission_id.remove(&tx.tx_hash).expect(
                     "Transaction should have a submission ID if it is in the timed transaction \
                      map.",
                 );
                 removed_txs.push(tx);
-
-                TRANSACTION_TIME_SPENT_IN_MEMPOOL.record(
-                    (self.clock.now() - submission_id.submission_time)
-                        .to_std()
-                        .unwrap()
-                        .as_secs_f64(),
-                );
             }
         }
 

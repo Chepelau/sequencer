@@ -2,14 +2,15 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use alloy::node_bindings::AnvilInstance;
-use apollo_consensus_manager::config::ConsensusManagerConfig;
-use apollo_http_server::config::HttpServerConfig;
+use apollo_base_layer_tests::anvil_base_layer::AnvilBaseLayer;
+use apollo_consensus_manager_config::config::ConsensusManagerConfig;
 use apollo_http_server::test_utils::HttpTestClient;
+use apollo_http_server_config::config::HttpServerConfig;
 use apollo_infra_utils::test_utils::AvailablePorts;
-use apollo_mempool_p2p::config::MempoolP2pConfig;
-use apollo_monitoring_endpoint::config::MonitoringEndpointConfig;
+use apollo_l1_gas_price_provider_config::config::EthToStrkOracleConfig;
+use apollo_mempool_p2p_config::config::MempoolP2pConfig;
 use apollo_monitoring_endpoint::test_utils::MonitoringClient;
+use apollo_monitoring_endpoint_config::config::MonitoringEndpointConfig;
 use apollo_network::gossipsub_impl::Topic;
 use apollo_network::network_manager::test_utils::{
     create_connected_network_configs,
@@ -17,12 +18,12 @@ use apollo_network::network_manager::test_utils::{
 };
 use apollo_network::network_manager::BroadcastTopicChannels;
 use apollo_node::clients::SequencerNodeClients;
-use apollo_node::config::component_config::ComponentConfig;
-use apollo_node::config::node_config::SequencerNodeConfig;
 use apollo_node::servers::run_component_servers;
 use apollo_node::utils::create_node_modules;
+use apollo_node_config::component_config::ComponentConfig;
+use apollo_node_config::node_config::SequencerNodeConfig;
 use apollo_protobuf::consensus::{HeightAndRound, ProposalPart, StreamMessage, StreamMessageBody};
-use apollo_state_sync::config::StateSyncConfig;
+use apollo_state_sync_config::config::StateSyncConfig;
 use apollo_storage::StorageConfig;
 use blockifier::context::ChainInfo;
 use futures::StreamExt;
@@ -30,23 +31,24 @@ use mempool_test_utils::starknet_api_test_utils::{
     AccountTransactionGenerator,
     MultiAccountTransactionGenerator,
 };
-use papyrus_base_layer::ethereum_base_layer_contract::{
-    EthereumBaseLayerConfig,
-    L1ToL2MessageArgs,
-    StarknetL1Contract,
-};
+use papyrus_base_layer::ethereum_base_layer_contract::EthereumBaseLayerConfig;
 use papyrus_base_layer::test_utils::{
-    ethereum_base_layer_config_for_anvil,
     make_block_history_on_anvil,
-    spawn_anvil_and_deploy_starknet_l1_contract,
-    DEFAULT_ANVIL_ADDITIONAL_ADDRESS_INDEX,
+    ARBITRARY_ANVIL_L1_ACCOUNT_ADDRESS,
+    OTHER_ARBITRARY_ANVIL_L1_ACCOUNT_ADDRESS,
 };
+use papyrus_base_layer::BaseLayerContract;
 use starknet_api::block::BlockNumber;
 use starknet_api::consensus_transaction::ConsensusTransaction;
 use starknet_api::core::{ChainId, ContractAddress};
 use starknet_api::execution_resources::GasAmount;
 use starknet_api::rpc_transaction::RpcTransaction;
-use starknet_api::transaction::{TransactionHash, TransactionHasher, TransactionVersion};
+use starknet_api::transaction::{
+    L1HandlerTransaction,
+    TransactionHash,
+    TransactionHasher,
+    TransactionVersion,
+};
 use starknet_types_core::felt::Felt;
 use tokio::sync::Mutex;
 use tracing::{debug, instrument, Instrument};
@@ -64,7 +66,7 @@ use crate::utils::{
     AccumulatedTransactions,
 };
 
-const NUM_OF_SEQUENCERS: usize = 2;
+pub const NUM_OF_SEQUENCERS: usize = 2;
 const SEQUENCER_0: usize = 0;
 const SEQUENCER_1: usize = 1;
 const BUILDER_BASE_ADDRESS: Felt = Felt::from_hex_unchecked("0x42");
@@ -76,10 +78,9 @@ pub struct FlowTestSetup {
     pub sequencer_0: FlowSequencerSetup,
     pub sequencer_1: FlowSequencerSetup,
 
-    // Handle for L1 server: the server is dropped when handle is dropped.
-    #[allow(dead_code)]
-    l1_handle: AnvilInstance,
-    starknet_l1_contract: StarknetL1Contract,
+    // Ethereum base layer coupled with an Anvil server instance, the server is dropped when the
+    // instance is dropped.
+    pub anvil_base_layer: AnvilBaseLayer,
 
     // The transactions that were streamed in the consensus proposals, used for asserting the right
     // transactions are batched.
@@ -91,7 +92,7 @@ impl FlowTestSetup {
     pub async fn new_from_tx_generator(
         tx_generator: &MultiAccountTransactionGenerator,
         test_unique_index: u16,
-        block_max_capacity_sierra_gas: GasAmount,
+        block_max_capacity_gas: GasAmount,
         allow_bootstrap_txs: bool,
     ) -> Self {
         let chain_info = ChainInfo::create_for_testing();
@@ -120,22 +121,23 @@ impl FlowTestSetup {
             .try_into()
             .unwrap();
 
-        let base_layer_config =
-            ethereum_base_layer_config_for_anvil(Some(available_ports.get_next_port()));
-        let (anvil, starknet_l1_contract) =
-            spawn_anvil_and_deploy_starknet_l1_contract(&base_layer_config).await;
+        let anvil_base_layer = AnvilBaseLayer::new(None).await;
+        let base_layer_url = anvil_base_layer.get_url().await.unwrap();
+        let base_layer_config = anvil_base_layer.ethereum_base_layer.config.clone();
 
         // Send some transactions to L1 so it has a history of blocks to scrape gas prices from.
-        let sender_address = anvil.addresses()[DEFAULT_ANVIL_ADDITIONAL_ADDRESS_INDEX];
-        let receiver_address = anvil.addresses()[DEFAULT_ANVIL_ADDITIONAL_ADDRESS_INDEX + 1];
+        let sender_address = ARBITRARY_ANVIL_L1_ACCOUNT_ADDRESS;
+        let receiver_address = OTHER_ARBITRARY_ANVIL_L1_ACCOUNT_ADDRESS;
         make_block_history_on_anvil(
             sender_address,
             receiver_address,
             base_layer_config.clone(),
+            &base_layer_url,
             NUM_L1_TRANSACTIONS,
         )
         .await;
 
+        // TODO(Itamar): Remove txs collector logic when flow tests are stable enough.
         // Spawn a thread that listens to proposals and collects batched transactions.
         let accumulated_txs = Arc::new(Mutex::new(AccumulatedTransactions::default()));
         let tx_collector_task = TxCollector {
@@ -152,11 +154,12 @@ impl FlowTestSetup {
             SEQUENCER_0,
             chain_info.clone(),
             base_layer_config.clone(),
+            base_layer_url.clone(),
             sequencer_0_consensus_manager_config,
             sequencer_0_mempool_p2p_config,
             AvailablePorts::new(test_unique_index, 1),
             sequencer_0_state_sync_config,
-            block_max_capacity_sierra_gas,
+            block_max_capacity_gas,
             allow_bootstrap_txs,
         )
         .await;
@@ -166,26 +169,35 @@ impl FlowTestSetup {
             SEQUENCER_1,
             chain_info,
             base_layer_config,
+            base_layer_url,
             sequencer_1_consensus_manager_config,
             sequencer_1_mempool_p2p_config,
             AvailablePorts::new(test_unique_index, 2),
             sequencer_1_state_sync_config,
-            block_max_capacity_sierra_gas,
+            block_max_capacity_gas,
             allow_bootstrap_txs,
         )
         .await;
 
-        Self { sequencer_0, sequencer_1, l1_handle: anvil, starknet_l1_contract, accumulated_txs }
+        Self { sequencer_0, sequencer_1, anvil_base_layer, accumulated_txs }
     }
 
     pub fn chain_id(&self) -> &ChainId {
         // TODO(Arni): Get the chain ID from a shared canonic location.
-        &self.sequencer_0.node_config.batcher_config.block_builder_config.chain_info.chain_id
+        &self
+            .sequencer_0
+            .node_config
+            .batcher_config
+            .as_ref()
+            .unwrap()
+            .block_builder_config
+            .chain_info
+            .chain_id
     }
 
-    pub async fn send_messages_to_l2(&self, l1_to_l2_messages_args: &[L1ToL2MessageArgs]) {
-        for l1_to_l2_message_args in l1_to_l2_messages_args {
-            self.starknet_l1_contract.send_message_to_l2(l1_to_l2_message_args).await;
+    pub async fn send_messages_to_l2(&self, l1_handlers: &[L1HandlerTransaction]) {
+        for l1_handler in l1_handlers {
+            self.anvil_base_layer.send_message_to_l2(l1_handler).await;
         }
     }
 }
@@ -220,11 +232,12 @@ impl FlowSequencerSetup {
         node_index: usize,
         chain_info: ChainInfo,
         base_layer_config: EthereumBaseLayerConfig,
+        base_layer_url: Url,
         mut consensus_manager_config: ConsensusManagerConfig,
         mempool_p2p_config: MempoolP2pConfig,
         mut available_ports: AvailablePorts,
         state_sync_config: StateSyncConfig,
-        block_max_capacity_sierra_gas: GasAmount,
+        block_max_capacity_gas: GasAmount,
         allow_bootstrap_txs: bool,
     ) -> Self {
         let path = None;
@@ -235,9 +248,12 @@ impl FlowSequencerSetup {
             spawn_local_success_recorder(available_ports.get_next_port());
         consensus_manager_config.cende_config.recorder_url = recorder_url;
 
-        let (eth_to_strk_oracle_url, _join_handle) =
+        let (eth_to_strk_oracle_url_headers, _join_handle) =
             spawn_local_eth_to_strk_oracle(available_ports.get_next_port());
-        consensus_manager_config.eth_to_strk_oracle_config.base_url = eth_to_strk_oracle_url;
+        let eth_to_strk_oracle_config = EthToStrkOracleConfig {
+            url_header_list: Some(vec![eth_to_strk_oracle_url_headers]),
+            ..Default::default()
+        };
 
         let validator_id = set_validator_id(&mut consensus_manager_config, node_index);
 
@@ -259,25 +275,31 @@ impl FlowSequencerSetup {
             storage_config,
             state_sync_config,
             consensus_manager_config,
+            eth_to_strk_oracle_config,
             mempool_p2p_config,
             monitoring_endpoint_config,
             component_config,
             base_layer_config,
-            block_max_capacity_sierra_gas,
+            base_layer_url,
+            block_max_capacity_gas,
             validator_id,
             allow_bootstrap_txs,
         );
         let num_l1_txs = u64::try_from(NUM_L1_TRANSACTIONS).unwrap();
-        node_config.l1_gas_price_scraper_config.number_of_blocks_for_mean = num_l1_txs;
-        node_config.l1_gas_price_provider_config.number_of_blocks_for_mean = num_l1_txs;
+        node_config.l1_gas_price_scraper_config.as_mut().unwrap().number_of_blocks_for_mean =
+            num_l1_txs;
+        node_config.l1_gas_price_provider_config.as_mut().unwrap().number_of_blocks_for_mean =
+            num_l1_txs;
 
         debug!("Sequencer config: {:#?}", node_config);
-        let (clients, servers) = create_node_modules(&node_config).await;
+        let (clients, servers) = create_node_modules(&node_config, vec![]).await;
 
-        let MonitoringEndpointConfig { ip, port, .. } = node_config.monitoring_endpoint_config;
+        let MonitoringEndpointConfig { ip, port, .. } =
+            node_config.monitoring_endpoint_config.as_ref().unwrap().to_owned();
         let monitoring_client = MonitoringClient::new(SocketAddr::from((ip, port)));
 
-        let HttpServerConfig { ip, port } = node_config.http_server_config;
+        let HttpServerConfig { ip, port } =
+            node_config.http_server_config.as_ref().unwrap().to_owned();
         let add_tx_http_client = HttpTestClient::new(SocketAddr::from((ip, port)));
 
         // Run the sequencer node.
@@ -311,7 +333,6 @@ pub fn create_consensus_manager_configs_and_channels(
 ) {
     let mut network_configs = create_connected_network_configs(ports);
 
-    // TODO(Tsabary): Need to also add a channel for votes, in addition to the proposals channel.
     let channels_network_config = network_configs.pop().unwrap();
 
     let n_network_configs = network_configs.len();
@@ -324,8 +345,6 @@ pub fn create_consensus_manager_configs_and_channels(
     for (i, config) in consensus_manager_configs.iter_mut().enumerate() {
         config.context_config.builder_address =
             ContractAddress::try_from(BUILDER_BASE_ADDRESS + Felt::from(i)).unwrap();
-        config.eth_to_strk_oracle_config.base_url =
-            Url::parse("https://eth_to_strk_oracle_url").expect("Should be a valid URL");
     }
 
     let broadcast_channels = network_config_into_broadcast_channels(
@@ -382,12 +401,11 @@ impl TxCollector {
 
         assert_eq!(
             incoming_message_id, 0,
-            "Expected the first message in the stream to have id 0, got {}",
-            incoming_message_id
+            "Expected the first message in the stream to have id 0, got {incoming_message_id}"
         );
         let StreamMessageBody::Content(ProposalPart::Init(incoming_proposal_init)) = init_message
         else {
-            panic!("Expected an init message. Got: {:?}", init_message)
+            panic!("Expected an init message. Got: {init_message:?}")
         };
 
         self.accumulated_txs
@@ -403,7 +421,7 @@ impl TxCollector {
             assert_eq!(stream_id, first_stream_id, "Expected the same stream id for all messages");
             match message {
                 StreamMessageBody::Content(ProposalPart::Init(init)) => {
-                    panic!("Unexpected init: {:?}", init)
+                    panic!("Unexpected init: {init:?}")
                 }
                 StreamMessageBody::Content(ProposalPart::Fin(..)) => {
                     got_proposal_fin = true;

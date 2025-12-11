@@ -3,6 +3,7 @@ use blockifier::execution::deprecated_syscalls::hint_processor::DeprecatedSyscal
 use blockifier::state::errors::StateError;
 use cairo_vm::hint_processor::hint_processor_definition::HintExtension;
 use cairo_vm::types::errors::math_errors::MathError;
+use cairo_vm::types::errors::program_errors::ProgramError;
 use cairo_vm::types::relocatable::MaybeRelocatable;
 use cairo_vm::vm::errors::exec_scope_errors::ExecScopeError;
 use cairo_vm::vm::errors::hint_errors::HintError as VmHintError;
@@ -11,13 +12,15 @@ use cairo_vm::vm::errors::runner_errors::RunnerError;
 use cairo_vm::vm::errors::vm_errors::VirtualMachineError;
 use num_bigint::{BigUint, TryFromBigIntError};
 use starknet_api::block::BlockNumber;
-use starknet_api::core::ClassHash;
+use starknet_api::core::{ClassHash, CompiledClassHash, ContractAddress};
 use starknet_api::executable_transaction::TransactionType;
+use starknet_api::hash::HashOutput;
+use starknet_api::state::StorageKey;
 use starknet_api::StarknetApiError;
-use starknet_patricia::hash::hash_trait::HashOutput;
 use starknet_patricia::patricia_merkle_tree::node_data::errors::{
     EdgePathError,
     PathToBottomError,
+    PreimageError,
 };
 use starknet_types_core::felt::Felt;
 
@@ -28,10 +31,13 @@ use crate::hints::enum_definition::AllHints;
 use crate::hints::hint_implementation::kzg::utils::FftError;
 use crate::hints::hint_implementation::patricia::error::PatriciaError;
 use crate::hints::vars::{Const, Ids};
+use crate::io::os_output::OsOutputError;
 use crate::vm_utils::VmUtilsError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OsHintError {
+    #[error("Tried to access an already consumed Bootloader input.")]
+    AggregatorBootloaderInputAlreadyConsumed,
     #[error("Assertion failed: {message}")]
     AssertionFailed { message: String },
     #[error("Unexpectedly assigned leaf bytecode segment.")]
@@ -74,8 +80,11 @@ pub enum OsHintError {
          is probably out of sync."
     )]
     InconsistentBlockNumber { actual: BlockNumber, expected: BlockNumber },
-    #[error("Inconsistent storage value. Actual: {actual}, expected: {expected}.")]
-    InconsistentValue { actual: Felt, expected: Felt },
+    #[error(
+        "Inconsistent storage value for contract address: {}, key: {}. Expected: {}, actual: {}.",
+        .0.contract_address.0.key(), .0.key.0.key(), .0.expected, .0.actual
+    )]
+    InconsistentStorageValue(Box<InnerInconsistentStorageValueError>),
     #[error(transparent)]
     IO(#[from] std::io::Error),
     #[error(transparent)]
@@ -85,7 +94,7 @@ pub enum OsHintError {
     #[error(transparent)]
     Memory(#[from] MemoryError),
     #[error("No bytecode segment structure for class hash: {0:?}.")]
-    MissingBytecodeSegmentStructure(ClassHash),
+    MissingBytecodeSegmentStructure(CompiledClassHash),
     #[error("Hint {hint:?} has no nondet offset.")]
     MissingOffsetForHint { hint: AllHints },
     #[error("No component hashes for class hash {0:?}.")]
@@ -101,9 +110,15 @@ pub enum OsHintError {
     #[error(transparent)]
     OsLogger(#[from] OsLoggerError),
     #[error(transparent)]
+    OsOutput(#[from] OsOutputError),
+    #[error(transparent)]
     PathToBottom(#[from] PathToBottomError),
     #[error(transparent)]
     Patricia(#[from] PatriciaError),
+    #[error(transparent)]
+    Preimage(#[from] PreimageError),
+    #[error(transparent)]
+    Program(#[from] ProgramError),
     #[error(transparent)]
     Runner(#[from] RunnerError),
     #[error("{error:?} for json value {value}.")]
@@ -128,6 +143,14 @@ pub enum OsHintError {
     VmHint(#[from] VmHintError),
     #[error(transparent)]
     VmUtils(#[from] VmUtilsError),
+}
+
+#[derive(Debug)]
+pub struct InnerInconsistentStorageValueError {
+    pub contract_address: ContractAddress,
+    pub key: StorageKey,
+    pub actual: Felt,
+    pub expected: Felt,
 }
 
 /// `OsHintError` and the VM's `HintError` must have conversions in both directions, as execution

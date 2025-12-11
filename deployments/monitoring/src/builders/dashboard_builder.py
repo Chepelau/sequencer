@@ -1,11 +1,15 @@
 import argparse
+import copy
 import json
 import os
 import time
+from urllib.parse import quote
 
 import requests
 from common.grafana10_objects import empty_dashboard, row_object, templating_object
-from common.helpers import get_logger
+from common.helpers import EnvironmentName, get_logger
+
+MAX_ALLOWED_JSON_SIZE = 1024 * 1024  # 1MB
 
 
 def create_grafana_panel(panel: dict, panel_id: int, y_position: int, x_position: int) -> dict:
@@ -20,11 +24,42 @@ def create_grafana_panel(panel: dict, panel_id: int, y_position: int, x_position
         + "\n".join(f"{i + 1}. {expr}" for i, expr in enumerate(exprs))
     )
 
+    extra = panel.get("extra_params", {})
+    unit = extra.get("unit", "none")
+    show_percent_change = extra.get("show_percent_change", False)
+    log_query = extra.get("log_query", "")
+    log_comment = extra.get("log_comment", "")
+    thresholds = extra.get("thresholds", {})
+    query_parts = [
+        f"resource.labels.namespace_name=~%22^%28${{namespace:pipe}}%29$%22",
+        quote(log_query),
+    ]
+    if log_comment:
+        query_parts.append(quote(log_comment))
+    query_value = "%0A".join(query_parts)
+    # TODO(Ron): Turn link into variable to save space in the json file
+    link = "\n".join(
+        [
+            "https://console.cloud.google.com/logs/query;",
+            f"query={query_value};",
+            "summaryFields=resource%252Flabels%252Fnamespace_name,resource%252Flabels%252Fcontainer_name;",
+            "timeRange=${__from:date:iso}%2F${__to:date:iso}",
+            "?project=${gcp_project}",
+        ]
+    )
+    legends = extra.get("legends", [])
+    display_name_override_value = (
+        "${__field.labels.namespace}"
+        if panel["type"] == "stat"
+        else "${__field.labels.namespace} | ${__field.labels.location}"
+    )
+
     # Generate targets with unique refIds A–Z
     targets = [
         {
             "expr": expr,
             "refId": chr(ASCII_A + i),  # 'A' to 'Z'
+            **({"legendFormat": f"{legends[i]} " + "{{namespace}}"} if legends else {}),
         }
         for i, expr in enumerate(exprs)
     ]
@@ -38,19 +73,54 @@ def create_grafana_panel(panel: dict, panel_id: int, y_position: int, x_position
         "targets": targets,
         "fieldConfig": {
             "defaults": {
-                "unit": "none",
-                "thresholds": {
-                    "mode": "absolute",
-                    "steps": [
-                        {"color": "green", "value": None},
-                        {"color": "orange", "value": 70},
-                        {"color": "red", "value": 90},
-                    ],
-                },
-            }
+                "color": {"mode": "palette-classic"},
+                "unit": unit,
+                "thresholds": thresholds,
+            },
+            "overrides": [
+                # Override the pod display name to show only namespace (and sometimes location) labels
+                {
+                    "matcher": {"id": "byRegexp", "options": ".*location.*"},
+                    "properties": [{"id": "displayName", "value": display_name_override_value}],
+                }
+            ],
+        },
+        "links": ([{"url": link, "title": "GCP Logs", "targetBlank": True}]),
+        "transformations": [
+            # Renames labels of the form {label="value"} to just "value"
+            {
+                "id": "renameByRegex",
+                "options": {"regex": '^\\{[^=]+=\\"([^\\"]+)\\"\\}$', "renamePattern": "$1"},
+            },
+            # Used twice to remove up to 2 instances of cluster and namespace labels, since it is
+            # not possible to remove all in one transformation
+            remove_cluster_and_namespace_from_display_name(),
+            remove_cluster_and_namespace_from_display_name(),
+        ],
+    }
+
+    if thresholds:
+        grafana_panel["fieldConfig"]["defaults"]["color"] = {"mode": "thresholds"}
+
+    if panel["type"] == "stat":
+        grafana_panel["options"] = {
+            "textMode": "value_and_name",
+            "showPercentChange": show_percent_change,
+        }
+
+    return grafana_panel
+
+
+def remove_cluster_and_namespace_from_display_name():
+    return {
+        "id": "renameByRegex",
+        "options": {
+            # Remove 'cluster' and 'namespace' label from display name if it is a panel with
+            # combined namespaces (meaning it contains 'cluster' but not 'location').
+            "regex": "^(.*)\{(?=[^}]*cluster)(?![^}]*location)[^}]*\}(.*)$",
+            "renamePattern": "$1$2",
         },
     }
-    return grafana_panel
 
 
 def get_next_position(x_position, y_position):
@@ -71,7 +141,7 @@ def dashboard_file_name(out_dir: str, dashboard_name: str) -> str:
     return f"{out_dir}/{file_name}.json"
 
 
-def create_dashboard(dashboard_name: str, dev_dashboard: json) -> dict:
+def create_dashboard(dashboard_name: str, dev_dashboard: json, env: EnvironmentName) -> dict:
     dashboard = empty_dashboard.copy()
     templating = templating_object.copy()
     panel_id = 1
@@ -80,20 +150,25 @@ def create_dashboard(dashboard_name: str, dev_dashboard: json) -> dict:
     dashboard["title"] = dashboard_name
     dashboard["templating"] = templating
 
-    for row_title, panels in dev_dashboard.items():
-        row_panel = row_object.copy()
+    for row_title, value in dev_dashboard.items():
+        panels = value.get("panels")
+        collapsed = bool(value.get("collapsed"))
+        row_panel = copy.deepcopy(row_object)
         row_panel["title"] = row_title
         row_panel["id"] = panel_id
         row_panel["gridPos"]["y"] = y_position
         row_panel["panels"] = []
+        row_panel["collapsed"] = collapsed
         panel_id += 1
         x_position = 0
         y_position += 1
         dashboard["panels"].append(row_panel)
+        # Rows that aren't collapsed require its panels to be added directly to the dashboard
+        target = row_panel["panels"] if collapsed else dashboard["panels"]
 
         for panel in panels:
             grafana_panel = create_grafana_panel(panel, panel_id, y_position, x_position)
-            row_panel["panels"].append(grafana_panel)
+            target.append(grafana_panel)
             panel_id += 1
             x_position, y_position = get_next_position(x_position, y_position)
 
@@ -141,6 +216,7 @@ def dashboard_builder(args: argparse.Namespace) -> None:
                 create_dashboard(
                     dashboard_name=dashboard_name,
                     dev_dashboard=dev_json[dashboard_name],
+                    env=EnvironmentName(args.env),
                 ),
             ]
         )
@@ -150,8 +226,10 @@ def dashboard_builder(args: argparse.Namespace) -> None:
         if args.out_dir:
             output_dir = f"{args.out_dir}/dashboards"
             os.makedirs(output_dir, exist_ok=True)
-            with open(dashboard_file_name(output_dir, dashboard_name), "w") as f:
-                json.dump(dashboard, f, indent=4)
+            json_data = json.dumps(dashboard, indent=1, ensure_ascii=False)
+            assert len(json_data) < MAX_ALLOWED_JSON_SIZE, "Grafana dashboard JSON is too large"
+            with open(dashboard_file_name(output_dir, dashboard_name), "w", encoding="utf-8") as f:
+                f.write(json_data)
         if not args.dry_run:
             upload_dashboards_local(dashboard=dashboard)
 

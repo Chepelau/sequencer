@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use libp2p::core::transport::PortUse;
 use libp2p::core::Endpoint;
 use libp2p::swarm::{
     ConnectionClosed,
@@ -29,9 +30,9 @@ use super::handler::{
     RequestToBehaviourEvent,
     SessionError as HandlerSessionError,
 };
-use super::{Bytes, Config, GenericEvent, InboundSessionId, OutboundSessionId, SessionId};
+use super::{Config, GenericEvent, InboundSessionId, OutboundSessionId, SessionId};
 use crate::mixed_behaviour::{self, BridgedBehaviour};
-use crate::peer_manager;
+use crate::{peer_manager, Bytes};
 
 #[derive(thiserror::Error, Debug)]
 pub enum SessionError {
@@ -101,10 +102,6 @@ pub enum Event {
 #[error("The given session ID doesn't exist.")]
 pub struct SessionIdNotFoundError;
 
-#[derive(thiserror::Error, Debug)]
-#[error("We are not connected to the given peer. Dial to the given peer and try again.")]
-pub struct PeerNotConnected;
-
 pub struct Behaviour {
     config: Config,
     pending_events: VecDeque<ToSwarm<Event, RequestFromBehaviourEvent>>,
@@ -112,7 +109,7 @@ pub struct Behaviour {
     next_outbound_session_id: OutboundSessionId,
     next_inbound_session_id: Arc<AtomicUsize>,
     dropped_sessions: HashSet<SessionId>,
-    wakers_waiting_for_event: Vec<Waker>,
+    last_waker_waiting_for_event: Option<Waker>,
     outbound_sessions_pending_peer_assignment: HashMap<OutboundSessionId, (Bytes, StreamProtocol)>,
     supported_inbound_protocols: HashSet<StreamProtocol>,
 }
@@ -126,7 +123,7 @@ impl Behaviour {
             next_outbound_session_id: Default::default(),
             next_inbound_session_id: Arc::new(Default::default()),
             dropped_sessions: Default::default(),
-            wakers_waiting_for_event: Default::default(),
+            last_waker_waiting_for_event: None,
             outbound_sessions_pending_peer_assignment: Default::default(),
             supported_inbound_protocols: Default::default(),
         }
@@ -213,7 +210,7 @@ impl Behaviour {
 
     fn add_event_to_queue(&mut self, event: ToSwarm<Event, RequestFromBehaviourEvent>) {
         self.pending_events.push_back(event);
-        for waker in self.wakers_waiting_for_event.drain(..) {
+        if let Some(waker) = self.last_waker_waiting_for_event.take() {
             waker.wake();
         }
     }
@@ -249,6 +246,7 @@ impl NetworkBehaviour for Behaviour {
         peer_id: PeerId,
         _addr: &Multiaddr,
         _role_override: Endpoint,
+        _port_use: PortUse,
     ) -> Result<Self::ConnectionHandler, ConnectionDenied> {
         Ok(Handler::new(
             self.config.clone(),
@@ -330,7 +328,7 @@ impl NetworkBehaviour for Behaviour {
         if let Some(event) = self.pending_events.pop_front() {
             return Poll::Ready(event);
         }
-        self.wakers_waiting_for_event.push(cx.waker().clone());
+        self.last_waker_waiting_for_event = Some(cx.waker().clone());
         Poll::Pending
     }
 }
@@ -361,6 +359,13 @@ impl BridgedBehaviour for Behaviour {
                 "Outbound session assigned peer but it isn't in \
                  outbound_sessions_pending_peer_assignment. Not running query."
             );
+            // Emit SessionFailed event to trigger cleanup in network manager
+            self.add_event_to_queue(ToSwarm::GenerateEvent(Event::External(
+                ExternalEvent::SessionFailed {
+                    session_id: (*outbound_session_id).into(),
+                    error: SessionError::ConnectionClosed,
+                },
+            )));
             return;
         };
 

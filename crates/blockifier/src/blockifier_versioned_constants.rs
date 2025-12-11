@@ -19,6 +19,7 @@ use starknet_api::define_versioned_constants;
 use starknet_api::executable_transaction::TransactionType;
 use starknet_api::execution_resources::{GasAmount, GasVector};
 use starknet_api::transaction::fields::{hex_to_tip, GasVectorComputationMode, Tip};
+use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
 use strum::IntoEnumIterator;
 use thiserror::Error;
 
@@ -37,6 +38,8 @@ define_versioned_constants!(
     VersionedConstants,
     RawVersionedConstants,
     VersionedConstantsError,
+    StarknetVersion::V0_13_0,
+    "resources/versioned_constants_diff_regression",
     (V0_13_0, "../resources/blockifier_versioned_constants_0_13_0.json"),
     (V0_13_1, "../resources/blockifier_versioned_constants_0_13_1.json"),
     (V0_13_1_1, "../resources/blockifier_versioned_constants_0_13_1_1.json"),
@@ -47,6 +50,8 @@ define_versioned_constants!(
     (V0_13_5, "../resources/blockifier_versioned_constants_0_13_5.json"),
     (V0_13_6, "../resources/blockifier_versioned_constants_0_13_6.json"),
     (V0_14_0, "../resources/blockifier_versioned_constants_0_14_0.json"),
+    (V0_14_1, "../resources/blockifier_versioned_constants_0_14_1.json"),
+    (V0_15_0, "../resources/blockifier_versioned_constants_0_15_0.json"),
 );
 
 pub type SyscallGasCostsMap = HashMap<SyscallSelector, RawSyscallGasCost>;
@@ -77,6 +82,8 @@ pub struct RawVersionedConstants {
     pub ignore_inner_event_resources: bool,
     pub disable_deploy_in_validation_mode: bool,
     pub enable_reverts: bool,
+    pub enable_casm_hash_migration: bool,
+    pub block_casm_hash_v1_declares: bool,
     pub min_sierra_version_for_sierra_gas: SierraVersion,
     pub enable_tip: bool,
     pub segment_arena_cells: bool,
@@ -241,6 +248,8 @@ pub struct VersionedConstants {
     // Transactions settings.
     pub disable_cairo0_redeclaration: bool,
     pub enable_stateful_compression: bool,
+    pub enable_casm_hash_migration: bool,
+    pub block_casm_hash_v1_declares: bool,
     pub comprehensive_state_diff: bool,
     pub block_direct_execute_call: bool,
     pub ignore_inner_event_resources: bool,
@@ -288,6 +297,8 @@ impl From<RawVersionedConstants> for VersionedConstants {
             ignore_inner_event_resources: raw_vc.ignore_inner_event_resources,
             disable_deploy_in_validation_mode: raw_vc.disable_deploy_in_validation_mode,
             enable_reverts: raw_vc.enable_reverts,
+            enable_casm_hash_migration: raw_vc.enable_casm_hash_migration,
+            block_casm_hash_v1_declares: raw_vc.block_casm_hash_v1_declares,
             os_constants: Arc::new(os_constants),
             vm_resource_fee_cost: Arc::new(raw_vc.vm_resource_fee_cost),
             enable_tip: raw_vc.enable_tip,
@@ -430,23 +441,29 @@ impl VersionedConstants {
     // squashing the functions together.
     /// Returns the latest versioned constants, applying the given overrides.
     pub fn get_versioned_constants(
-        versioned_constants_overrides: VersionedConstantsOverrides,
+        versioned_constants_overrides: Option<VersionedConstantsOverrides>,
     ) -> Self {
-        let VersionedConstantsOverrides {
-            validate_max_n_steps,
-            max_recursion_depth,
-            invoke_tx_max_n_steps,
-            max_n_events,
-        } = versioned_constants_overrides;
         let latest_constants = Self::latest_constants().clone();
-        let tx_event_limits =
-            EventLimits { max_n_emitted_events: max_n_events, ..latest_constants.tx_event_limits };
-        Self {
-            validate_max_n_steps,
-            max_recursion_depth,
-            invoke_tx_max_n_steps,
-            tx_event_limits,
-            ..latest_constants
+        match versioned_constants_overrides {
+            None => latest_constants,
+            Some(VersionedConstantsOverrides {
+                validate_max_n_steps,
+                max_recursion_depth,
+                invoke_tx_max_n_steps,
+                max_n_events,
+            }) => {
+                let tx_event_limits = EventLimits {
+                    max_n_emitted_events: max_n_events,
+                    ..latest_constants.tx_event_limits
+                };
+                Self {
+                    validate_max_n_steps,
+                    max_recursion_depth,
+                    invoke_tx_max_n_steps,
+                    tx_event_limits,
+                    ..latest_constants
+                }
+            }
         }
     }
 
@@ -897,8 +914,7 @@ pub struct BaseGasCosts {
     pub syscall_base_gas_cost: u64,
 }
 
-#[cfg_attr(any(test, feature = "testing"), derive(Serialize))]
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct BuiltinGasCosts {
     // Range check has a hard-coded cost higher than its proof percentage to avoid the overhead of
     // retrieving its price from the table.
@@ -1019,7 +1035,7 @@ impl GasCosts {
         builtin_costs: &BuiltinGasCosts,
     ) -> SyscallGasCost {
         let raw_cost = syscall_gas_costs.get(&selector).unwrap_or_else(|| {
-            panic!("{selector:?} missing from syscall_gas_costs map. Map: {:?}", syscall_gas_costs)
+            panic!("{selector:?} missing from syscall_gas_costs map. Map: {syscall_gas_costs:?}")
         });
         SyscallGasCost::new_from_base_cost(match raw_cost {
             RawSyscallGasCost::Flat(flat_cost) => *flat_cost,
@@ -1386,7 +1402,7 @@ impl SerializeConfig for VersionedConstantsOverrides {
             ser_param(
                 "max_n_events",
                 &self.max_n_events,
-                "Maximum number of events that can be emitted from the transation.",
+                "Maximum number of events that can be emitted from the transaction.",
                 ParamPrivacyInput::Public,
             ),
         ])

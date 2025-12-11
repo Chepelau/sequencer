@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use apollo_compile_to_native::config::SierraCompilationConfig;
+use apollo_compile_to_native_types::SierraCompilationConfig;
 use blockifier::abi::constants;
 use blockifier::blockifier::config::{
     CairoNativeRunConfig,
@@ -11,10 +11,12 @@ use blockifier::blockifier::config::{
     ContractClassManagerConfig,
     NativeClassesWhitelist,
 };
-use blockifier::blockifier_versioned_constants::VersionedConstantsOverrides;
+use blockifier::blockifier::transaction_executor::CompiledClassHashesForMigration;
+use blockifier::blockifier_versioned_constants::{BuiltinGasCosts, VersionedConstantsOverrides};
 use blockifier::bouncer::{BouncerConfig, BouncerWeights, BuiltinWeights, CasmHashComputationData};
 use blockifier::state::contract_class_manager::DEFAULT_COMPILATION_REQUEST_CHANNEL_SIZE;
 use blockifier::state::global_cache::GLOBAL_CONTRACT_CACHE_SIZE_FOR_TEST;
+use blockifier::utils::u64_from_usize;
 use cairo_vm::vm::runners::cairo_runner::ExecutionResources;
 use pyo3::prelude::*;
 use starknet_api::core::ClassHash;
@@ -111,6 +113,7 @@ impl From<PyVersionedConstantsOverrides> for VersionedConstantsOverrides {
 pub struct PyBouncerConfig {
     pub full_total_weights: HashMap<String, usize>,
     pub builtin_weights: HashMap<String, usize>,
+    pub blake_weight: usize,
 }
 
 impl TryFrom<PyBouncerConfig> for BouncerConfig {
@@ -123,11 +126,11 @@ impl TryFrom<PyBouncerConfig> for BouncerConfig {
             builtin_weights: hash_map_into_builtin_weights(
                 py_bouncer_config.builtin_weights.clone(),
             )?,
+            blake_weight: py_bouncer_config.blake_weight,
         })
     }
 }
 
-#[allow(clippy::result_large_err)]
 fn hash_map_into_bouncer_weights(
     mut data: HashMap<String, usize>,
 ) -> NativeBlockifierResult<BouncerWeights> {
@@ -169,35 +172,45 @@ fn hash_map_into_bouncer_weights(
     })
 }
 
-#[allow(clippy::result_large_err)]
 fn hash_map_into_builtin_weights(
     mut data: HashMap<String, usize>,
 ) -> NativeBlockifierResult<BuiltinWeights> {
-    let pedersen = data.remove(Builtin::Pedersen.name()).expect("pedersen must be present");
-    let range_check = data.remove(Builtin::RangeCheck.name()).expect("range_check must be present");
-    let bitwise = data.remove(Builtin::Bitwise.name()).expect("bitwise must be present");
-    let ecdsa = data.remove(Builtin::Ecdsa.name()).expect("ecdsa must be present");
-    let keccak = data.remove(Builtin::Keccak.name()).expect("keccak must be present");
-    let add_mod = data.remove(Builtin::AddMod.name()).expect("add_mod must be present");
-    let mul_mod = data.remove(Builtin::MulMod.name()).expect("mul_mod must be present");
-    let ec_op = data.remove(Builtin::EcOp.name()).expect("ec_op must be present");
-    let range_check96 =
-        data.remove(Builtin::RangeCheck96.name()).expect("range_check96 must be present");
-    let poseidon = data.remove(Builtin::Poseidon.name()).expect("poseidon must be present");
+    let pedersen =
+        u64_from_usize(data.remove(Builtin::Pedersen.name()).expect("pedersen must be present"));
+    let range_check = u64_from_usize(
+        data.remove(Builtin::RangeCheck.name()).expect("range_check must be present"),
+    );
+    let bitwise =
+        u64_from_usize(data.remove(Builtin::Bitwise.name()).expect("bitwise must be present"));
+    let ecdsa = u64_from_usize(data.remove(Builtin::Ecdsa.name()).expect("ecdsa must be present"));
+    let keccak =
+        u64_from_usize(data.remove(Builtin::Keccak.name()).expect("keccak must be present"));
+    let add_mod =
+        u64_from_usize(data.remove(Builtin::AddMod.name()).expect("add_mod must be present"));
+    let mul_mod =
+        u64_from_usize(data.remove(Builtin::MulMod.name()).expect("mul_mod must be present"));
+    let ecop = u64_from_usize(data.remove(Builtin::EcOp.name()).expect("ec_op must be present"));
+    let range_check96 = u64_from_usize(
+        data.remove(Builtin::RangeCheck96.name()).expect("range_check96 must be present"),
+    );
+    let poseidon =
+        u64_from_usize(data.remove(Builtin::Poseidon.name()).expect("poseidon must be present"));
 
     assert!(data.is_empty(), "Unexpected keys in builtin weights: {:?}", data.keys());
 
     Ok(BuiltinWeights {
-        pedersen,
-        range_check,
-        bitwise,
-        ecdsa,
-        keccak,
-        add_mod,
-        mul_mod,
-        ec_op,
-        range_check96,
-        poseidon,
+        gas_costs: BuiltinGasCosts {
+            pedersen,
+            range_check,
+            bitwise,
+            ecdsa,
+            keccak,
+            add_mod,
+            mul_mod,
+            ecop,
+            range_check96,
+            poseidon,
+        },
     })
 }
 
@@ -311,6 +324,24 @@ impl From<PyContractClassManagerConfig> for ContractClassManagerConfig {
                 .cairo_native_run_config
                 .into(),
             native_compiler_config: py_contract_class_manager_config.native_compiler_config.into(),
+        }
+    }
+}
+
+#[pyclass]
+#[derive(Clone, Default)]
+pub struct PyCompiledClassHashesForMigration {
+    #[pyo3(get)]
+    pub compiled_class_hash_v2_to_v1: Vec<(PyFelt, PyFelt)>,
+}
+
+impl From<CompiledClassHashesForMigration> for PyCompiledClassHashesForMigration {
+    fn from(hashes: CompiledClassHashesForMigration) -> Self {
+        Self {
+            compiled_class_hash_v2_to_v1: hashes
+                .into_iter()
+                .map(|(v2_hash, v1_hash)| (PyFelt(v2_hash.0), PyFelt(v1_hash.0)))
+                .collect(),
         }
     }
 }

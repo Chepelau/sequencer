@@ -9,6 +9,7 @@ description = "A library for handling node configuration."
 [dependencies]
 apollo_infra_utils.workspace = true
 clap = { workspace = true, features = ["env", "string"] }
+colored = { workspace = true, optional = true }
 const_format.workspace = true
 itertools.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -20,13 +21,16 @@ url = { workspace = true, features = ["serde"] }
 validator = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
-apollo_infra_utils.workspace = true
+apollo_infra_utils = { workspace = true, features = ["testing"] }
 apollo_test_utils.workspace = true
 assert_matches.workspace = true
+colored.workspace = true
 itertools.workspace = true
 lazy_static.workspace = true
-starknet_api.workspace = true
 tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+testing = ["apollo_infra_utils/testing", "dep:colored"]

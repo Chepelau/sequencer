@@ -2,60 +2,73 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use apollo_batcher::block_builder::BlockBuilderConfig;
-use apollo_batcher::config::BatcherConfig;
-use apollo_class_manager::class_storage::CachedClassStorageConfig;
-use apollo_class_manager::config::{
+use apollo_base_layer_tests::anvil_base_layer::AnvilBaseLayer;
+use apollo_batcher::pre_confirmed_cende_client::RECORDER_WRITE_PRE_CONFIRMED_BLOCK_PATH;
+use apollo_batcher_config::config::{BatcherConfig, BlockBuilderConfig};
+use apollo_class_manager_config::config::{
+    CachedClassStorageConfig,
     ClassManagerConfig,
     FsClassManagerConfig,
     FsClassStorageConfig,
 };
-use apollo_consensus::config::{ConsensusConfig, TimeoutsConfig};
-use apollo_consensus::types::ValidatorId;
-use apollo_consensus_manager::config::ConsensusManagerConfig;
-use apollo_consensus_orchestrator::cende::{CendeConfig, RECORDER_WRITE_BLOB_PATH};
-use apollo_consensus_orchestrator::config::ContextConfig;
-use apollo_gateway::config::{
+use apollo_committer_config::config::CommitterConfig;
+use apollo_config::converters::UrlAndHeaders;
+use apollo_config_manager_config::config::ConfigManagerConfig;
+use apollo_consensus_config::config::{
+    ConsensusConfig,
+    ConsensusDynamicConfig,
+    ConsensusStaticConfig,
+    TimeoutsConfig,
+};
+use apollo_consensus_config::ValidatorId;
+use apollo_consensus_manager_config::config::ConsensusManagerConfig;
+use apollo_consensus_orchestrator::cende::RECORDER_WRITE_BLOB_PATH;
+use apollo_consensus_orchestrator_config::config::{CendeConfig, ContextConfig};
+use apollo_gateway_config::config::{
     GatewayConfig,
     StatefulTransactionValidatorConfig,
     StatelessTransactionValidatorConfig,
 };
 use apollo_http_server::test_utils::create_http_server_config;
 use apollo_infra_utils::test_utils::AvailablePorts;
-use apollo_l1_endpoint_monitor::monitor::L1EndpointMonitorConfig;
-use apollo_l1_gas_price::eth_to_strk_oracle::{EthToStrkOracleConfig, ETH_TO_STRK_QUANTIZATION};
-use apollo_l1_gas_price::l1_gas_price_provider::L1GasPriceProviderConfig;
+use apollo_l1_endpoint_monitor_config::config::L1EndpointMonitorConfig;
+use apollo_l1_gas_price::eth_to_strk_oracle::ETH_TO_STRK_QUANTIZATION;
+use apollo_l1_gas_price_provider_config::config::{
+    EthToStrkOracleConfig,
+    L1GasPriceProviderConfig,
+    L1GasPriceScraperConfig,
+};
 use apollo_l1_gas_price_types::DEFAULT_ETH_TO_FRI_RATE;
-use apollo_l1_provider::l1_scraper::L1ScraperConfig;
-use apollo_l1_provider::L1ProviderConfig;
-use apollo_mempool::config::MempoolConfig;
-use apollo_mempool_p2p::config::MempoolP2pConfig;
-use apollo_monitoring_endpoint::config::MonitoringEndpointConfig;
+use apollo_l1_provider_config::config::L1ProviderConfig;
+use apollo_l1_scraper_config::config::L1ScraperConfig;
+use apollo_mempool_config::config::{MempoolConfig, MempoolDynamicConfig, MempoolStaticConfig};
+use apollo_mempool_p2p_config::config::MempoolP2pConfig;
+use apollo_monitoring_endpoint_config::config::MonitoringEndpointConfig;
 use apollo_network::network_manager::test_utils::create_connected_network_configs;
 use apollo_network::NetworkConfig;
-use apollo_node::config::component_config::ComponentConfig;
-use apollo_node::config::definitions::ConfigPointersMap;
-use apollo_node::config::node_config::{SequencerNodeConfig, CONFIG_POINTERS};
+use apollo_node_config::component_config::ComponentConfig;
+use apollo_node_config::component_execution_config::ExpectedComponentConfig;
+use apollo_node_config::definitions::ConfigPointersMap;
+use apollo_node_config::monitoring::MonitoringConfig;
+use apollo_node_config::node_config::{SequencerNodeConfig, CONFIG_POINTERS};
 use apollo_rpc::RpcConfig;
-use apollo_state_sync::config::StateSyncConfig;
+use apollo_sierra_compilation_config::config::SierraCompilationConfig;
+use apollo_state_sync_config::config::StateSyncConfig;
+use apollo_storage::db::DbConfig;
 use apollo_storage::StorageConfig;
 use axum::extract::Query;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use blockifier::blockifier::config::WorkerPoolConfig;
 #[cfg(feature = "cairo_native")]
-use blockifier::blockifier::config::{CairoNativeRunConfig, ContractClassManagerConfig};
-use blockifier::bouncer::{BouncerConfig, BouncerWeights, BuiltinWeights};
+use blockifier::blockifier::config::CairoNativeRunConfig;
+use blockifier::blockifier::config::{ContractClassManagerConfig, WorkerPoolConfig};
+use blockifier::bouncer::{BouncerConfig, BouncerWeights};
 use blockifier::context::ChainInfo;
 use blockifier_test_utils::cairo_versions::{CairoVersion, RunnableCairo1};
 use blockifier_test_utils::contracts::FeatureContract;
 use mempool_test_utils::starknet_api_test_utils::{AccountId, MultiAccountTransactionGenerator};
-use papyrus_base_layer::ethereum_base_layer_contract::{
-    EthereumBaseLayerConfig,
-    L1ToL2MessageArgs,
-    StarknetL1Contract,
-};
+use papyrus_base_layer::ethereum_base_layer_contract::EthereumBaseLayerConfig;
 use serde::Deserialize;
 use serde_json::{json, to_value};
 use starknet_api::block::BlockNumber;
@@ -63,7 +76,7 @@ use starknet_api::core::{ChainId, ContractAddress};
 use starknet_api::execution_resources::GasAmount;
 use starknet_api::rpc_transaction::RpcTransaction;
 use starknet_api::transaction::fields::ContractAddressSalt;
-use starknet_api::transaction::{TransactionHash, TransactionHasher};
+use starknet_api::transaction::{L1HandlerTransaction, TransactionHash, TransactionHasher};
 use starknet_types_core::felt::Felt;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, Instrument};
@@ -82,7 +95,7 @@ pub const N_TXS_IN_FIRST_BLOCK: usize = 2;
 
 pub type CreateRpcTxsFn = fn(&mut MultiAccountTransactionGenerator) -> Vec<RpcTransaction>;
 pub type CreateL1ToL2MessagesArgsFn =
-    fn(&mut MultiAccountTransactionGenerator) -> Vec<L1ToL2MessageArgs>;
+    fn(&mut MultiAccountTransactionGenerator) -> Vec<L1HandlerTransaction>;
 pub type TestTxHashesFn = fn(&[TransactionHash]) -> Vec<TransactionHash>;
 
 pub trait TestScenario {
@@ -90,7 +103,7 @@ pub trait TestScenario {
         &self,
         tx_generator: &mut MultiAccountTransactionGenerator,
         account_id: AccountId,
-    ) -> (Vec<RpcTransaction>, Vec<L1ToL2MessageArgs>);
+    ) -> (Vec<RpcTransaction>, Vec<L1HandlerTransaction>);
 
     fn n_txs(&self) -> usize;
 }
@@ -105,10 +118,11 @@ impl TestScenario for ConsensusTxs {
         &self,
         tx_generator: &mut MultiAccountTransactionGenerator,
         account_id: AccountId,
-    ) -> (Vec<RpcTransaction>, Vec<L1ToL2MessageArgs>) {
+    ) -> (Vec<RpcTransaction>, Vec<L1HandlerTransaction>) {
+        const SHOULD_REVERT: bool = false;
         (
             create_invoke_txs(tx_generator, account_id, self.n_invoke_txs),
-            create_l1_to_l2_messages_args(tx_generator, self.n_l1_handler_txs),
+            create_l1_to_l2_messages_args(tx_generator, self.n_l1_handler_txs, SHOULD_REVERT),
         )
     }
 
@@ -124,8 +138,9 @@ impl TestScenario for DeclareTx {
         &self,
         tx_generator: &mut MultiAccountTransactionGenerator,
         account_id: AccountId,
-    ) -> (Vec<RpcTransaction>, Vec<L1ToL2MessageArgs>) {
-        let declare_tx = tx_generator.account_with_id_mut(account_id).generate_declare();
+    ) -> (Vec<RpcTransaction>, Vec<L1HandlerTransaction>) {
+        let declare_tx =
+            tx_generator.account_with_id_mut(account_id).generate_declare_of_contract_class();
         (vec![declare_tx], vec![])
     }
 
@@ -141,7 +156,7 @@ impl TestScenario for DeployAndInvokeTxs {
         &self,
         tx_generator: &mut MultiAccountTransactionGenerator,
         account_id: AccountId,
-    ) -> (Vec<RpcTransaction>, Vec<L1ToL2MessageArgs>) {
+    ) -> (Vec<RpcTransaction>, Vec<L1HandlerTransaction>) {
         let txs = create_deploy_account_tx_and_invoke_tx(tx_generator, account_id);
         assert_eq!(
             txs.len(),
@@ -158,19 +173,21 @@ impl TestScenario for DeployAndInvokeTxs {
     }
 }
 
-// TODO(Tsabary/Shahak/Yair/AlonH): this function needs a proper cleaning.
+// TODO(Tsabary): clean the passed args.
 #[allow(clippy::too_many_arguments)]
 pub fn create_node_config(
     available_ports: &mut AvailablePorts,
     chain_info: ChainInfo,
     storage_config: StorageTestConfig,
     mut state_sync_config: StateSyncConfig,
-    consensus_manager_config: ConsensusManagerConfig,
+    mut consensus_manager_config: ConsensusManagerConfig,
+    eth_to_strk_oracle_config: EthToStrkOracleConfig,
     mempool_p2p_config: MempoolP2pConfig,
     monitoring_endpoint_config: MonitoringEndpointConfig,
-    component_config: ComponentConfig,
+    components: ComponentConfig,
     base_layer_config: EthereumBaseLayerConfig,
-    block_max_capacity_sierra_gas: GasAmount,
+    base_layer_url: Url,
+    block_max_capacity_gas: GasAmount,
     validator_id: ValidatorId,
     allow_bootstrap_txs: bool,
 ) -> (SequencerNodeConfig, ConfigPointersMap) {
@@ -179,27 +196,37 @@ pub fn create_node_config(
     let batcher_config = create_batcher_config(
         storage_config.batcher_storage_config,
         chain_info.clone(),
-        block_max_capacity_sierra_gas,
+        block_max_capacity_gas,
     );
+    let committer_config = CommitterConfig { enable_committer: true };
     let validate_non_zero_resource_bounds = !allow_bootstrap_txs;
     let gateway_config =
         create_gateway_config(chain_info.clone(), validate_non_zero_resource_bounds);
-    let l1_scraper_config =
-        L1ScraperConfig { chain_id: chain_info.chain_id.clone(), ..Default::default() };
+    let l1_scraper_config = L1ScraperConfig {
+        chain_id: chain_info.chain_id.clone(),
+        startup_rewind_time_seconds: Duration::from_secs(0),
+        polling_interval_seconds: Duration::from_secs(1),
+        ..Default::default()
+    };
     let l1_provider_config = L1ProviderConfig {
-        provider_startup_height_override: Some(BlockNumber(1)),
+        startup_sync_sleep_retry_interval_seconds: Duration::from_secs(0),
+        l1_handler_cancellation_timelock_seconds: Duration::from_secs(0),
+        l1_handler_consumption_timelock_seconds: Duration::from_secs(0),
+        new_l1_handler_cooldown_seconds: Duration::from_secs(0),
         ..Default::default()
     };
     let l1_endpoint_monitor_config = L1EndpointMonitorConfig {
         // This is the Anvil URL, initialized at the callsite.
         // TODO(Gilad): make this explicit in the Anvil refactor.
-        ordered_l1_endpoint_urls: vec![base_layer_config.node_url.clone()],
+        ordered_l1_endpoint_urls: vec![base_layer_url.clone()],
+        ..Default::default()
     };
-    let override_gas_price_threshold_check = allow_bootstrap_txs;
-    let mempool_config = create_mempool_config(override_gas_price_threshold_check);
+    let validate_resource_bounds = !allow_bootstrap_txs;
+    let mempool_config = create_mempool_config(validate_resource_bounds);
     let l1_gas_price_provider_config = L1GasPriceProviderConfig {
         // Use newly minted blocks on Anvil to be used for gas price calculations.
-        lag_margin_seconds: 0,
+        lag_margin_seconds: Duration::from_secs(0),
+        eth_to_strk_oracle_config,
         ..Default::default()
     };
     let http_server_config =
@@ -209,6 +236,12 @@ pub fn create_node_config(
     state_sync_config.storage_config = storage_config.state_sync_storage_config;
     state_sync_config.rpc_config.chain_id = chain_info.chain_id.clone();
     let starknet_url = state_sync_config.rpc_config.starknet_url.clone();
+
+    consensus_manager_config.consensus_manager_config.static_config.storage_config =
+        storage_config.consensus_storage_config.clone();
+
+    let l1_gas_price_scraper_config = L1GasPriceScraperConfig::default();
+    let sierra_compiler_config = SierraCompilationConfig::default();
 
     // Update config pointer values.
     let mut config_pointers_map = ConfigPointersMap::new(CONFIG_POINTERS.clone());
@@ -238,27 +271,75 @@ pub fn create_node_config(
         "starknet_url",
         to_value(starknet_url).expect("Failed to serialize starknet_url"),
     );
-    (
-        SequencerNodeConfig {
-            base_layer_config,
-            batcher_config,
-            class_manager_config,
-            consensus_manager_config,
-            gateway_config,
-            http_server_config,
-            mempool_config,
-            mempool_p2p_config,
-            monitoring_endpoint_config,
-            state_sync_config,
-            components: component_config,
-            l1_scraper_config,
-            l1_provider_config,
-            l1_endpoint_monitor_config,
-            l1_gas_price_provider_config,
-            ..Default::default()
-        },
-        config_pointers_map,
-    )
+
+    // A helper macro that wraps the config in `Some(...)` if `components.<field>` expects it;
+    // otherwise returns `None`. Assumes `components` is in scope.
+    macro_rules! wrap_if_component_config_expected {
+        ($component_field:ident, $config_field:expr) => {{
+            if components.$component_field.is_running_locally() {
+                Some($config_field)
+            } else {
+                None
+            }
+        }};
+    }
+
+    // Retain only the required configs.
+    let base_layer_config = Some(base_layer_config);
+    let batcher_config = wrap_if_component_config_expected!(batcher, batcher_config);
+    let class_manager_config =
+        wrap_if_component_config_expected!(class_manager, class_manager_config);
+    let config_manager_config = ConfigManagerConfig::disabled();
+    let config_manager_config =
+        wrap_if_component_config_expected!(config_manager, config_manager_config);
+    let committer_config = wrap_if_component_config_expected!(committer, committer_config);
+    let consensus_manager_config =
+        wrap_if_component_config_expected!(consensus_manager, consensus_manager_config);
+    let gateway_config = wrap_if_component_config_expected!(gateway, gateway_config);
+    let http_server_config = wrap_if_component_config_expected!(http_server, http_server_config);
+    let l1_endpoint_monitor_config =
+        wrap_if_component_config_expected!(l1_endpoint_monitor, l1_endpoint_monitor_config);
+    let l1_gas_price_provider_config =
+        wrap_if_component_config_expected!(l1_gas_price_provider, l1_gas_price_provider_config);
+    let l1_gas_price_scraper_config =
+        wrap_if_component_config_expected!(l1_gas_price_scraper, l1_gas_price_scraper_config);
+    let l1_provider_config = wrap_if_component_config_expected!(l1_provider, l1_provider_config);
+    let l1_scraper_config = wrap_if_component_config_expected!(l1_scraper, l1_scraper_config);
+    let mempool_config = wrap_if_component_config_expected!(mempool, mempool_config);
+    let mempool_p2p_config = wrap_if_component_config_expected!(mempool_p2p, mempool_p2p_config);
+    let monitoring_endpoint_config =
+        wrap_if_component_config_expected!(monitoring_endpoint, monitoring_endpoint_config);
+    let monitoring_config = MonitoringConfig::default();
+    let sierra_compiler_config =
+        wrap_if_component_config_expected!(sierra_compiler, sierra_compiler_config);
+    let state_sync_config = wrap_if_component_config_expected!(state_sync, state_sync_config);
+
+    let sequencer_node_config = SequencerNodeConfig {
+        base_layer_config,
+        batcher_config,
+        class_manager_config,
+        committer_config,
+        components,
+        config_manager_config,
+        consensus_manager_config,
+        gateway_config,
+        http_server_config,
+        l1_endpoint_monitor_config,
+        l1_gas_price_provider_config,
+        l1_gas_price_scraper_config,
+        l1_provider_config,
+        l1_scraper_config,
+        mempool_config,
+        mempool_p2p_config,
+        monitoring_endpoint_config,
+        monitoring_config,
+        sierra_compiler_config,
+        state_sync_config,
+    };
+
+    sequencer_node_config.validate_node_config().expect("Generated node config should be valid.");
+
+    (sequencer_node_config, config_pointers_map)
 }
 
 pub(crate) fn create_consensus_manager_configs_from_network_configs(
@@ -266,25 +347,30 @@ pub(crate) fn create_consensus_manager_configs_from_network_configs(
     n_composed_nodes: usize,
     chain_id: &ChainId,
 ) -> Vec<ConsensusManagerConfig> {
-    // TODO(Matan, Dan): set reasonable default timeouts.
-    let mut timeouts = TimeoutsConfig::default();
-    timeouts.precommit_timeout *= 3;
-    timeouts.prevote_timeout *= 3;
-    timeouts.proposal_timeout *= 3;
-
     let num_validators = u64::try_from(n_composed_nodes).unwrap();
-
+    let mut timeouts = TimeoutsConfig::default();
+    // Scale by 2.0 for integration runs to avoid timeouts.
+    timeouts.scale_by(2.0);
     network_configs
         .into_iter()
         // TODO(Matan): Get config from default config file.
         .map(|network_config| ConsensusManagerConfig {
             network_config,
-            immediate_active_height: BlockNumber(1),
-            consensus_config: ConsensusConfig {
-                // TODO(Matan, Dan): Set the right amount
-                startup_delay: Duration::from_secs(15),
-                timeouts: timeouts.clone(),
-                ..Default::default()
+            consensus_manager_config: ConsensusConfig {
+                dynamic_config: ConsensusDynamicConfig {
+                    timeouts: timeouts.clone(),
+                    ..Default::default()
+                },
+                static_config: ConsensusStaticConfig {
+                    storage_config: StorageConfig { db_config: DbConfig{
+                        path_prefix: "/data/consensus".into(),
+                        enforce_file_exists: false,
+                        ..Default::default()
+                    },
+                    ..Default::default() },
+                    // TODO(Matan, Dan): Set the right amount
+                    startup_delay: Duration::from_secs(15),
+                },
             },
             context_config: ContextConfig {
                 num_validators,
@@ -292,14 +378,8 @@ pub(crate) fn create_consensus_manager_configs_from_network_configs(
                 builder_address: ContractAddress::from(4_u128),
                 ..Default::default()
             },
-            cende_config: CendeConfig{
-                skip_write_height: Some(BlockNumber(1)),
+            cende_config: CendeConfig {
                 ..Default::default()
-            },
-            eth_to_strk_oracle_config: EthToStrkOracleConfig {
-                base_url: Url::parse("https://eth_to_strk_oracle_url")
-                    .expect("Should be a valid URL"),
-                    ..Default::default()
             },
             assume_no_malicious_validators: true,
             ..Default::default()
@@ -310,16 +390,27 @@ pub(crate) fn create_consensus_manager_configs_from_network_configs(
 // Creates a local recorder server that always returns a success status.
 pub fn spawn_success_recorder(socket_address: SocketAddr) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let router = Router::new().route(
-            RECORDER_WRITE_BLOB_PATH,
-            post(move || {
-                async {
-                    debug!("Received a request to write a blob.");
-                    StatusCode::OK.to_string()
-                }
-                .instrument(tracing::debug_span!("success recorder write_blob"))
-            }),
-        );
+        let router = Router::new()
+            .route(
+                RECORDER_WRITE_BLOB_PATH,
+                post(move || {
+                    async {
+                        debug!("Received a request to write a blob.");
+                        StatusCode::OK.to_string()
+                    }
+                    .instrument(tracing::debug_span!("success recorder write_blob"))
+                }),
+            )
+            .route(
+                RECORDER_WRITE_PRE_CONFIRMED_BLOCK_PATH,
+                post(move || {
+                    async {
+                        debug!("Received a request to write a pre-confirmed block.");
+                        StatusCode::OK.to_string()
+                    }
+                    .instrument(tracing::debug_span!("success recorder write_pre_confirmed_block"))
+                }),
+            );
         axum::Server::bind(&socket_address).serve(router.into_make_service()).await.unwrap();
     })
 }
@@ -328,7 +419,7 @@ pub fn spawn_local_success_recorder(port: u16) -> (Url, JoinHandle<()>) {
     // [127, 0, 0, 1] is the localhost IP address.
     let socket_address = SocketAddr::from(([127, 0, 0, 1], port));
     // TODO(Tsabary): create a socket-to-url function.
-    let url = Url::parse(&format!("http://{}", socket_address)).unwrap();
+    let url = Url::parse(&format!("http://{socket_address}")).unwrap();
     let join_handle = spawn_success_recorder(socket_address);
     (url, join_handle)
 }
@@ -350,7 +441,7 @@ async fn get_price(Query(query): Query<EthToStrkOracleQuery>) -> Json<serde_json
     //
     // TODO(Asmaa): Retrun timestamp as price once we start mocking out time in the
     // tests.
-    let price = format!("0x{:x}", DEFAULT_ETH_TO_FRI_RATE);
+    let price = format!("0x{DEFAULT_ETH_TO_FRI_RATE:x}");
     let response = json!({ "timestamp": query.timestamp ,"price": price, "decimals": ETH_TO_STRK_QUANTIZATION });
     Json(response)
 }
@@ -364,11 +455,15 @@ pub fn spawn_eth_to_strk_oracle_server(socket_address: SocketAddr) -> JoinHandle
 }
 
 /// Starts the fake eth to fri oracle server and returns its URL and handle.
-pub fn spawn_local_eth_to_strk_oracle(port: u16) -> (Url, JoinHandle<()>) {
+pub fn spawn_local_eth_to_strk_oracle(port: u16) -> (UrlAndHeaders, JoinHandle<()>) {
     let socket_address = SocketAddr::from(([127, 0, 0, 1], port));
-    let url = Url::parse(&format!("http://{}{}", socket_address, ETH_TO_STRK_ORACLE_PATH)).unwrap();
+    let url = Url::parse(&format!("http://{socket_address}{ETH_TO_STRK_ORACLE_PATH}")).unwrap();
+    let url_and_headers = UrlAndHeaders {
+        url,
+        headers: Default::default(), // No additional headers needed for this test.
+    };
     let join_handle = spawn_eth_to_strk_oracle_server(socket_address);
-    (url, join_handle)
+    (url_and_headers, join_handle)
 }
 
 pub fn create_mempool_p2p_configs(chain_id: ChainId, ports: Vec<u16>) -> Vec<MempoolP2pConfig> {
@@ -424,7 +519,7 @@ pub fn create_deploy_account_tx_and_invoke_tx(
     let undeployed_account_tx_generator = tx_generator.account_with_id_mut(account_id);
     assert!(!undeployed_account_tx_generator.is_deployed());
     let deploy_tx = undeployed_account_tx_generator.generate_deploy_account();
-    let invoke_tx = undeployed_account_tx_generator.generate_invoke_with_tip(1);
+    let invoke_tx = undeployed_account_tx_generator.generate_trivial_rpc_invoke_tx(1);
     vec![deploy_tx, invoke_tx]
 }
 
@@ -434,27 +529,25 @@ pub fn create_invoke_txs(
     n_txs: usize,
 ) -> Vec<RpcTransaction> {
     (0..n_txs)
-        .map(|_| tx_generator.account_with_id_mut(account_id).generate_invoke_with_tip(1))
+        .map(|_| tx_generator.account_with_id_mut(account_id).generate_trivial_rpc_invoke_tx(1))
         .collect()
 }
 
 pub fn create_l1_to_l2_messages_args(
     tx_generator: &mut MultiAccountTransactionGenerator,
     n_txs: usize,
-) -> Vec<L1ToL2MessageArgs> {
-    (0..n_txs).map(|_| tx_generator.create_l1_to_l2_message_args()).collect()
+    should_revert: bool,
+) -> Vec<L1HandlerTransaction> {
+    (0..n_txs).map(|_| tx_generator.create_l1_to_l2_message_args(should_revert)).collect()
 }
 
 pub async fn send_message_to_l2_and_calculate_tx_hash(
-    send_message_to_l2_args: L1ToL2MessageArgs,
-    starknet_l1_contract: &StarknetL1Contract,
+    l1_handler: L1HandlerTransaction,
+    anvil_base_layer: &AnvilBaseLayer,
     chain_id: &ChainId,
 ) -> TransactionHash {
-    starknet_l1_contract.send_message_to_l2(&send_message_to_l2_args).await;
-    send_message_to_l2_args
-        .tx
-        .calculate_transaction_hash(chain_id, &send_message_to_l2_args.tx.version)
-        .unwrap()
+    anvil_base_layer.send_message_to_l2(&l1_handler).await;
+    l1_handler.calculate_transaction_hash(chain_id, &l1_handler.version).unwrap()
 }
 
 async fn send_rpc_txs<'a, Fut>(
@@ -478,7 +571,7 @@ where
 pub async fn run_test_scenario<'a, Fut>(
     tx_generator: &mut MultiAccountTransactionGenerator,
     create_rpc_txs_fn: CreateRpcTxsFn,
-    l1_to_l2_message_args: Vec<L1ToL2MessageArgs>,
+    l1_handlers: Vec<L1HandlerTransaction>,
     send_rpc_tx_fn: &'a mut dyn Fn(RpcTransaction) -> Fut,
     test_tx_hashes_fn: TestTxHashesFn,
     chain_id: &ChainId,
@@ -486,9 +579,11 @@ pub async fn run_test_scenario<'a, Fut>(
 where
     Fut: Future<Output = TransactionHash> + 'a,
 {
-    let mut tx_hashes: Vec<TransactionHash> = l1_to_l2_message_args
+    let mut tx_hashes: Vec<TransactionHash> = l1_handlers
         .iter()
-        .map(|args| args.tx.calculate_transaction_hash(chain_id, &args.tx.version).unwrap())
+        .map(|l1_handler| {
+            l1_handler.calculate_transaction_hash(chain_id, &l1_handler.version).unwrap()
+        })
         .collect();
 
     let rpc_txs = create_rpc_txs_fn(tx_generator);
@@ -502,7 +597,7 @@ pub async fn send_consensus_txs<'a, 'b, FutA, FutB>(
     account_id: AccountId,
     test_scenario: &impl TestScenario,
     send_rpc_tx_fn: &'a mut dyn Fn(RpcTransaction) -> FutA,
-    send_l1_handler_tx_fn: &'b mut dyn Fn(L1ToL2MessageArgs) -> FutB,
+    send_l1_handler_tx_fn: &'b mut dyn Fn(L1HandlerTransaction) -> FutB,
 ) -> Vec<TransactionHash>
 where
     FutA: Future<Output = TransactionHash> + 'a,
@@ -530,26 +625,32 @@ pub fn create_gateway_config(
     validate_non_zero_resource_bounds: bool,
 ) -> GatewayConfig {
     let stateless_tx_validator_config = StatelessTransactionValidatorConfig {
-        validate_non_zero_resource_bounds,
-        max_calldata_length: 10,
+        validate_resource_bounds: validate_non_zero_resource_bounds,
+        max_calldata_length: 19,
         max_signature_length: 2,
         ..Default::default()
     };
-    let stateful_tx_validator_config =
-        StatefulTransactionValidatorConfig { max_allowed_nonce_gap: 1000, ..Default::default() };
+    let stateful_tx_validator_config = StatefulTransactionValidatorConfig {
+        max_allowed_nonce_gap: 1000,
+        validate_resource_bounds: validate_non_zero_resource_bounds,
+        ..Default::default()
+    };
+    let contract_class_manager_config = ContractClassManagerConfig::default();
 
     GatewayConfig {
         stateless_tx_validator_config,
         stateful_tx_validator_config,
+        contract_class_manager_config,
         chain_info,
         block_declare: false,
+        authorized_declarer_accounts: None,
     }
 }
 
 pub fn create_batcher_config(
     batcher_storage_config: StorageConfig,
     chain_info: ChainInfo,
-    block_max_capacity_sierra_gas: GasAmount,
+    block_max_capacity_gas: GasAmount,
 ) -> BatcherConfig {
     // TODO(Arni): Create BlockBuilderConfig create for testing method and use here.
     BatcherConfig {
@@ -558,10 +659,11 @@ pub fn create_batcher_config(
             chain_info,
             bouncer_config: BouncerConfig {
                 block_max_capacity: BouncerWeights {
-                    sierra_gas: block_max_capacity_sierra_gas,
+                    sierra_gas: block_max_capacity_gas,
+                    proving_gas: block_max_capacity_gas,
                     ..Default::default()
                 },
-                builtin_weights: BuiltinWeights::default(),
+                ..Default::default()
             },
             execute_config: WorkerPoolConfig::create_for_testing(),
             n_concurrent_txs: 3,
@@ -573,11 +675,10 @@ pub fn create_batcher_config(
     }
 }
 
-pub fn create_mempool_config(override_gas_price_threshold_check: bool) -> MempoolConfig {
+pub fn create_mempool_config(validate_resource_bounds: bool) -> MempoolConfig {
     MempoolConfig {
-        transaction_ttl: Duration::from_secs(5 * 60),
-        override_gas_price_threshold_check,
-        ..Default::default()
+        dynamic_config: MempoolDynamicConfig { transaction_ttl: Duration::from_secs(5 * 60) },
+        static_config: MempoolStaticConfig { validate_resource_bounds, ..Default::default() },
     }
 }
 
@@ -596,10 +697,11 @@ pub fn set_validator_id(
     node_index: usize,
 ) -> ValidatorId {
     let validator_id = ValidatorId::try_from(
-        Felt::from(consensus_manager_config.consensus_config.validator_id) + Felt::from(node_index),
+        Felt::from(consensus_manager_config.consensus_manager_config.dynamic_config.validator_id)
+            + Felt::from(node_index),
     )
     .unwrap();
-    consensus_manager_config.consensus_config.validator_id = validator_id;
+    consensus_manager_config.consensus_manager_config.dynamic_config.validator_id = validator_id;
     validator_id
 }
 
@@ -618,6 +720,7 @@ pub fn create_state_sync_configs(
                 port: rpc_ports.remove(0),
                 ..Default::default()
             },
+            should_replay_processed_txs_metric: true,
             ..Default::default()
         })
         .collect()

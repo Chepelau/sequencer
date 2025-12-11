@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::collections::btree_map::IntoIter;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use blockifier::execution::call_info::CallExecution;
 use blockifier::execution::syscalls::secp::SecpHintProcessor;
@@ -8,8 +8,8 @@ use blockifier::execution::syscalls::vm_syscall_utils::{execute_next_syscall, Sy
 use blockifier::state::state_api::StateReader;
 #[cfg(any(feature = "testing", test))]
 use blockifier::test_utils::dict_state_reader::DictStateReader;
-use cairo_lang_casm::hints::{Hint as Cairo1Hint, StarknetHint};
-use cairo_lang_runner::casm_run::execute_core_hint_base;
+use cairo_lang_casm::hints::{CoreHint, CoreHintBase, Hint as Cairo1Hint, StarknetHint};
+use cairo_lang_runner::casm_run::{cell_ref_to_relocatable, execute_core_hint_base};
 use cairo_lang_starknet_classes::casm_contract_class::CasmContractClass;
 use cairo_vm::hint_processor::builtin_hint_processor::builtin_hint_processor_definition::{
     BuiltinHintProcessor,
@@ -22,9 +22,11 @@ use cairo_vm::types::relocatable::Relocatable;
 use cairo_vm::vm::errors::hint_errors::HintError as VmHintError;
 use cairo_vm::vm::runners::cairo_runner::ResourceTracker;
 use cairo_vm::vm::vm_core::VirtualMachine;
-use starknet_api::core::ClassHash;
+use rand::{Rng, SeedableRng};
+use starknet_api::core::{ClassHash, CompiledClassHash};
 use starknet_api::deprecated_contract_class::ContractClass;
 use starknet_types_core::felt::Felt;
+use starknet_types_core::hash::{Poseidon, StarkHash};
 
 use crate::errors::StarknetOsError;
 use crate::hint_processor::common_hint_processor::{
@@ -127,7 +129,7 @@ pub struct SnosHintProcessor<'a, S: StateReader> {
     pub(crate) os_hints_config: OsHintsConfig,
     pub(crate) deprecated_compiled_classes_iter: IntoIter<ClassHash, ContractClass>,
     pub(crate) deprecated_class_hashes: HashSet<ClassHash>,
-    pub(crate) compiled_classes: BTreeMap<ClassHash, CasmContractClass>,
+    pub(crate) compiled_classes: BTreeMap<CompiledClassHash, CasmContractClass>,
     pub(crate) state_update_pointers: Option<StateUpdatePointers>,
     builtin_hint_processor: BuiltinHintProcessor,
     // The type of commitment tree next in line for hashing. Used to determine which HashBuiltin
@@ -137,6 +139,8 @@ pub struct SnosHintProcessor<'a, S: StateReader> {
     da_segment: Option<Vec<Felt>>,
     // Indicates wether to create pages or not when serializing data-availability.
     pub(crate) serialize_data_availability_create_pages: bool,
+    // The random number generator.
+    pub(crate) rng: rand::rngs::StdRng,
     // For testing, track hint coverage.
     #[cfg(any(test, feature = "testing"))]
     pub unused_hints: HashSet<AllHints>,
@@ -150,7 +154,7 @@ impl<'a, S: StateReader> SnosHintProcessor<'a, S> {
         os_block_inputs: Vec<&'a OsBlockInput>,
         cached_state_inputs: Vec<CachedStateInput>,
         deprecated_compiled_classes: BTreeMap<ClassHash, ContractClass>,
-        compiled_classes: BTreeMap<ClassHash, CasmContractClass>,
+        compiled_classes: BTreeMap<CompiledClassHash, CasmContractClass>,
         state_readers: Vec<S>,
     ) -> Result<Self, StarknetOsError> {
         if state_readers.len() != os_block_inputs.len() {
@@ -160,6 +164,7 @@ impl<'a, S: StateReader> SnosHintProcessor<'a, S> {
             )
             .into());
         }
+        let rng_seed = Self::rng_seed(&os_block_inputs, &os_hints_config.rng_seed_salt);
         let execution_helpers = os_block_inputs
             .into_iter()
             .zip(cached_state_inputs.into_iter())
@@ -185,9 +190,22 @@ impl<'a, S: StateReader> SnosHintProcessor<'a, S> {
             state_update_pointers: None,
             commitment_type: CommitmentType::State,
             serialize_data_availability_create_pages: false,
+            rng: rand::rngs::StdRng::from_seed(rng_seed.to_bytes_be()),
             #[cfg(any(test, feature = "testing"))]
             unused_hints: AllHints::all_iter().collect(),
         })
+    }
+
+    /// Hashes the block hashes of the given block inputs to get a seed for the random number
+    /// generator.
+    fn rng_seed(os_block_inputs: &Vec<&'a OsBlockInput>, rng_seed_salt: &Option<Felt>) -> Felt {
+        Poseidon::hash_array(
+            &os_block_inputs
+                .iter()
+                .map(|block_input| block_input.new_block_hash.0)
+                .chain([rng_seed_salt.unwrap_or_default()])
+                .collect::<Vec<_>>(),
+        )
     }
 
     /// Returns an execution helper reference of the currently processed block.
@@ -284,6 +302,10 @@ impl<S: StateReader> HintProcessorLogic for SnosHintProcessor<'_, S> {
 impl<'program, S: StateReader> CommonHintProcessor<'program> for SnosHintProcessor<'program, S> {
     impl_common_hint_processor_getters!();
 
+    fn get_rng(&mut self) -> &mut rand::rngs::StdRng {
+        &mut self.rng
+    }
+
     fn execute_cairo0_unique_hint(
         &mut self,
         hint: &AllHints,
@@ -360,12 +382,8 @@ impl<S: StateReader> ResourceTracker for SnosHintProcessor<'_, S> {}
 
 #[derive(Default)]
 pub struct SyscallHintProcessor {
-    // Sha256 segment related fields.
-    pub(crate) sha256_segment: Option<Relocatable>,
-    pub(crate) sha256_block_count: usize,
     syscall_ptr: Option<Relocatable>,
     pub(crate) syscall_usage: SyscallUsageMap,
-
     // Secp hint processors.
     pub(crate) secp256k1_hint_processor: SecpHintProcessor<ark_secp256k1::Config>,
     pub(crate) secp256r1_hint_processor: SecpHintProcessor<ark_secp256r1::Config>,

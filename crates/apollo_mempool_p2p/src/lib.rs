@@ -1,4 +1,3 @@
-pub mod config;
 pub mod metrics;
 pub mod propagator;
 pub mod runner;
@@ -8,19 +7,27 @@ use std::collections::HashMap;
 use apollo_class_manager_types::transaction_converter::TransactionConverter;
 use apollo_class_manager_types::SharedClassManagerClient;
 use apollo_gateway_types::communication::SharedGatewayClient;
+use apollo_mempool_p2p_config::config::MempoolP2pConfig;
 use apollo_mempool_p2p_types::communication::SharedMempoolP2pPropagatorClient;
 use apollo_network::gossipsub_impl::Topic;
-use apollo_network::network_manager::metrics::{BroadcastNetworkMetrics, NetworkMetrics};
+use apollo_network::metrics::{
+    BroadcastNetworkMetrics,
+    EventMetrics,
+    LatencyMetrics,
+    NetworkMetrics,
+};
 use apollo_network::network_manager::{BroadcastTopicChannels, NetworkManager};
 use futures::FutureExt;
 use metrics::MEMPOOL_P2P_NUM_BLACKLISTED_PEERS;
 use tracing::{info_span, Instrument};
 
-use crate::config::MempoolP2pConfig;
 use crate::metrics::{
+    MEMPOOL_P2P_NETWORK_EVENTS,
     MEMPOOL_P2P_NUM_CONNECTED_PEERS,
+    MEMPOOL_P2P_NUM_DROPPED_MESSAGES,
     MEMPOOL_P2P_NUM_RECEIVED_MESSAGES,
     MEMPOOL_P2P_NUM_SENT_MESSAGES,
+    MEMPOOL_P2P_PING_LATENCY,
 };
 use crate::propagator::MempoolP2pPropagator;
 use crate::runner::MempoolP2pRunner;
@@ -43,6 +50,7 @@ pub fn create_p2p_propagator_and_runner(
         BroadcastNetworkMetrics {
             num_sent_broadcast_messages: MEMPOOL_P2P_NUM_SENT_MESSAGES,
             num_received_broadcast_messages: MEMPOOL_P2P_NUM_RECEIVED_MESSAGES,
+            num_dropped_broadcast_messages: MEMPOOL_P2P_NUM_DROPPED_MESSAGES,
         },
     );
     let network_manager_metrics = Some(NetworkMetrics {
@@ -50,6 +58,8 @@ pub fn create_p2p_propagator_and_runner(
         num_blacklisted_peers: MEMPOOL_P2P_NUM_BLACKLISTED_PEERS,
         broadcast_metrics_by_topic: Some(broadcast_metrics_by_topic),
         sqmr_metrics: None,
+        event_metrics: Some(EventMetrics { event_counter: MEMPOOL_P2P_NETWORK_EVENTS }),
+        latency_metrics: Some(LatencyMetrics { ping_latency_seconds: MEMPOOL_P2P_PING_LATENCY }),
     });
     let mut network_manager = NetworkManager::new(
         mempool_p2p_config.network_config,
@@ -77,6 +87,7 @@ pub fn create_p2p_propagator_and_runner(
         gateway_client,
         mempool_p2p_propagator_client,
         mempool_p2p_config.transaction_batch_rate_millis,
+        mempool_p2p_config.max_concurrent_gateway_requests,
     );
     (mempool_p2p_propagator, mempool_p2p_runner)
 }

@@ -24,6 +24,7 @@
 //! #     min_size: 1 << 20,    // 1MB
 //! #     max_size: 1 << 35,    // 32GB
 //! #     growth_step: 1 << 26, // 64MB
+//! #     max_readers: 1 << 13, // 8K readers
 //! # };
 //! # let storage_config = StorageConfig{db_config, ..Default::default()};
 //! let state_diff = ThinStateDiff::default();
@@ -56,11 +57,11 @@ mod state_test;
 
 use std::collections::HashSet;
 
-use apollo_proc_macros::latency_histogram;
+use apollo_proc_macros::{latency_histogram, sequencer_latency_histogram};
 use cairo_lang_starknet_classes::casm_contract_class::CasmContractClass;
 use indexmap::IndexMap;
 use starknet_api::block::BlockNumber;
-use starknet_api::core::{ClassHash, ContractAddress, Nonce};
+use starknet_api::core::{ClassHash, CompiledClassHash, ContractAddress, Nonce};
 use starknet_api::deprecated_contract_class::ContractClass as DeprecatedContractClass;
 use starknet_api::state::{SierraContractClass, StateNumber, StorageKey, ThinStateDiff};
 use starknet_types_core::felt::Felt;
@@ -69,8 +70,7 @@ use tracing::debug;
 use crate::db::serialization::{NoVersionValueWrapper, VersionZeroWrapper};
 use crate::db::table_types::{CommonPrefix, DbCursorTrait, SimpleTable, Table};
 use crate::db::{DbTransaction, TableHandle, TransactionKind, RW};
-#[cfg(feature = "document_calls")]
-use crate::document_calls::{add_query, StorageQuery};
+use crate::metrics::STORAGE_APPEND_THIN_STATE_DIFF_LATENCY;
 use crate::mmap_file::LocationInFile;
 use crate::state::data::IndexedDeprecatedContractClass;
 use crate::{
@@ -96,6 +96,8 @@ pub(crate) type DeprecatedDeclaredClassesBlockTable<'env> =
     TableHandle<'env, ClassHash, NoVersionValueWrapper<BlockNumber>, SimpleTable>;
 pub(crate) type CompiledClassesTable<'env> =
     TableHandle<'env, ClassHash, VersionZeroWrapper<LocationInFile>, SimpleTable>;
+pub(crate) type StatelessCompiledClassHashV2Table<'env> =
+    TableHandle<'env, ClassHash, NoVersionValueWrapper<CompiledClassHash>, SimpleTable>;
 pub(crate) type DeployedContractsTable<'env> =
     TableHandle<'env, (ContractAddress, BlockNumber), VersionZeroWrapper<ClassHash>, SimpleTable>;
 pub(crate) type ContractStorageTable<'env> = TableHandle<
@@ -106,6 +108,12 @@ pub(crate) type ContractStorageTable<'env> = TableHandle<
 >;
 pub(crate) type NoncesTable<'env> =
     TableHandle<'env, (ContractAddress, BlockNumber), VersionZeroWrapper<Nonce>, CommonPrefix>;
+pub(crate) type CompiledClassHashTable<'env> = TableHandle<
+    'env,
+    (ClassHash, BlockNumber),
+    VersionZeroWrapper<CompiledClassHash>,
+    CommonPrefix,
+>;
 
 /// Interface for reading data related to the state.
 // Structure of state data:
@@ -125,6 +133,8 @@ pub(crate) type NoncesTable<'env> =
 //   block_num.
 // * nonces_table: (contract_address, block_num) -> (nonce). Specifies that at `block_num`, the
 //   nonce of `contract_address` was changed to `nonce`.
+// * compiled_class_hash_table: (class_hash, block_num) -> (compiled_class_hash). Specifies that at
+//   `block_num`, the compiled class hash of `class_hash` was changed to `compiled_class_hash`.
 pub trait StateStorageReader<Mode: TransactionKind> {
     /// The state marker is the first block number that doesn't exist yet.
     fn get_state_marker(&self) -> StorageResult<BlockNumber>;
@@ -195,6 +205,7 @@ pub struct StateReader<'env, Mode: TransactionKind> {
     deprecated_declared_classes_block_table: DeprecatedDeclaredClassesBlockTable<'env>,
     deployed_contracts_table: DeployedContractsTable<'env>,
     nonces_table: NoncesTable<'env>,
+    compiled_class_hash_table: CompiledClassHashTable<'env>,
     storage_table: ContractStorageTable<'env>,
     markers_table: MarkersTable<'env>,
     file_handlers: &'env FileHandlers<Mode>,
@@ -211,6 +222,7 @@ impl<'env, Mode: TransactionKind> StateReader<'env, Mode> {
     /// # Errors
     /// Returns [`StorageError`] if there was an error opening the tables.
     fn new(txn: &'env StorageTxn<'env, Mode>) -> StorageResult<Self> {
+        let compiled_class_hash_table = txn.txn.open_table(&txn.tables.compiled_class_hash)?;
         let declared_classes_table = txn.txn.open_table(&txn.tables.declared_classes)?;
         let declared_classes_block_table =
             txn.txn.open_table(&txn.tables.declared_classes_block)?;
@@ -224,6 +236,7 @@ impl<'env, Mode: TransactionKind> StateReader<'env, Mode> {
         let markers_table = txn.txn.open_table(&txn.tables.markers)?;
         Ok(StateReader {
             txn: &txn.txn,
+            compiled_class_hash_table,
             declared_classes_table,
             declared_classes_block_table,
             deprecated_declared_classes_table,
@@ -250,10 +263,6 @@ impl<'env, Mode: TransactionKind> StateReader<'env, Mode> {
         state_number: StateNumber,
         address: &ContractAddress,
     ) -> StorageResult<Option<ClassHash>> {
-        // TODO(dvir): create an attribute instead of this.
-        #[cfg(feature = "document_calls")]
-        add_query(StorageQuery::GetClassHashAt(state_number, *address));
-
         let first_irrelevant_block: BlockNumber = state_number.block_after();
         let db_key = (*address, first_irrelevant_block);
         let mut cursor = self.deployed_contracts_table.cursor(self.txn)?;
@@ -281,12 +290,33 @@ impl<'env, Mode: TransactionKind> StateReader<'env, Mode> {
         state_number: StateNumber,
         address: &ContractAddress,
     ) -> StorageResult<Option<Nonce>> {
-        #[cfg(feature = "document_calls")]
-        add_query(StorageQuery::GetNonceAt(state_number, *address));
-
         // State diff updates are indexed by the block_number at which they occurred.
         let block_number: BlockNumber = state_number.block_after();
         get_nonce_at(block_number, address, self.txn, &self.nonces_table)
+    }
+
+    /// Returns the compiled class hash at a given state number.
+    /// If CompiledClassHash is not found at the given state number, returns `None`.
+    ///
+    /// # Arguments
+    /// * state_number - state number to search before.
+    /// * class_hash - The class hash to search for.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] if there was an error searching the table.
+    pub fn get_compiled_class_hash_at(
+        &self,
+        state_number: StateNumber,
+        class_hash: &ClassHash,
+    ) -> StorageResult<Option<CompiledClassHash>> {
+        // State diff updates are indexed by the block_number at which they occurred.
+        let block_number: BlockNumber = state_number.block_after();
+        get_compiled_class_hash_at(
+            block_number,
+            class_hash,
+            self.txn,
+            &self.compiled_class_hash_table,
+        )
     }
 
     /// Returns the storage value at a given state number for a given contract and key.
@@ -305,9 +335,6 @@ impl<'env, Mode: TransactionKind> StateReader<'env, Mode> {
         address: &ContractAddress,
         key: &StorageKey,
     ) -> StorageResult<Felt> {
-        #[cfg(feature = "document_calls")]
-        add_query(StorageQuery::GetStorageAt(state_number, *address, *key));
-
         // The updates to the storage key are indexed by the block_number at which they occurred.
         let first_irrelevant_block: BlockNumber = state_number.block_after();
         // The relevant update is the last update strictly before `first_irrelevant_block`.
@@ -431,7 +458,7 @@ impl<'env, Mode: TransactionKind> StateReader<'env, Mode> {
 }
 
 impl StateStorageWriter for StorageTxn<'_, RW> {
-    #[latency_histogram("storage_append_thin_state_diff_latency_seconds", false)]
+    #[sequencer_latency_histogram(STORAGE_APPEND_THIN_STATE_DIFF_LATENCY, false)]
     fn append_state_diff(
         self,
         block_number: BlockNumber,
@@ -446,6 +473,7 @@ impl StateStorageWriter for StorageTxn<'_, RW> {
         let declared_classes_block_table = self.open_table(&self.tables.declared_classes_block)?;
         let deprecated_declared_classes_block_table =
             self.open_table(&self.tables.deprecated_declared_classes_block)?;
+        let compiled_class_hash_table = self.open_table(&self.tables.compiled_class_hash)?;
 
         // Write state.
         write_deployed_contracts(
@@ -464,9 +492,19 @@ impl StateStorageWriter for StorageTxn<'_, RW> {
         // Must be called after write_deployed_contracts since the nonces are updated there.
         write_nonces(&thin_state_diff.nonces, &self.txn, block_number, &nonces_table)?;
 
-        for (class_hash, _) in &thin_state_diff.declared_classes {
-            declared_classes_block_table.insert(&self.txn, class_hash, &block_number)?;
+        for (class_hash, _) in &thin_state_diff.class_hash_to_compiled_class_hash {
+            let not_declared = declared_classes_block_table.get(&self.txn, class_hash)?.is_none();
+            if not_declared {
+                declared_classes_block_table.insert(&self.txn, class_hash, &block_number)?;
+            }
         }
+
+        write_compiled_class_hashes(
+            &thin_state_diff.class_hash_to_compiled_class_hash,
+            &self.txn,
+            block_number,
+            &compiled_class_hash_table,
+        )?;
 
         for class_hash in thin_state_diff.deprecated_declared_classes.iter() {
             // Cairo0 classes can be declared in different blocks. The first block to declare the
@@ -511,10 +549,13 @@ impl StateStorageWriter for StorageTxn<'_, RW> {
             self.open_table(&self.tables.deprecated_declared_classes_block)?;
         // TODO(yair): Consider reverting the compiled classes in their own module.
         let compiled_classes_table = self.open_table(&self.tables.casms)?;
+        let compiled_class_hash_v2_table =
+            self.open_table(&self.tables.stateless_compiled_class_hash_v2)?;
         let deployed_contracts_table = self.open_table(&self.tables.deployed_contracts)?;
         let nonces_table = self.open_table(&self.tables.nonces)?;
         let storage_table = self.open_table(&self.tables.contract_storage)?;
         let state_diffs_table = self.open_table(&self.tables.state_diffs)?;
+        let compiled_class_hash_table = self.open_table(&self.tables.compiled_class_hash)?;
 
         let current_state_marker = self.get_state_marker()?;
 
@@ -548,6 +589,7 @@ impl StateStorageWriter for StorageTxn<'_, RW> {
             &self.txn,
             &thin_state_diff,
             &declared_classes_block_table,
+            block_number,
         )?;
         let deleted_classes = delete_declared_classes(
             &self.txn,
@@ -570,9 +612,14 @@ impl StateStorageWriter for StorageTxn<'_, RW> {
         )?;
         let deleted_compiled_classes = delete_compiled_classes(
             &self.txn,
-            thin_state_diff.declared_classes.keys(),
+            thin_state_diff.class_hash_to_compiled_class_hash.keys(),
             &compiled_classes_table,
             &self.file_handlers,
+        )?;
+        delete_compiled_class_hashes_v2(
+            &self.txn,
+            thin_state_diff.class_hash_to_compiled_class_hash.keys(),
+            &compiled_class_hash_v2_table,
         )?;
         delete_deployed_contracts(
             &self.txn,
@@ -583,6 +630,12 @@ impl StateStorageWriter for StorageTxn<'_, RW> {
         )?;
         delete_storage_diffs(&self.txn, block_number, &thin_state_diff, &storage_table)?;
         delete_nonces(&self.txn, block_number, &thin_state_diff, &nonces_table)?;
+        delete_compiled_class_hashes(
+            &self.txn,
+            block_number,
+            &thin_state_diff,
+            &compiled_class_hash_table,
+        )?;
         state_diffs_table.delete(&self.txn, &block_number)?;
 
         Ok((
@@ -641,7 +694,7 @@ fn advance_compiled_class_marker_over_blocks_without_classes<'env>(
             .unwrap_or_else(|| panic!("Missing state diff for block {compiled_class_marker}"));
         if !file_handlers
             .get_thin_state_diff_unchecked(state_diff_location)?
-            .declared_classes
+            .class_hash_to_compiled_class_hash
             .is_empty()
         {
             break;
@@ -690,6 +743,19 @@ fn write_nonces<'env>(
     Ok(())
 }
 
+#[latency_histogram("storage_write_nonce_latency_seconds", false)]
+fn write_compiled_class_hashes<'env>(
+    compiled_class_hashes: &IndexMap<ClassHash, CompiledClassHash>,
+    txn: &DbTransaction<'env, RW>,
+    block_number: BlockNumber,
+    compiled_class_hash_table: &'env CompiledClassHashTable<'env>,
+) -> StorageResult<()> {
+    for (class_hash, compiled_class_hash) in compiled_class_hashes {
+        compiled_class_hash_table.insert(txn, &(*class_hash, block_number), compiled_class_hash)?;
+    }
+    Ok(())
+}
+
 #[latency_histogram("storage_write_storage_diffs_latency_seconds", false)]
 fn write_storage_diffs<'env>(
     storage_diffs: &IndexMap<ContractAddress, IndexMap<StorageKey, Felt>>,
@@ -709,11 +775,23 @@ fn delete_declared_classes_block<'env>(
     txn: &'env DbTransaction<'env, RW>,
     thin_state_diff: &ThinStateDiff,
     declared_classes_block_table: &'env DeclaredClassesBlockTable<'env>,
+    block_number: BlockNumber,
 ) -> StorageResult<Vec<ClassHash>> {
     let mut deleted_data = Vec::new();
-    for class_hash in thin_state_diff.declared_classes.keys() {
-        declared_classes_block_table.delete(txn, class_hash)?;
-        deleted_data.push(*class_hash);
+    for class_hash in thin_state_diff.class_hash_to_compiled_class_hash.keys() {
+        let class_block_entry =
+            declared_classes_block_table.get(txn, class_hash)?.ok_or_else(|| {
+                StorageError::DBInconsistency {
+                    msg: format!(
+                        "Attempting to revert declaration of class {class_hash} but it doesn't \
+                         exist in the DB"
+                    ),
+                }
+            })?;
+        if class_block_entry == block_number {
+            declared_classes_block_table.delete(txn, class_hash)?;
+            deleted_data.push(*class_hash);
+        }
     }
     Ok(deleted_data)
 }
@@ -725,7 +803,7 @@ fn delete_declared_classes<'env>(
     file_handlers: &FileHandlers<RW>,
 ) -> StorageResult<IndexMap<ClassHash, SierraContractClass>> {
     let mut deleted_data = IndexMap::new();
-    for class_hash in thin_state_diff.declared_classes.keys() {
+    for class_hash in thin_state_diff.class_hash_to_compiled_class_hash.keys() {
         let Some(contract_class_location) = declared_classes_table.get(txn, class_hash)? else {
             continue;
         };
@@ -882,6 +960,29 @@ fn delete_nonces<'env>(
     Ok(())
 }
 
+fn delete_compiled_class_hashes<'env>(
+    txn: &'env DbTransaction<'env, RW>,
+    block_number: BlockNumber,
+    thin_state_diff: &ThinStateDiff,
+    compiled_class_hash_table: &'env CompiledClassHashTable<'env>,
+) -> StorageResult<()> {
+    for (class_hash, _) in &thin_state_diff.class_hash_to_compiled_class_hash {
+        compiled_class_hash_table.delete(txn, &(*class_hash, block_number))?;
+    }
+    Ok(())
+}
+
+fn delete_compiled_class_hashes_v2<'env>(
+    txn: &'env DbTransaction<'env, RW>,
+    class_hashes: impl Iterator<Item = &'env ClassHash>,
+    compiled_class_hash_v2_table: &'env StatelessCompiledClassHashV2Table<'env>,
+) -> StorageResult<()> {
+    for class_hash in class_hashes {
+        compiled_class_hash_v2_table.delete(txn, class_hash)?;
+    }
+    Ok(())
+}
+
 fn get_nonce_at<'env, Mode: TransactionKind>(
     first_irrelevant_block: BlockNumber,
     address: &ContractAddress,
@@ -899,6 +1000,31 @@ fn get_nonce_at<'env, Mode: TransactionKind>(
         Some(((got_address, _got_block_number), value)) => {
             if got_address != *address {
                 // The previous item belongs to different address, which means there is no
+                // previous state diff for this item.
+                return Ok(None);
+            };
+            // The previous db item indeed belongs to this address and key.
+            Ok(Some(value))
+        }
+    }
+}
+
+fn get_compiled_class_hash_at<'env, Mode: TransactionKind>(
+    first_irrelevant_block: BlockNumber,
+    class_hash: &ClassHash,
+    txn: &'env DbTransaction<'env, Mode>,
+    compiled_class_hash_table: &'env CompiledClassHashTable<'env>,
+) -> StorageResult<Option<CompiledClassHash>> {
+    let db_key = (*class_hash, first_irrelevant_block);
+    // Find the previous db item.
+    let mut cursor = compiled_class_hash_table.cursor(txn)?;
+    cursor.lower_bound(&db_key)?;
+    let res = cursor.prev()?;
+    match res {
+        None => Ok(None),
+        Some(((got_class_hash, _got_block_number), value)) => {
+            if got_class_hash != *class_hash {
+                // The previous item belongs to different class hash, which means there is no
                 // previous state diff for this item.
                 return Ok(None);
             };

@@ -19,6 +19,7 @@ use crate::transaction_provider::{
     ProposeTransactionProvider,
     TransactionProvider,
     TransactionProviderError,
+    TxProviderPhase,
     ValidateTransactionProvider,
 };
 
@@ -63,13 +64,22 @@ impl MockDependencies {
         }
     }
 
-    fn propose_tx_provider(self) -> ProposeTransactionProvider {
+    fn propose_tx_provider_with_phase(self, phase: TxProviderPhase) -> ProposeTransactionProvider {
         ProposeTransactionProvider::new(
             Arc::new(self.mempool_client),
             Arc::new(self.l1_provider_client),
             MAX_L1_HANDLER_TXS_PER_BLOCK,
             HEIGHT,
+            phase,
         )
+    }
+
+    fn propose_tx_provider(self) -> ProposeTransactionProvider {
+        self.propose_tx_provider_with_phase(TxProviderPhase::L1)
+    }
+
+    fn propose_tx_provider_mempool_phase(self) -> ProposeTransactionProvider {
+        self.propose_tx_provider_with_phase(TxProviderPhase::Mempool)
     }
 
     fn validate_tx_provider(self) -> ValidateTransactionProvider {
@@ -205,6 +215,16 @@ async fn no_more_l1_handler(mut mock_dependencies: MockDependencies) {
 
 #[rstest]
 #[tokio::test]
+async fn provider_in_mempool_phase_no_l1(mut mock_dependencies: MockDependencies) {
+    mock_dependencies.expect_get_mempool_txs(MAX_TXS_PER_FETCH);
+    let mut tx_provider = mock_dependencies.propose_tx_provider_mempool_phase();
+    let txs = tx_provider.get_txs(MAX_TXS_PER_FETCH).await.unwrap();
+    let data = assert_matches!(txs, txs if txs.len() == MAX_TXS_PER_FETCH => txs);
+    assert!(data.iter().all(|tx| matches!(tx, InternalConsensusTransaction::RpcTransaction(_))));
+}
+
+#[rstest]
+#[tokio::test]
 async fn validate_flow(mut mock_dependencies: MockDependencies) {
     let test_tx = test_l1handler_tx();
     mock_dependencies.expect_validate_l1handler(test_tx.clone(), L1ValidationStatus::Validated);
@@ -249,7 +269,8 @@ async fn validate_fails(
     #[values(
         InvalidValidationStatus::AlreadyIncludedInProposedBlock,
         InvalidValidationStatus::AlreadyIncludedOnL2,
-        InvalidValidationStatus::ConsumedOnL1OrUnknown
+        InvalidValidationStatus::ConsumedOnL1,
+        InvalidValidationStatus::NotFound
     )]
     expected_validation_status: InvalidValidationStatus,
 ) {

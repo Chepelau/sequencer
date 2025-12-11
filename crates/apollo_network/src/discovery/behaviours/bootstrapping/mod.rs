@@ -3,6 +3,7 @@ use std::task::{Context, Poll};
 use bootstrap_peer::BootstrapPeerEventStream;
 use futures::stream::SelectAll;
 use futures::StreamExt;
+use libp2p::core::transport::PortUse;
 use libp2p::core::Endpoint;
 use libp2p::swarm::{
     dummy,
@@ -46,6 +47,7 @@ impl NetworkBehaviour for BootstrappingBehaviour {
         _peer: PeerId,
         _addr: &Multiaddr,
         _role_override: Endpoint,
+        _port_use: PortUse,
     ) -> Result<Self::ConnectionHandler, ConnectionDenied> {
         Ok(dummy::ConnectionHandler)
     }
@@ -89,8 +91,7 @@ impl BootstrappingBehaviour {
             bootstrap_peers.iter().map(|(id, _)| id).collect();
         assert!(
             unique_peer_ids.len() == bootstrap_peers.len(),
-            "Bootstrap peer IDs must be unique, PeerIds: {:?}",
-            bootstrap_peers
+            "Bootstrap peer IDs must be unique, PeerIds: {bootstrap_peers:?}"
         );
 
         let mut peers = SelectAll::new();

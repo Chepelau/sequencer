@@ -1,22 +1,22 @@
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use apollo_class_manager_config::config::{
+    CachedClassStorageConfig,
+    ClassHashStorageConfig,
+    FsClassStorageConfig,
+};
 use apollo_class_manager_types::{CachedClassStorageError, ClassId, ExecutableClassHash};
 use apollo_compile_to_casm_types::{RawClass, RawClassError, RawExecutableClass};
-use apollo_config::dumping::{ser_param, SerializeConfig};
-use apollo_config::{ParamPath, ParamPrivacyInput, SerializedParam};
 use apollo_storage::class_hash::{ClassHashStorageReader, ClassHashStorageWriter};
+use apollo_storage::metrics::CLASS_MANAGER_STORAGE_OPEN_READ_TRANSACTIONS;
 use apollo_storage::StorageConfig;
-use serde::{Deserialize, Serialize};
 use starknet_api::class_cache::GlobalContractCache;
-use starknet_api::contract_class::ContractClass;
 use thiserror::Error;
 use tracing::instrument;
 
-use crate::config::{ClassHashStorageConfig, FsClassStorageConfig};
 use crate::metrics::{increment_n_classes, record_class_size, CairoClassType, ClassObjectType};
 
 #[cfg(test)]
@@ -40,7 +40,7 @@ pub trait ClassStorage: Send + Sync {
 
     fn get_executable(&self, class_id: ClassId) -> Result<Option<RawExecutableClass>, Self::Error>;
 
-    fn get_executable_class_hash(
+    fn get_executable_class_hash_v2(
         &self,
         class_id: ClassId,
     ) -> Result<Option<ExecutableClassHash>, Self::Error>;
@@ -57,45 +57,13 @@ pub trait ClassStorage: Send + Sync {
     ) -> Result<Option<RawExecutableClass>, Self::Error>;
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct CachedClassStorageConfig {
-    pub class_cache_size: usize,
-    pub deprecated_class_cache_size: usize,
-}
-
-// TODO(Elin): provide default values for the fields.
-impl Default for CachedClassStorageConfig {
-    fn default() -> Self {
-        Self { class_cache_size: 10, deprecated_class_cache_size: 10 }
-    }
-}
-
-impl SerializeConfig for CachedClassStorageConfig {
-    fn dump(&self) -> BTreeMap<ParamPath, SerializedParam> {
-        BTreeMap::from([
-            ser_param(
-                "class_cache_size",
-                &self.class_cache_size,
-                "Contract classes cache size.",
-                ParamPrivacyInput::Public,
-            ),
-            ser_param(
-                "deprecated_class_cache_size",
-                &self.deprecated_class_cache_size,
-                "Deprecated contract classes cache size.",
-                ParamPrivacyInput::Public,
-            ),
-        ])
-    }
-}
-
 pub struct CachedClassStorage<S: ClassStorage> {
     storage: S,
 
     // Cache.
     classes: GlobalContractCache<RawClass>,
     executable_classes: GlobalContractCache<RawExecutableClass>,
-    executable_class_hashes: GlobalContractCache<ExecutableClassHash>,
+    executable_class_hashes_v2: GlobalContractCache<ExecutableClassHash>,
     deprecated_classes: GlobalContractCache<RawExecutableClass>,
 }
 
@@ -105,13 +73,13 @@ impl<S: ClassStorage> CachedClassStorage<S> {
             storage,
             classes: GlobalContractCache::new(config.class_cache_size),
             executable_classes: GlobalContractCache::new(config.class_cache_size),
-            executable_class_hashes: GlobalContractCache::new(config.class_cache_size),
+            executable_class_hashes_v2: GlobalContractCache::new(config.class_cache_size),
             deprecated_classes: GlobalContractCache::new(config.deprecated_class_cache_size),
         }
     }
 
     pub fn class_cached(&self, class_id: ClassId) -> bool {
-        self.executable_class_hashes.get(&class_id).is_some()
+        self.executable_class_hashes_v2.get(&class_id).is_some()
     }
 
     pub fn deprecated_class_cached(&self, class_id: ClassId) -> bool {
@@ -119,7 +87,11 @@ impl<S: ClassStorage> CachedClassStorage<S> {
     }
 }
 
-impl<S: ClassStorage> ClassStorage for CachedClassStorage<S> {
+impl<S> ClassStorage for CachedClassStorage<S>
+where
+    S: ClassStorage,
+    CachedClassStorageError<S::Error>: From<S::Error>,
+{
     type Error = CachedClassStorageError<S::Error>;
 
     #[instrument(skip(self, class, executable_class), level = "debug", ret, err)]
@@ -127,7 +99,7 @@ impl<S: ClassStorage> ClassStorage for CachedClassStorage<S> {
         &mut self,
         class_id: ClassId,
         class: RawClass,
-        executable_class_hash: ExecutableClassHash,
+        executable_class_hash_v2: ExecutableClassHash,
         executable_class: RawExecutableClass,
     ) -> Result<(), Self::Error> {
         if self.class_cached(class_id) {
@@ -137,7 +109,7 @@ impl<S: ClassStorage> ClassStorage for CachedClassStorage<S> {
         self.storage.set_class(
             class_id,
             class.clone(),
-            executable_class_hash,
+            executable_class_hash_v2,
             executable_class.clone(),
         )?;
 
@@ -151,7 +123,7 @@ impl<S: ClassStorage> ClassStorage for CachedClassStorage<S> {
         self.classes.set(class_id, class);
         self.executable_classes.set(class_id, executable_class);
         // Cache the executable class hash last; acts as an existence marker.
-        self.executable_class_hashes.set(class_id, executable_class_hash);
+        self.executable_class_hashes_v2.set(class_id, executable_class_hash_v2);
 
         Ok(())
     }
@@ -180,38 +152,38 @@ impl<S: ClassStorage> ClassStorage for CachedClassStorage<S> {
             return Ok(Some(class));
         }
 
-        let Some(class) = self.storage.get_executable(class_id)? else {
-            return Ok(None);
-        };
-
-        // TODO(Elin): separate Cairo0<>1 getters to avoid deserializing here.
-        match ContractClass::try_from(class.clone()).unwrap() {
-            ContractClass::V0(_) => {
-                self.deprecated_classes.set(class_id, class.clone());
-            }
-            ContractClass::V1(_) => {
-                self.executable_classes.set(class_id, class.clone());
-            }
+        // If compiled_class_hash_v2 exists, it'll be Cairo 1.
+        if self.get_executable_class_hash_v2(class_id)?.is_some() {
+            let Some(class) = self.storage.get_executable(class_id)? else {
+                return Ok(None);
+            };
+            self.executable_classes.set(class_id, class.clone());
+            return Ok(Some(class));
         }
 
+        let Some(class) = self.storage.get_deprecated_class(class_id)? else {
+            return Ok(None);
+        };
+        self.deprecated_classes.set(class_id, class.clone());
         Ok(Some(class))
     }
 
     #[instrument(skip(self), level = "debug", ret, err)]
-    fn get_executable_class_hash(
+    fn get_executable_class_hash_v2(
         &self,
         class_id: ClassId,
     ) -> Result<Option<ExecutableClassHash>, Self::Error> {
-        if let Some(class_hash) = self.executable_class_hashes.get(&class_id) {
-            return Ok(Some(class_hash));
+        if let Some(compiled_class_hash_v2) = self.executable_class_hashes_v2.get(&class_id) {
+            return Ok(Some(compiled_class_hash_v2));
         }
 
-        let Some(class_hash) = self.storage.get_executable_class_hash(class_id)? else {
+        let Some(compiled_class_hash_v2) = self.storage.get_executable_class_hash_v2(class_id)?
+        else {
             return Ok(None);
         };
 
-        self.executable_class_hashes.set(class_id, class_hash);
-        Ok(Some(class_hash))
+        self.executable_class_hashes_v2.set(class_id, compiled_class_hash_v2);
+        Ok(Some(compiled_class_hash_v2))
     }
 
     #[instrument(skip(self, class), level = "debug", ret, err)]
@@ -258,7 +230,7 @@ impl Clone for CachedClassStorage<FsClassStorage> {
             storage: self.storage.clone(),
             classes: self.classes.clone(),
             executable_classes: self.executable_classes.clone(),
-            executable_class_hashes: self.executable_class_hashes.clone(),
+            executable_class_hashes_v2: self.executable_class_hashes_v2.clone(),
             deprecated_classes: self.deprecated_classes.clone(),
         }
     }
@@ -282,7 +254,10 @@ pub struct ClassHashStorage {
 impl ClassHashStorage {
     pub fn new(config: ClassHashStorageConfig) -> ClassHashStorageResult<Self> {
         let storage_config = StorageConfig::from(config);
-        let (reader, writer) = apollo_storage::open_storage(storage_config)?;
+        let (reader, writer) = apollo_storage::open_storage_with_metric(
+            storage_config,
+            &CLASS_MANAGER_STORAGE_OPEN_READ_TRANSACTIONS,
+        )?;
 
         Ok(Self { reader, writer: Arc::new(Mutex::new(writer)) })
     }
@@ -292,22 +267,23 @@ impl ClassHashStorage {
     }
 
     #[instrument(skip(self), level = "debug", ret, err)]
-    fn get_executable_class_hash(
+    fn get_executable_class_hash_v2(
         &self,
         class_id: ClassId,
     ) -> ClassHashStorageResult<Option<ExecutableClassHash>> {
-        Ok(self.reader.begin_ro_txn()?.get_executable_class_hash(&class_id)?)
+        Ok(self.reader.begin_ro_txn()?.get_executable_class_hash_v2(&class_id)?)
     }
 
     #[instrument(skip(self), level = "debug", ret, err)]
-    fn set_executable_class_hash(
+    fn set_executable_class_hash_v2(
         &mut self,
         class_id: ClassId,
-        executable_class_hash: ExecutableClassHash,
+        executable_class_hash_v2: ExecutableClassHash,
     ) -> ClassHashStorageResult<()> {
         let mut writer = self.writer()?;
-        let txn =
-            writer.begin_rw_txn()?.set_executable_class_hash(&class_id, executable_class_hash)?;
+        let txn = writer
+            .begin_rw_txn()?
+            .set_executable_class_hash_v2(&class_id, executable_class_hash_v2)?;
         txn.commit()?;
 
         Ok(())
@@ -334,14 +310,21 @@ pub enum FsClassStorageError {
     RawClass(#[from] RawClassError),
 }
 
+impl From<FsClassStorageError> for CachedClassStorageError<FsClassStorageError> {
+    fn from(e: FsClassStorageError) -> Self {
+        CachedClassStorageError::Storage(e)
+    }
+}
+
 impl FsClassStorage {
     pub fn new(config: FsClassStorageConfig) -> FsClassStorageResult<Self> {
         let class_hash_storage = ClassHashStorage::new(config.class_hash_storage_config)?;
+        std::fs::create_dir_all(&config.persistent_root)?;
         Ok(Self { persistent_root: config.persistent_root, class_hash_storage })
     }
 
     fn contains_class(&self, class_id: ClassId) -> FsClassStorageResult<bool> {
-        Ok(self.get_executable_class_hash(class_id)?.is_some())
+        Ok(self.get_executable_class_hash_v2(class_id)?.is_some())
     }
 
     // TODO(Elin): make this more robust; checking file existence is not enough, since by reading
@@ -388,14 +371,40 @@ impl FsClassStorage {
         concat_deprecated_executable_filename(&self.get_persistent_dir(class_id))
     }
 
+    fn create_tmp_dir(
+        &self,
+        class_id: ClassId,
+    ) -> FsClassStorageResult<(tempfile::TempDir, PathBuf)> {
+        // Compute the final persistent directory for this `class_id`
+        let persistent_dir = self.get_persistent_dir(class_id);
+        let parent_dir = persistent_dir
+            .parent()
+            .expect("Class persistent dir should have a parent")
+            .to_path_buf();
+        std::fs::create_dir_all(&parent_dir)?;
+        // Create a temporary directory under the parent of the final persistent directory to ensure
+        // `rename` will be atomic.
+        let tmp_root = tempfile::tempdir_in(&parent_dir)?;
+        // Get the leaf directory name of the final persistent directory.
+        let leaf = persistent_dir.file_name().expect("Class dir leaf should exist");
+        // Create the temporary directory under the temporary root.
+        let tmp_dir = tmp_root.path().join(leaf);
+        // Returning `TempDir` since without it the handle would drop immediately and the temp
+        // directory would be removed before writes/rename.
+        Ok((tmp_root, tmp_dir))
+    }
+
     fn mark_class_id_as_existent(
         &mut self,
         class_id: ClassId,
-        executable_class_hash: ExecutableClassHash,
+        executable_class_hash_v2: ExecutableClassHash,
     ) -> FsClassStorageResult<()> {
-        Ok(self.class_hash_storage.set_executable_class_hash(class_id, executable_class_hash)?)
+        Ok(self
+            .class_hash_storage
+            .set_executable_class_hash_v2(class_id, executable_class_hash_v2)?)
     }
 
+    #[allow(dead_code)]
     fn write_class(
         &self,
         class_id: ClassId,
@@ -409,6 +418,7 @@ impl FsClassStorage {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn write_deprecated_class(
         &self,
         class_id: ClassId,
@@ -420,9 +430,6 @@ impl FsClassStorage {
         Ok(())
     }
 
-    // TODO(Elin): restore use of `write_[deprecated_]class_atomically`, but tmpdir
-    // should be located inside the PVC to prevent linking errors.
-    #[allow(dead_code)]
     fn write_class_atomically(
         &self,
         class_id: ClassId,
@@ -430,8 +437,7 @@ impl FsClassStorage {
         executable_class: RawExecutableClass,
     ) -> FsClassStorageResult<()> {
         // Write classes to a temporary directory.
-        let tmp_dir = create_tmp_dir()?;
-        let tmp_dir = tmp_dir.path().join(self.get_class_dir(class_id));
+        let (_tmp_root, tmp_dir) = self.create_tmp_dir(class_id)?;
         class.write_to_file(concat_sierra_filename(&tmp_dir))?;
         executable_class.write_to_file(concat_executable_filename(&tmp_dir))?;
 
@@ -442,15 +448,13 @@ impl FsClassStorage {
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn write_deprecated_class_atomically(
         &self,
         class_id: ClassId,
         class: RawExecutableClass,
     ) -> FsClassStorageResult<()> {
         // Write class to a temporary directory.
-        let tmp_dir = create_tmp_dir()?;
-        let tmp_dir = tmp_dir.path().join(self.get_class_dir(class_id));
+        let (_tmp_root, tmp_dir) = self.create_tmp_dir(class_id)?;
         class.write_to_file(concat_deprecated_executable_filename(&tmp_dir))?;
 
         // Atomically rename directory to persistent one.
@@ -469,15 +473,15 @@ impl ClassStorage for FsClassStorage {
         &mut self,
         class_id: ClassId,
         class: RawClass,
-        executable_class_hash: ExecutableClassHash,
+        executable_class_hash_v2: ExecutableClassHash,
         executable_class: RawExecutableClass,
     ) -> Result<(), Self::Error> {
         if self.contains_class(class_id)? {
             return Ok(());
         }
 
-        self.write_class(class_id, class, executable_class)?;
-        self.mark_class_id_as_existent(class_id, executable_class_hash)?;
+        self.write_class_atomically(class_id, class, executable_class)?;
+        self.mark_class_id_as_existent(class_id, executable_class_hash_v2)?;
 
         Ok(())
     }
@@ -512,11 +516,11 @@ impl ClassStorage for FsClassStorage {
     }
 
     #[instrument(skip(self), level = "debug", err)]
-    fn get_executable_class_hash(
+    fn get_executable_class_hash_v2(
         &self,
         class_id: ClassId,
     ) -> Result<Option<ExecutableClassHash>, Self::Error> {
-        Ok(self.class_hash_storage.get_executable_class_hash(class_id)?)
+        Ok(self.class_hash_storage.get_executable_class_hash_v2(class_id)?)
     }
 
     #[instrument(skip(self, class), level = "debug", ret, err)]
@@ -529,7 +533,7 @@ impl ClassStorage for FsClassStorage {
             return Ok(());
         }
 
-        self.write_deprecated_class(class_id, class)?;
+        self.write_deprecated_class_atomically(class_id, class)?;
 
         Ok(())
     }
@@ -570,10 +574,4 @@ fn concat_executable_filename(path: &Path) -> PathBuf {
 
 fn concat_deprecated_executable_filename(path: &Path) -> PathBuf {
     path.join("deprecated_casm")
-}
-
-// Creates a tmp directory and returns a owned representation of it.
-// As long as the returned directory object is lived, the directory is not deleted.
-pub(crate) fn create_tmp_dir() -> FsClassStorageResult<tempfile::TempDir> {
-    Ok(tempfile::tempdir()?)
 }

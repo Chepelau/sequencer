@@ -2,6 +2,7 @@ use std::fmt::Debug;
 
 use clap::Args;
 use starknet_os::errors::StarknetOsError;
+use starknet_patricia_storage::storage_trait::PatriciaStorageError;
 
 use crate::shared_utils::read::{read_input, write_to_file};
 
@@ -39,6 +40,8 @@ pub enum PythonTestError<E> {
     #[error("None value found in input.")]
     NoneInputError,
     #[error(transparent)]
+    PatriciaStorage(#[from] PatriciaStorageError),
+    #[error(transparent)]
     SpecificError(E),
     #[error(transparent)]
     StarknetOs(#[from] StarknetOsError),
@@ -48,7 +51,6 @@ pub(crate) trait PythonTestRunner: TryFrom<String> {
     type SpecificError: Debug;
 
     /// Returns the input string if it's `Some`, or an error if it's `None`.
-    #[allow(clippy::result_large_err)]
     fn non_optional_input(
         input: Option<&str>,
     ) -> Result<&str, PythonTestError<Self::SpecificError>> {
@@ -64,14 +66,14 @@ where
 {
     // Create PythonTest from test_name.
     let test = PT::try_from(python_test_arg.test_name)
-        .unwrap_or_else(|error| panic!("Failed to create PythonTest: {:?}", error));
+        .unwrap_or_else(|error| panic!("Failed to create PythonTest: {error:?}"));
     let input = read_input(python_test_arg.io_args.input_path);
 
     // Run relevant test.
     let output = test
         .run(Some(&input))
         .await
-        .unwrap_or_else(|error| panic!("Failed to run test: {:?}", error));
+        .unwrap_or_else(|error| panic!("Failed to run test: {error:?}"));
 
     // Write test's output.
     write_to_file(&python_test_arg.io_args.output_path, &output);

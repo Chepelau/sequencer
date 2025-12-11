@@ -1,12 +1,14 @@
 use starknet_committer::block_committer::commit::commit_block;
-use starknet_committer::block_committer::input::{Config, ConfigImpl, Input};
+use starknet_committer::block_committer::input::Config;
+use starknet_committer::db::facts_db::FactsDb;
+use starknet_patricia_storage::map_storage::MapStorage;
 use tracing::info;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::reload::Handle;
 use tracing_subscriber::Registry;
 
 use crate::committer_cli::filled_tree_output::filled_forest::SerializedForest;
-use crate::committer_cli::parse_input::cast::InputImpl;
+use crate::committer_cli::parse_input::cast::{CommitterInputImpl, InputImpl};
 use crate::committer_cli::parse_input::raw_input::RawInput;
 use crate::shared_utils::read::{load_input, write_to_file};
 
@@ -15,7 +17,7 @@ pub async fn parse_and_commit(
     output_path: String,
     log_filter_handle: Handle<LevelFilter, Registry>,
 ) {
-    let input: InputImpl = load_input::<RawInput>(input_path)
+    let CommitterInputImpl { input, storage } = load_input::<RawInput>(input_path)
         .try_into()
         .expect("Failed to convert RawInput to InputImpl.");
     info!(
@@ -27,13 +29,15 @@ pub async fn parse_and_commit(
     log_filter_handle
         .modify(|filter| *filter = input.config.logger_level())
         .expect("Failed to set the log level.");
-    commit(input, output_path).await;
+    commit(input, output_path, storage).await;
 }
 
-pub async fn commit(input: Input<ConfigImpl>, output_path: String) {
-    let serialized_filled_forest =
-        SerializedForest(commit_block(input).await.expect("Failed to commit the given block."));
-    let output = serialized_filled_forest.forest_to_output();
+pub async fn commit(input: InputImpl, output_path: String, storage: MapStorage) {
+    let mut facts_db = FactsDb::new(storage);
+    let serialized_filled_forest = SerializedForest(
+        commit_block(input, &mut facts_db, None).await.expect("Failed to commit the given block."),
+    );
+    let output = serialized_filled_forest.forest_to_output().await;
     write_to_file(&output_path, &output);
     info!(
         "Successfully committed given block. Updated Contracts Trie Root Hash: {:?},

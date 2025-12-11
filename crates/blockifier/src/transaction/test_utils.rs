@@ -3,9 +3,11 @@ use blockifier_test_utils::calldata::create_calldata;
 use blockifier_test_utils::contracts::FeatureContract;
 use rstest::fixture;
 use starknet_api::abi::abi_utils::get_fee_token_var_address;
-use starknet_api::block::{FeeType, GasPrice};
+use starknet_api::block::{BlockNumber, BlockTimestamp, FeeType, GasPrice};
+use starknet_api::contract_class::compiled_class_hash::HashVersion;
 use starknet_api::contract_class::{ClassInfo, ContractClass, SierraVersion};
-use starknet_api::core::{ClassHash, ContractAddress, Nonce};
+use starknet_api::core::{ChainId, ClassHash, ContractAddress, EntryPointSelector, Nonce};
+use starknet_api::data_availability::DataAvailabilityMode;
 use starknet_api::executable_transaction::TransactionType;
 use starknet_api::execution_resources::{GasAmount, GasVector};
 use starknet_api::test_utils::declare::executable_declare_tx;
@@ -25,15 +27,23 @@ use starknet_api::test_utils::{
     MAX_FEE,
 };
 use starknet_api::transaction::fields::{
+    AccountDeploymentData,
     AllResourceBounds,
     ContractAddressSalt,
     Fee,
     GasVectorComputationMode,
+    PaymasterData,
+    Resource,
     ResourceBounds,
     TransactionSignature,
     ValidResourceBounds,
 };
-use starknet_api::transaction::{constants, TransactionVersion};
+use starknet_api::transaction::{
+    constants,
+    TransactionHash,
+    TransactionVersion,
+    QUERY_VERSION_BASE,
+};
 use starknet_api::{calldata, declare_tx_args, deploy_account_tx_args, felt, invoke_tx_args};
 use starknet_types_core::felt::Felt;
 use strum::IntoEnumIterator;
@@ -42,9 +52,9 @@ use crate::blockifier_versioned_constants::VersionedConstants;
 use crate::context::{BlockContext, ChainInfo};
 use crate::state::cached_state::CachedState;
 use crate::state::state_api::State;
-use crate::test_utils::contracts::FeatureContractTrait;
+use crate::test_utils::contracts::{FeatureContractData, FeatureContractTrait};
 use crate::test_utils::dict_state_reader::DictStateReader;
-use crate::test_utils::initial_test_state::test_state;
+use crate::test_utils::initial_test_state::{test_state, test_state_inner};
 use crate::test_utils::BALANCE;
 use crate::transaction::account_transaction::{AccountTransaction, ExecutionFlags};
 use crate::transaction::objects::{TransactionExecutionInfo, TransactionExecutionResult};
@@ -165,6 +175,42 @@ pub fn create_test_init_data(chain_info: &ChainInfo, cairo_version: CairoVersion
     }
 }
 
+/// Initializes a state before the compiled class hash migration.
+/// if `declare_with_casm_hash_v1` is true, the classes are declared with the old hash version.
+pub fn create_init_data_for_compiled_class_hash_migration_test(
+    chain_info: &ChainInfo,
+    cairo_version: CairoVersion,
+    declare_with_casm_hash_v1: bool,
+) -> TestInitData {
+    // If the classes are not declared with the old hash version, return the test init data for the
+    // new hash version.
+    if !declare_with_casm_hash_v1 {
+        return create_test_init_data(chain_info, cairo_version);
+    }
+
+    let account = FeatureContract::AccountWithoutValidations(cairo_version);
+    let test_contract = FeatureContract::TestContract(cairo_version);
+    let erc20 = FeatureContract::ERC20(CairoVersion::Cairo0);
+    let contract_instances = [(erc20, 1), (account, 1), (test_contract, 1)];
+    let contract_instances_vec: Vec<(FeatureContractData, u16)> = contract_instances
+        .iter()
+        .map(|(feature_contract, i)| ((*feature_contract).into(), *i))
+        .collect();
+    let state = test_state_inner(
+        chain_info,
+        BALANCE,
+        &contract_instances_vec[..],
+        &HashVersion::V1,
+        CairoVersion::Cairo0,
+    );
+    TestInitData {
+        state,
+        account_address: account.get_instance_address(0),
+        contract_address: test_contract.get_instance_address(0),
+        nonce_manager: NonceManager::default(),
+    }
+}
+
 pub struct FaultyAccountTxCreatorArgs {
     pub tx_type: TransactionType,
     pub tx_version: TransactionVersion,
@@ -277,7 +323,7 @@ pub fn create_account_tx_for_validate_test(
                     version: tx_version,
                     nonce: nonce_manager.next(sender_address),
                     class_hash,
-                    compiled_class_hash: declared_contract.get_compiled_class_hash(),
+                    compiled_class_hash: declared_contract.get_compiled_class_hash(&HashVersion::V2),
                 },
                 class_info,
             );
@@ -327,7 +373,6 @@ pub fn invoke_tx_with_default_flags(invoke_args: InvokeTxArgs) -> AccountTransac
     AccountTransaction::new_with_default_flags(tx)
 }
 
-#[allow(clippy::result_large_err)]
 pub fn run_invoke_tx(
     state: &mut CachedState<DictStateReader>,
     block_context: &BlockContext,
@@ -409,8 +454,132 @@ pub fn emit_n_events_tx(
     let tx = executable_invoke_tx(invoke_tx_args! {
         sender_address: account_contract,
         calldata,
-        nonce
+        nonce,
+        // TODO(Arni): Consider using `ValidResourceBounds::create_for_testing()`. It is simpler.
+        resource_bounds: ValidResourceBounds::create_for_testing_no_fee_enforcement(),
     });
 
     AccountTransaction::new_for_sequencing(tx)
+}
+
+/// Utility struct to test the execution info syscall.
+/// For simplicity, some fields are not included in the struct, and assumed empty.
+pub struct ExpectedExecutionInfo {
+    pub version: TransactionVersion,
+    pub account_address: ContractAddress,
+    pub max_fee: Fee,
+    pub transaction_hash: TransactionHash,
+    pub chain_id: ChainId,
+    pub nonce: Nonce,
+    pub resource_bounds: ValidResourceBounds,
+    pub paymaster_data: PaymasterData,
+    pub nonce_data_availability_mode: DataAvailabilityMode,
+    pub fee_data_availability_mode: DataAvailabilityMode,
+    pub account_deployment_data: AccountDeploymentData,
+    pub caller_address: ContractAddress,
+    pub contract_address: ContractAddress,
+    pub entry_point_selector: EntryPointSelector,
+    pub block_number: BlockNumber,
+    pub block_timestamp: BlockTimestamp,
+    pub sequencer_address: ContractAddress,
+}
+
+impl ExpectedExecutionInfo {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        only_query: bool,
+        account_address: ContractAddress,
+        caller_address: ContractAddress,
+        contract_address: ContractAddress,
+        chain_id: ChainId,
+        entry_point_selector: EntryPointSelector,
+        block_number: BlockNumber,
+        block_timestamp: BlockTimestamp,
+        sequencer_address: ContractAddress,
+        resource_bounds: ValidResourceBounds,
+        nonce: Nonce,
+    ) -> Self {
+        let mut version = Felt::THREE;
+        if only_query {
+            version += *QUERY_VERSION_BASE;
+        }
+        Self {
+            version: TransactionVersion(version),
+            account_address,
+            caller_address,
+            contract_address,
+            chain_id,
+            entry_point_selector,
+            block_number,
+            block_timestamp,
+            sequencer_address,
+            resource_bounds,
+            nonce,
+            max_fee: Fee::default(),
+            transaction_hash: TransactionHash::default(),
+            paymaster_data: PaymasterData::default(),
+            nonce_data_availability_mode: DataAvailabilityMode::default(),
+            fee_data_availability_mode: DataAvailabilityMode::default(),
+            account_deployment_data: AccountDeploymentData::default(),
+        }
+    }
+
+    pub fn to_syscall_result(self) -> Vec<Felt> {
+        let expected_tx_info = vec![
+            self.version.0,
+            **self.account_address,
+            self.max_fee.0.into(),
+            Felt::ZERO,
+            self.transaction_hash.0,
+            Felt::from_hex_unchecked(&self.chain_id.as_hex()),
+            self.nonce.0,
+        ];
+
+        let expected_resource_bounds = match self.resource_bounds {
+            ValidResourceBounds::L1Gas(l1_gas) => vec![
+                Felt::ONE, // One resource type.
+                felt!(Resource::L1Gas.to_hex()),
+                felt!(l1_gas.max_amount.0),
+                felt!(l1_gas.max_price_per_unit.0),
+            ],
+            ValidResourceBounds::AllResources(AllResourceBounds {
+                l1_gas,
+                l2_gas,
+                l1_data_gas,
+            }) => {
+                vec![
+                    Felt::THREE, // Three resource types.
+                    felt!(Resource::L1Gas.to_hex()),
+                    felt!(l1_gas.max_amount.0),
+                    felt!(l1_gas.max_price_per_unit.0),
+                    felt!(Resource::L2Gas.to_hex()),
+                    felt!(l2_gas.max_amount.0),
+                    felt!(l2_gas.max_price_per_unit.0),
+                    felt!(Resource::L1DataGas.to_hex()),
+                    felt!(l1_data_gas.max_amount.0),
+                    felt!(l1_data_gas.max_price_per_unit.0),
+                ]
+            }
+        };
+
+        // Tip, Paymaster data, Nonce DA, Fee DA, Account data.
+        let expected_unsupported_fields = vec![Felt::ZERO; 5];
+
+        let expected_call_info =
+            vec![**self.caller_address, **self.contract_address, self.entry_point_selector.0];
+        let expected_block_info = vec![
+            felt!(self.block_number.0),
+            felt!(self.block_timestamp.0),
+            **self.sequencer_address,
+        ];
+
+        [
+            expected_block_info,
+            expected_tx_info,
+            expected_resource_bounds,
+            expected_unsupported_fields,
+            expected_call_info,
+        ]
+        .concat()
+    }
 }

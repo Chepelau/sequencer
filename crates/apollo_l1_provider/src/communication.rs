@@ -1,8 +1,5 @@
 use apollo_infra::component_client::{LocalComponentClient, RemoteComponentClient};
-use apollo_infra::component_definitions::{
-    ComponentRequestAndResponseSender,
-    ComponentRequestHandler,
-};
+use apollo_infra::component_definitions::{ComponentRequestHandler, RequestWrapper};
 use apollo_infra::component_server::{LocalComponentServer, RemoteComponentServer, WrapperServer};
 use apollo_l1_provider_types::{L1ProviderRequest, L1ProviderResponse};
 use async_trait::async_trait;
@@ -12,8 +9,7 @@ use tracing::instrument;
 pub type LocalL1ProviderServer =
     LocalComponentServer<L1Provider, L1ProviderRequest, L1ProviderResponse>;
 pub type RemoteL1ProviderServer = RemoteComponentServer<L1ProviderRequest, L1ProviderResponse>;
-pub type L1ProviderRequestAndResponseSender =
-    ComponentRequestAndResponseSender<L1ProviderRequest, L1ProviderResponse>;
+pub type L1ProviderRequestWrapper = RequestWrapper<L1ProviderRequest, L1ProviderResponse>;
 pub type LocalL1ProviderClient = LocalComponentClient<L1ProviderRequest, L1ProviderResponse>;
 pub type RemoteL1ProviderClient = RemoteComponentClient<L1ProviderRequest, L1ProviderResponse>;
 
@@ -46,11 +42,14 @@ impl ComponentRequestHandler<L1ProviderRequest, L1ProviderResponse> for L1Provid
             L1ProviderRequest::Validate { tx_hash, height } => {
                 L1ProviderResponse::Validate(self.validate(tx_hash, height))
             }
-            L1ProviderRequest::Initialize(events) => {
-                L1ProviderResponse::Initialize(self.initialize(events).await)
+            L1ProviderRequest::Initialize { historic_l2_height, events } => {
+                L1ProviderResponse::Initialize(self.initialize(historic_l2_height, events).await)
             }
             L1ProviderRequest::GetL1ProviderSnapshot => {
                 L1ProviderResponse::GetL1ProviderSnapshot(self.get_l1_provider_snapshot())
+            }
+            L1ProviderRequest::GetProviderState => {
+                L1ProviderResponse::GetProviderState(self.get_provider_state())
             }
         }
     }

@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use apollo_sizeof::SizeOf;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use size_of::SizeOf;
 use starknet_types_core::felt::Felt;
 use strum_macros::EnumIter;
 
@@ -11,6 +11,8 @@ use crate::execution_resources::{GasAmount, GasVector};
 use crate::hash::StarkHash;
 use crate::serde_utils::PrefixedBytesAsHex;
 use crate::{StarknetApiError, StarknetApiResult};
+
+pub const HIGH_GAS_AMOUNT: u64 = 10000000000; // A high gas amount that should be enough for execution.
 
 /// A fee.
 #[cfg_attr(any(test, feature = "testing"), derive(derive_more::Add, derive_more::Deref))]
@@ -114,6 +116,12 @@ pub struct TransactionSignature(pub Arc<Vec<Felt>>);
     Debug, Clone, Default, Eq, PartialEq, Hash, Deserialize, Serialize, PartialOrd, Ord, SizeOf,
 )]
 pub struct Calldata(pub Arc<Vec<Felt>>);
+
+impl From<Vec<Felt>> for Calldata {
+    fn from(value: Vec<Felt>) -> Self {
+        Self(Arc::new(value))
+    }
+}
 
 #[macro_export]
 macro_rules! calldata {
@@ -400,9 +408,8 @@ impl ValidResourceBounds {
         }
     }
 
-    #[cfg(any(feature = "testing", test))]
-    pub fn create_for_testing_no_fee_enforcement() -> Self {
-        let default_l2_gas_amount = GasAmount(10000000000); // Sufficient to avoid out of gas errors.
+    pub fn new_unlimited_gas_no_fee_enforcement() -> Self {
+        let default_l2_gas_amount = GasAmount(HIGH_GAS_AMOUNT); // Sufficient to avoid out of gas errors.
         let default_resource =
             ResourceBounds { max_amount: GasAmount(0), max_price_per_unit: GasPrice(1) };
         Self::AllResources(AllResourceBounds {
@@ -413,6 +420,16 @@ impl ValidResourceBounds {
             },
             l1_data_gas: default_resource,
         })
+    }
+
+    #[cfg(any(feature = "testing", test))]
+    pub fn create_for_testing_no_fee_enforcement() -> Self {
+        Self::new_unlimited_gas_no_fee_enforcement()
+    }
+
+    #[cfg(any(feature = "testing", test))]
+    pub fn create_for_testing() -> Self {
+        Self::AllResources(AllResourceBounds::create_for_testing())
     }
 
     /// Utility method to "zip" an amount vector and a price vector to get an AllResourceBounds.
@@ -461,6 +478,15 @@ pub struct AllResourceBounds {
     pub l1_gas: ResourceBounds,
     pub l2_gas: ResourceBounds,
     pub l1_data_gas: ResourceBounds,
+}
+
+impl AllResourceBounds {
+    #[cfg(any(feature = "testing", test))]
+    pub fn create_for_testing() -> Self {
+        let resource_bounds =
+            ResourceBounds { max_amount: GasAmount(0), max_price_per_unit: GasPrice(1) };
+        Self { l1_gas: resource_bounds, l2_gas: resource_bounds, l1_data_gas: resource_bounds }
+    }
 }
 
 impl std::fmt::Display for AllResourceBounds {
@@ -586,5 +612,42 @@ pub struct AccountDeploymentData(pub Vec<Felt>);
 impl AccountDeploymentData {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+}
+
+/// Client-provided proof facts used for client-side proving.
+/// Only needed when the client supplies a proof; otherwise empty.
+#[derive(
+    Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, SizeOf,
+)]
+pub struct ProofFacts(pub Vec<Felt>);
+
+impl ProofFacts {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Client-provided proof used for client-side proving.
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    Deserialize,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    SizeOf,
+    derive_more::Deref,
+    derive_more::From,
+)]
+pub struct Proof(pub Arc<Vec<u32>>);
+
+impl From<Vec<u32>> for Proof {
+    fn from(value: Vec<u32>) -> Self {
+        Self(Arc::new(value))
     }
 }

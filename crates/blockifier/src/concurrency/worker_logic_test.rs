@@ -6,6 +6,7 @@ use blockifier_test_utils::calldata::{create_calldata, create_trivial_calldata};
 use blockifier_test_utils::contracts::FeatureContract;
 use rstest::rstest;
 use starknet_api::abi::abi_utils::get_fee_token_var_address;
+use starknet_api::contract_class::compiled_class_hash::HashVersion;
 use starknet_api::core::{ContractAddress, Nonce};
 use starknet_api::test_utils::declare::executable_declare_tx;
 use starknet_api::test_utils::{NonceManager, TEST_ERC20_CONTRACT_ADDRESS2};
@@ -150,7 +151,7 @@ pub fn test_commit_tx() {
         if should_pass_validation {
             assert_eq!(commit_result, CommitResult::Success);
         } else {
-            assert_eq!(commit_result, CommitResult::ValidationFailed, "commit_idx: {}", commit_idx);
+            assert_eq!(commit_result, CommitResult::ValidationFailed, "commit_idx: {commit_idx}");
             // Re-execute the transaction.
             executor.execute_tx(commit_idx);
             // Commit again. This time it should succeed.
@@ -413,7 +414,7 @@ fn test_worker_execute(default_all_resource_bounds: ValidResourceBounds) {
     let account_balance = BALANCE.0 - result.receipt.fee.0;
     assert!(!result.is_reverted());
 
-    let erc20 = FeatureContract::ERC20(CairoVersion::Cairo0);
+    let erc20 = FeatureContract::ERC20(account_contract.cairo_version());
     let erc_contract_address = contract_address!(TEST_ERC20_CONTRACT_ADDRESS2);
     let account_balance_key_low = get_fee_token_var_address(account_address);
     let account_balance_key_high = account_balance_key_low.next_storage_key().unwrap();
@@ -449,7 +450,7 @@ fn test_worker_execute(default_all_resource_bounds: ValidResourceBounds) {
             (test_contract.get_class_hash(), true),
             (erc20.get_class_hash(), true),
         ]),
-        ..Default::default()
+        compiled_class_hashes: HashMap::new(),
     };
 
     assert_eq!(execution_output.state_diff, writes.diff(&reads));
@@ -622,7 +623,7 @@ fn test_deploy_before_declare(
     let test_contract = FeatureContract::TestContract(cairo_version);
     let test_class_hash = test_contract.get_class_hash();
     let test_class_info = calculate_class_info_for_testing(test_contract.get_class());
-    let test_compiled_class_hash = test_contract.get_compiled_class_hash();
+    let test_compiled_class_hash = test_contract.get_compiled_class_hash(&HashVersion::V2);
     let declare_tx = AccountTransaction::new_with_default_flags(executable_declare_tx(
         declare_tx_args! {
             sender_address: account_address_0,

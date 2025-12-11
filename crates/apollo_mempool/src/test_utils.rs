@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use apollo_mempool_types::errors::MempoolError;
-use apollo_mempool_types::mempool_types::{AddTransactionArgs, CommitBlockArgs};
+use apollo_mempool_types::mempool_types::{AddTransactionArgs, CommitBlockArgs, ValidationArgs};
 use apollo_metrics::metrics::HistogramValue;
 use metrics_exporter_prometheus::PrometheusRecorder;
 use pretty_assertions::assert_eq;
@@ -15,7 +15,6 @@ use crate::metrics::{
     LABEL_NAME_DROP_REASON,
     LABEL_NAME_TX_TYPE,
     MEMPOOL_DELAYED_DECLARES_SIZE,
-    MEMPOOL_EVICTIONS_COUNT,
     MEMPOOL_GET_TXS_SIZE,
     MEMPOOL_PENDING_QUEUE_SIZE,
     MEMPOOL_POOL_SIZE,
@@ -24,7 +23,8 @@ use crate::metrics::{
     MEMPOOL_TRANSACTIONS_COMMITTED,
     MEMPOOL_TRANSACTIONS_DROPPED,
     MEMPOOL_TRANSACTIONS_RECEIVED,
-    TRANSACTION_TIME_SPENT_IN_MEMPOOL,
+    TRANSACTION_TIME_SPENT_UNTIL_BATCHED,
+    TRANSACTION_TIME_SPENT_UNTIL_COMMITTED,
 };
 
 /// Creates an executable invoke transaction with the given field subset (the rest receive default
@@ -65,7 +65,7 @@ macro_rules! tx {
             })
     }};
     (tx_hash: $tx_hash:expr, address: $address:expr, tx_nonce: $tx_nonce:expr, tip: $tip:expr) => {{
-        use mempool_test_utils::starknet_api_test_utils::VALID_L2_GAS_MAX_PRICE_PER_UNIT;
+        use starknet_api::test_utils::VALID_L2_GAS_MAX_PRICE_PER_UNIT;
         tx!(
             tx_hash: $tx_hash,
             address: $address,
@@ -140,7 +140,7 @@ macro_rules! add_tx_input {
         account_nonce: $account_nonce:expr,
         tip: $tip:expr
     ) => {{
-        use mempool_test_utils::starknet_api_test_utils::VALID_L2_GAS_MAX_PRICE_PER_UNIT;
+        use starknet_api::test_utils::VALID_L2_GAS_MAX_PRICE_PER_UNIT;
         add_tx_input!(
             tx_hash: $tx_hash,
             address: $address,
@@ -256,6 +256,20 @@ pub fn add_tx_expect_error(
 }
 
 #[track_caller]
+pub fn validate_tx(mempool: &mut Mempool, input: &ValidationArgs) {
+    assert_eq!(mempool.validate_tx(input.clone()), Ok(()));
+}
+
+#[track_caller]
+pub fn validate_tx_expect_error(
+    mempool: &mut Mempool,
+    input: &ValidationArgs,
+    expected_error: MempoolError,
+) {
+    assert_eq!(mempool.validate_tx(input.clone()), Err(expected_error));
+}
+
+#[track_caller]
 pub fn commit_block(
     mempool: &mut Mempool,
     nonces: impl IntoIterator<Item = (&'static str, u8)>,
@@ -287,8 +301,8 @@ pub struct MempoolMetrics {
     pub txs_received_deploy_account: u64,
     pub txs_committed: u64,
     pub txs_dropped_expired: u64,
-    pub txs_dropped_failed_add_tx_checks: u64,
     pub txs_dropped_rejected: u64,
+    pub txs_dropped_evicted: u64,
     pub pool_size: u64,
     pub priority_queue_size: u64,
     pub pending_queue_size: u64,
@@ -296,13 +310,13 @@ pub struct MempoolMetrics {
     pub delayed_declares_size: u64,
     pub total_size_in_bytes: u64,
     pub evictions_count: u64,
-    pub transaction_time_spent_in_mempool: HistogramValue,
+    pub transaction_time_spent_until_batched: HistogramValue,
+    pub transaction_time_spent_until_committed: HistogramValue,
 }
 
 impl MempoolMetrics {
     pub fn verify_metrics(&self, recorder: &PrometheusRecorder) {
         let metrics = &recorder.handle().render();
-        MEMPOOL_EVICTIONS_COUNT.assert_eq(metrics, self.evictions_count);
         MEMPOOL_TRANSACTIONS_RECEIVED.assert_eq(
             metrics,
             self.txs_received_invoke,
@@ -326,13 +340,13 @@ impl MempoolMetrics {
         );
         MEMPOOL_TRANSACTIONS_DROPPED.assert_eq(
             metrics,
-            self.txs_dropped_failed_add_tx_checks,
-            &[(LABEL_NAME_DROP_REASON, DropReason::FailedAddTxChecks.into())],
+            self.txs_dropped_rejected,
+            &[(LABEL_NAME_DROP_REASON, DropReason::Rejected.into())],
         );
         MEMPOOL_TRANSACTIONS_DROPPED.assert_eq(
             metrics,
-            self.txs_dropped_rejected,
-            &[(LABEL_NAME_DROP_REASON, DropReason::Rejected.into())],
+            self.txs_dropped_evicted,
+            &[(LABEL_NAME_DROP_REASON, DropReason::Evicted.into())],
         );
         MEMPOOL_POOL_SIZE.assert_eq(metrics, self.pool_size);
         MEMPOOL_PRIORITY_QUEUE_SIZE.assert_eq(metrics, self.priority_queue_size);
@@ -340,7 +354,9 @@ impl MempoolMetrics {
         MEMPOOL_GET_TXS_SIZE.assert_eq(metrics, self.get_txs_size);
         MEMPOOL_DELAYED_DECLARES_SIZE.assert_eq(metrics, self.delayed_declares_size);
         MEMPOOL_TOTAL_SIZE_BYTES.assert_eq(metrics, self.total_size_in_bytes);
-        TRANSACTION_TIME_SPENT_IN_MEMPOOL
-            .assert_eq(metrics, &self.transaction_time_spent_in_mempool);
+        TRANSACTION_TIME_SPENT_UNTIL_BATCHED
+            .assert_eq(metrics, &self.transaction_time_spent_until_batched);
+        TRANSACTION_TIME_SPENT_UNTIL_COMMITTED
+            .assert_eq(metrics, &self.transaction_time_spent_until_committed);
     }
 }

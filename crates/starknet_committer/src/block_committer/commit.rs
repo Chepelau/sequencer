@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use starknet_api::core::{ClassHash, ContractAddress, Nonce};
 use starknet_patricia::patricia_merkle_tree::types::{NodeIndex, SortedLeafIndices};
-use starknet_patricia_storage::map_storage::MapStorage;
 use tracing::{info, warn};
 
 use crate::block_committer::errors::BlockCommitmentError;
@@ -13,8 +12,10 @@ use crate::block_committer::input::{
     Input,
     StateDiff,
 };
+use crate::block_committer::timing_util::{Action, TimeMeasurement};
+use crate::db::forest_trait::ForestReader;
 use crate::forest::filled_forest::FilledForest;
-use crate::forest::original_skeleton_forest::{ForestSortedIndices, OriginalSkeletonForest};
+use crate::forest::original_skeleton_forest::ForestSortedIndices;
 use crate::forest::updated_skeleton_forest::UpdatedSkeletonForest;
 use crate::hash_function::hash::TreeHashFunctionImpl;
 use crate::patricia_merkle_tree::leaf::leaf_impl::ContractState;
@@ -22,7 +23,11 @@ use crate::patricia_merkle_tree::types::class_hash_into_node_index;
 
 type BlockCommitmentResult<T> = Result<T, BlockCommitmentError>;
 
-pub async fn commit_block(input: Input<ConfigImpl>) -> BlockCommitmentResult<FilledForest> {
+pub async fn commit_block<Reader: for<'a> ForestReader<'a>>(
+    input: Input<ConfigImpl>,
+    trie_reader: &mut Reader,
+    mut time_measurement: Option<&mut TimeMeasurement>,
+) -> BlockCommitmentResult<FilledForest> {
     let (mut storage_tries_indices, mut contracts_trie_indices, mut classes_trie_indices) =
         get_all_modified_indices(&input.state_diff);
     let forest_sorted_indices = ForestSortedIndices {
@@ -35,15 +40,25 @@ pub async fn commit_block(input: Input<ConfigImpl>) -> BlockCommitmentResult<Fil
     };
     let actual_storage_updates = input.state_diff.actual_storage_updates();
     let actual_classes_updates = input.state_diff.actual_classes_updates();
-    let (mut original_forest, original_contracts_trie_leaves) = OriginalSkeletonForest::create(
-        MapStorage::from(input.storage),
-        input.contracts_trie_root_hash,
-        input.classes_trie_root_hash,
-        &actual_storage_updates,
-        &actual_classes_updates,
-        &forest_sorted_indices,
-        &input.config,
-    )?;
+    // Reads - fetch_nodes.
+    if let Some(ref mut tm) = time_measurement {
+        tm.start_measurement(Action::Read);
+    }
+    let (mut original_forest, original_contracts_trie_leaves) = trie_reader
+        .read(
+            input.contracts_trie_root_hash,
+            input.classes_trie_root_hash,
+            &actual_storage_updates,
+            &actual_classes_updates,
+            &forest_sorted_indices,
+            input.config.clone(),
+        )
+        .await?;
+    if let Some(ref mut tm) = time_measurement {
+        let n_read_facts =
+            original_forest.storage_tries.values().map(|trie| trie.nodes.len()).sum();
+        tm.stop_measurement(Some(n_read_facts), Action::Read);
+    }
     info!("Original skeleton forest created successfully.");
 
     if input.config.warn_on_trivial_modifications() {
@@ -54,6 +69,10 @@ pub async fn commit_block(input: Input<ConfigImpl>) -> BlockCommitmentResult<Fil
         );
     }
 
+    // Compute the new topology.
+    if let Some(ref mut tm) = time_measurement {
+        tm.start_measurement(Action::Compute);
+    }
     let updated_forest = UpdatedSkeletonForest::create(
         &mut original_forest,
         &input.state_diff.skeleton_classes_updates(),
@@ -64,6 +83,7 @@ pub async fn commit_block(input: Input<ConfigImpl>) -> BlockCommitmentResult<Fil
     )?;
     info!("Updated skeleton forest created successfully.");
 
+    // Compute the new hashes.
     let filled_forest = FilledForest::create::<TreeHashFunctionImpl>(
         updated_forest,
         actual_storage_updates,
@@ -73,6 +93,9 @@ pub async fn commit_block(input: Input<ConfigImpl>) -> BlockCommitmentResult<Fil
         &input.state_diff.address_to_nonce,
     )
     .await?;
+    if let Some(ref mut tm) = time_measurement {
+        tm.stop_measurement(None, Action::Compute);
+    }
     info!("Filled forest created successfully.");
 
     Ok(filled_forest)

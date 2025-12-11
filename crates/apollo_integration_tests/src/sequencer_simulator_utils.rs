@@ -18,16 +18,11 @@ pub struct SequencerSimulator {
 }
 
 impl SequencerSimulator {
-    pub fn new(
-        http_url: String,
-        http_port: u16,
-        monitoring_url: String,
-        monitoring_port: u16,
-    ) -> Self {
+    pub fn new(http_url: &str, http_port: u16, monitoring_url: &str, monitoring_port: u16) -> Self {
         let monitoring_client =
-            MonitoringClient::new(get_socket_addr(&monitoring_url, monitoring_port).unwrap());
+            MonitoringClient::new(get_socket_addr(monitoring_url, monitoring_port).unwrap());
 
-        let http_client = HttpTestClient::new(get_socket_addr(&http_url, http_port).unwrap());
+        let http_client = HttpTestClient::new(get_socket_addr(http_url, http_port).unwrap());
 
         Self { monitoring_client, http_client }
     }
@@ -96,10 +91,8 @@ fn get_socket_addr(url_str: &str, port: u16) -> Result<SocketAddr, Box<dyn std::
     info!("Parsed url: {}", url);
     let host = url.host_str().ok_or("Invalid URL: no host found")?;
     info!("Host: {}", host);
-    let addr = format!("{}:{}", host, port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or("Failed to resolve address")?;
+    let addr =
+        format!("{host}:{port}").to_socket_addrs()?.next().ok_or("Failed to resolve address")?;
 
     Ok(addr)
 }

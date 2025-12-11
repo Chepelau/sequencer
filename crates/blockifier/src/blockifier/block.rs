@@ -8,6 +8,7 @@ use starknet_api::block::{
     NonzeroGasPrice,
 };
 use starknet_api::state::StorageKey;
+use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
 
 use crate::abi::constants;
 use crate::blockifier_versioned_constants::{OsConstants, VersionedConstants};
@@ -27,8 +28,8 @@ fn validate_l2_gas_price(gas_prices: &GasPrices) {
     if GasPrice::from(eth_l2_gas_price) != expected_eth_l2_gas_price {
         // TODO(Aner): change to panic! Requires fixing several tests.
         warn!(
-            "eth_l2_gas_price {} does not match expected eth_l2_gas_price {}.",
-            eth_l2_gas_price, expected_eth_l2_gas_price
+            "eth_l2_gas_price {eth_l2_gas_price} does not match expected eth_l2_gas_price \
+             {expected_eth_l2_gas_price}."
         )
     }
     let strk_l2_gas_price = gas_prices.strk_gas_prices.l2_gas_price;
@@ -37,8 +38,8 @@ fn validate_l2_gas_price(gas_prices: &GasPrices) {
     if GasPrice::from(strk_l2_gas_price) != expected_strk_l2_gas_price {
         // TODO(Aner): change to panic! Requires fixing test_discounted_gas_overdraft
         warn!(
-            "strk_l2_gas_price {} does not match expected strk_l2_gas_price {}.",
-            strk_l2_gas_price, expected_strk_l2_gas_price
+            "strk_l2_gas_price {strk_l2_gas_price} does not match expected strk_l2_gas_price \
+             {expected_strk_l2_gas_price}."
         )
     }
 }

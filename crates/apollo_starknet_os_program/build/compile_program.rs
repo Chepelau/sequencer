@@ -39,7 +39,7 @@ pub async fn compile_and_output_program(
 pub async fn compile_test_contracts(out_dir: PathBuf) {
     let mut task_set = tokio::task::JoinSet::new();
     task_set.spawn(compile_and_output_program(
-        out_dir,
+        out_dir.clone(),
         "starkware/starknet/core/os/state/aliases_test.cairo",
         "aliases_test",
     ));

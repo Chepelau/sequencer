@@ -4,13 +4,15 @@ use assert_matches::assert_matches;
 use blockifier_test_utils::cairo_versions::{CairoVersion, RunnableCairo1};
 use blockifier_test_utils::calldata::create_calldata;
 use blockifier_test_utils::contracts::FeatureContract;
+use indexmap::IndexMap;
 use pretty_assertions::assert_eq;
 use rstest::rstest;
+use starknet_api::contract_class::compiled_class_hash::HashVersion;
 use starknet_api::test_utils::declare::executable_declare_tx;
 use starknet_api::test_utils::deploy_account::executable_deploy_account_tx;
 use starknet_api::test_utils::invoke::executable_invoke_tx;
 use starknet_api::test_utils::DEFAULT_STRK_L1_GAS_PRICE;
-use starknet_api::transaction::fields::Fee;
+use starknet_api::transaction::fields::{Fee, ValidResourceBounds};
 use starknet_api::transaction::TransactionVersion;
 use starknet_api::{declare_tx_args, deploy_account_tx_args, felt, invoke_tx_args, nonce};
 use starknet_types_core::felt::Felt;
@@ -35,6 +37,7 @@ use crate::transaction::errors::TransactionExecutionError;
 use crate::transaction::test_utils::{
     block_context,
     calculate_class_info_for_testing,
+    create_init_data_for_compiled_class_hash_migration_test,
     create_test_init_data,
     emit_n_events_tx,
     l1_resource_bounds,
@@ -62,7 +65,7 @@ fn tx_executor_test_body<S: StateReader>(
     // TODO(Arni, 30/03/2024): Test all bouncer weights.
     let _tx_execution_output = tx_executor.execute(&tx).unwrap();
     let bouncer = tx_executor.bouncer.lock().unwrap();
-    let bouncer_weights = bouncer.get_accumulated_weights();
+    let bouncer_weights = bouncer.get_bouncer_weights();
     assert_eq!(bouncer_weights.state_diff_size, expected_bouncer_weights.state_diff_size);
     assert_eq!(
         bouncer_weights.message_segment_length,
@@ -132,7 +135,7 @@ fn test_declare(
         declare_tx_args! {
             sender_address: account_contract.get_instance_address(0),
             class_hash: declared_contract.get_class_hash(),
-            compiled_class_hash: declared_contract.get_compiled_class_hash(),
+            compiled_class_hash: declared_contract.get_compiled_class_hash(&HashVersion::V2),
             version: tx_version,
             resource_bounds: l1_resource_bounds(0_u8.into(), DEFAULT_STRK_L1_GAS_PRICE.into()),
         },
@@ -232,6 +235,7 @@ fn test_invoke(
         sender_address: account_contract.get_instance_address(0),
         calldata,
         version,
+        resource_bounds: ValidResourceBounds::create_for_testing_no_fee_enforcement(),
     });
     let tx = AccountTransaction::new_for_sequencing(invoke_tx).into();
     tx_executor_test_body(state, block_context, tx, expected_bouncer_weights);
@@ -284,7 +288,7 @@ fn test_bouncing(#[case] initial_bouncer_weights: BouncerWeights, #[case] n_even
     let mut tx_executor =
         TransactionExecutor::new(state, block_context, TransactionExecutorConfig::default());
 
-    tx_executor.bouncer.lock().unwrap().set_accumulated_weights(initial_bouncer_weights);
+    tx_executor.bouncer.lock().unwrap().set_bouncer_weights(initial_bouncer_weights);
 
     tx_executor
         .execute(
@@ -397,6 +401,140 @@ fn test_execute_txs_bouncing(#[case] concurrency_enabled: bool, #[case] external
     }
 }
 
+/// Tests compiled class hash migration behavior.
+/// Verifies that contracts declared with an old compiled class hash version
+/// are migrated to the new version **only** when migration is enabled and the
+/// Cairo version supports it (i.e., not Cairo0).
+#[rstest]
+#[cfg_attr(feature = "cairo_native", case(CairoVersion::Cairo1(RunnableCairo1::Native)))]
+#[case(CairoVersion::Cairo0)]
+#[case(CairoVersion::Cairo1(RunnableCairo1::Casm))]
+fn test_compiled_class_hash_migration(
+    mut block_context: BlockContext,
+    #[values(true, false)] declare_with_casm_hash_v1: bool,
+    #[values(true, false)] enable_casm_hash_migration: bool,
+    #[case] cairo_version: CairoVersion,
+) {
+    // Configure migration flag.
+    block_context.versioned_constants.enable_casm_hash_migration = enable_casm_hash_migration;
+
+    // Prepare initial state depending on whether classes were declared with old hash versions.
+    let TestInitData { state, account_address, contract_address, nonce_manager: _ } =
+        create_init_data_for_compiled_class_hash_migration_test(
+            &block_context.chain_info,
+            cairo_version,
+            declare_with_casm_hash_v1,
+        );
+
+    // Get the class hash to compiled class hash before migration.
+    // The compiled class hash before migration is the compiled class hash v1.
+    let class_hash_to_compiled_class_hash_before_migration =
+        state.state.class_hash_to_compiled_class_hash.clone();
+
+    // Build and execute a simple invoke transaction calling `return_result(3)`.
+    let mut tx_executor = TransactionExecutor::new(
+        state.clone(),
+        block_context.clone(),
+        TransactionExecutorConfig::default(),
+    );
+    let calldata = create_calldata(
+        contract_address,
+        "return_result",
+        &[
+            felt!(3_u32), // result to return.
+        ],
+    );
+    let invoke_tx = executable_invoke_tx(invoke_tx_args! {
+        sender_address: account_address,
+        calldata,
+        version: TransactionVersion::THREE,
+        resource_bounds: ValidResourceBounds::create_for_testing_no_fee_enforcement(),
+    });
+    let tx = AccountTransaction::new_for_sequencing(invoke_tx).into();
+    let tx_exexution_result = tx_executor.execute_txs(&[tx], None);
+    // Check that the transaction was executed successfully.
+    assert!(
+        tx_exexution_result.len() == 1,
+        "Expected 1 transaction execution result, got {}",
+        tx_exexution_result.len()
+    );
+
+    let tx_execution_info = &tx_exexution_result[0].as_ref().unwrap().0;
+
+    assert!(
+        !tx_execution_info.is_reverted(),
+        "Transaction reverted: {:#?}",
+        tx_execution_info.revert_error
+    );
+    let mut block_execution_summary = tx_executor.finalize().unwrap();
+
+    // Migration should occur only if:
+    //   1. Migration is enabled,
+    //   2. Classes were declared with old hash versions,
+    //   3. Cairo version is not Cairo0 (since migration doesn’t apply there).
+    let should_migrate =
+        enable_casm_hash_migration && declare_with_casm_hash_v1 && !cairo_version.is_cairo0();
+    if should_migrate {
+        // The expected compiled class hashes for migration are the compiled class hashes v2
+        // to compiled class hashes v1,
+        // of the class hashes that were declared with compiled class hash v1,
+        // and were executed during the transaction execution.
+        let executed_class_hashes =
+            tx_execution_info.summarize(&block_context.versioned_constants).executed_class_hashes;
+        let mut expected_compiled_class_hashes_for_migration = executed_class_hashes
+            .iter()
+            .map(|class_hash| {
+                (
+                    state
+                        .get_compiled_class_hash_v2(
+                            *class_hash,
+                            &state.get_compiled_class(*class_hash).unwrap(),
+                        )
+                        .unwrap(),
+                    *class_hash_to_compiled_class_hash_before_migration.get(class_hash).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        block_execution_summary.compiled_class_hashes_for_migration.sort();
+        expected_compiled_class_hashes_for_migration.sort();
+
+        assert_eq!(
+            block_execution_summary.compiled_class_hashes_for_migration,
+            expected_compiled_class_hashes_for_migration
+        );
+        // Verify that the migration is applied to the state diff.
+        // State diff class hash to compiled class hash contains both migration and declared
+        // classes. But this block only contains the migration.
+        assert_eq!(
+            block_execution_summary.state_diff.class_hash_to_compiled_class_hash,
+            executed_class_hashes
+                .iter()
+                .map(|&class_hash| (
+                    class_hash,
+                    state
+                        .get_compiled_class_hash_v2(
+                            class_hash,
+                            &state.get_compiled_class(class_hash).unwrap()
+                        )
+                        .unwrap()
+                ))
+                .collect::<IndexMap<_, _>>()
+        );
+    } else {
+        // No migration should happen.
+        assert!(
+            block_execution_summary.compiled_class_hashes_for_migration.is_empty(),
+            "Migration shouldn't occur with: enable_migration: {enable_casm_hash_migration}, \
+             classess_declared_with_old_hash_version: {declare_with_casm_hash_v1}, cairo_zero: \
+             {cairo_version:?} but this is not the case. The compiled class hashes for migration \
+             are: {:#?}",
+            block_execution_summary.compiled_class_hashes_for_migration
+        );
+        // Neither migration nor declare tx, so state diff in class hash to compiled class hash.
+        assert!(block_execution_summary.state_diff.class_hash_to_compiled_class_hash.is_empty(),)
+    }
+}
+
 #[cfg(feature = "cairo_native")]
 #[rstest::rstest]
 /// Tests that Native can handle deep recursion calls without causing a stack overflow.
@@ -418,6 +556,7 @@ fn test_stack_overflow(#[values(true, false)] concurrency_enabled: bool) {
         sender_address: account_address,
         calldata,
         nonce: nonce_manager.next(account_address),
+        resource_bounds: ValidResourceBounds::create_for_testing_no_fee_enforcement(),
     });
     let account_tx = AccountTransaction::new_for_sequencing(invoke_tx);
     // Ensure the transaction is allocated the maximum gas limits.
@@ -429,7 +568,7 @@ fn test_stack_overflow(#[values(true, false)] concurrency_enabled: bool) {
     // Run.
     let config = TransactionExecutorConfig::create_for_testing(concurrency_enabled);
     let mut executor = TransactionExecutor::new(state, block_context, config);
-    let results = executor.execute_txs(&vec![account_tx.into()], None);
+    let results = executor.execute_txs(&[account_tx.into()], None);
 
     let (tx_execution_info, _state_diff) = results[0].as_ref().unwrap();
     assert!(tx_execution_info.is_reverted());

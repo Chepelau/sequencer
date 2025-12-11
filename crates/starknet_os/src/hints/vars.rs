@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use apollo_starknet_os_program::OS_PROGRAM;
 use cairo_vm::hint_processor::builtin_hint_processor::hint_utils::get_integer_from_var_name;
 use cairo_vm::hint_processor::hint_processor_definition::HintReference;
 use cairo_vm::serde::deserialize_program::ApTracking;
@@ -33,20 +34,29 @@ use crate::hints::error::OsHintError;
 #[macro_export]
 macro_rules! define_string_enum {
     (
-        $(#[$cfgs:meta])*
+        $(#[$enum_meta:meta])*
         $visibility:vis enum $enum_name:ident {
-            $(($variant:ident $(, $variant_str:expr)?)),+ $(,)?
+            $(
+                $(#[$variant_meta:meta])*
+                ($variant:ident $(, $variant_str:expr)?)
+            ),+ $(,)?
         }
     ) => {
-        $(#[$cfgs])*
+        $(#[$enum_meta])*
         $visibility enum $enum_name {
-            $($variant),+
+            $(
+                $(#[$variant_meta])*
+                $variant
+            ),+
         }
 
         impl From<$enum_name> for &'static str {
             fn from(value: $enum_name) -> Self {
                 match value {
-                    $($enum_name::$variant => string_or_snake_case!($variant $(, $variant_str)?),)+
+                    $(
+                        $(#[$variant_meta])*
+                        $enum_name::$variant => string_or_snake_case!($variant $(, $variant_str)?),
+                    )+
                 }
             }
         }
@@ -83,8 +93,8 @@ define_string_enum! {
         (BytecodeSegmentStructure),
         (BytecodeSegmentStructures),
         (Case),
+        (ClassHash),
         (CompiledClass),
-        (CompiledClassHash),
         (ContractAddressForRevert),
         (Descend),
         (DescentMap),
@@ -105,7 +115,7 @@ define_string_enum! {
 impl std::fmt::Display for Scope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let scope_string: &'static str = (*self).into();
-        write!(f, "{}", scope_string)
+        write!(f, "{scope_string}")
     }
 }
 
@@ -121,6 +131,7 @@ define_string_enum! {
     pub enum Ids {
         (AccountDeploymentData),
         (AccountDeploymentDataSize),
+        (ActualOutState),
         (AliasesEntry),
         (AllEncodings),
         (ArrayPtr),
@@ -138,6 +149,7 @@ define_string_enum! {
         (CompiledClassFacts),
         (CompiledClassHash),
         (CompressedDst),
+        (CompressedEnd),
         (CompressedStart),
         (CompressStateUpdates),
         (ConstructorCalldata),
@@ -158,6 +170,7 @@ define_string_enum! {
         (Edge),
         (ElmBound),
         (ElmSize),
+        (End),
         (EntryPointReturnValues),
         (Evals),
         (ExecutionContext),
@@ -166,32 +179,38 @@ define_string_enum! {
         (FinalRoot),
         (FinalSquashedContractStateChangesEnd),
         (FinalSquashedContractStateChangesStart),
+        (FullContract),
         (Hash),
         (HashPtr),
         (Height),
+        (EncryptedStart),
+        (ExpectedCasmHashV2),
         (Index),
         (InitialCarriedOutputs),
         (InitialContractStateRoot),
         (InitialGas),
+        (InnerRemainingGas),
         (InitialRoot),
         (IsLeaf),
         (IsNUpdatesSmall),
         (IsOnCurve),
-        (IsSegmentUsed),
         (IsSierraGasMode),
-        (IsUsedLeaf),
         (Key),
         (KzgCommitments),
         (Length),
+        (IsLeafAndLoaded),
+        (LoadSegment),
         (Low),
         (MaxGas),
         (N),
         (NBlobs),
         (NBlocks),
         (NBuiltins),
+        (NClassesToMigrate),
         (NCompiledClassFacts),
         (NElms),
         (NSelectedBuiltins),
+        (NTasks),
         (NTxs),
         (NUpdates),
         (NewAliasesStateEntry),
@@ -199,18 +218,27 @@ define_string_enum! {
         (NewRoot),
         (NextAvailableAlias),
         (NewStateEntry),
+        (NKeys),
         (Node),
+        (NPublicKeys),
         (NotOnCurve),
         (OldBlockHash),
         (OldBlockNumber),
+        (OsOutputs),
+        (OsProgramHash),
         (OsStateUpdate),
         (OutputPtr),
         (PackedFelt),
+        (PackedValue),
+        (PackedValues),
+        (PackedValuesLen),
         (Path),
         (PrevOffset),
         (PrevAliasesStateEntry),
         (PrevRoot),
         (PrevValue),
+        (PublicKeys),
+        (SnPrivateKeys),
         (RangeCheck96Ptr, "range_check96_ptr"),
         (RangeCheckPtr),
         (RemainingGas),
@@ -231,6 +259,7 @@ define_string_enum! {
         (SenderAddress),
         (Sha256Ptr, "sha256_ptr"),
         (Sha256PtrEnd, "sha256_ptr_end"),
+        (ShouldUseReadOptimized),
         (Siblings),
         (SignatureLen),
         (SignatureStart),
@@ -246,10 +275,12 @@ define_string_enum! {
         (StateEntry),
         (StateUpdatesStart),
         (StorageKey),
+        (SymmetricKey),
         (SyscallPtr),
         (TransactionHash),
         (TxInfo),
         (TxType),
+        (UnpackedU32s),
         (UpdatePtr),
         (UseKzgDa),
         (Value),
@@ -278,8 +309,10 @@ impl Ids {
 }
 
 define_string_enum! {
+    #[cfg_attr(any(test, feature = "testing"), derive(strum_macros::EnumIter))]
     #[derive(Clone, Copy, Debug)]
     pub enum Const {
+        (AddrBound, "starkware.starknet.common.storage.ADDR_BOUND"),
         (AliasContractAddress, "starkware.starknet.core.os.constants.ALIAS_CONTRACT_ADDRESS"),
         (
             AliasCounterStorageKey,
@@ -293,8 +326,9 @@ define_string_enum! {
         ),
         (
             CompiledClassVersion,
-            "starkware.starknet.core.os.contract_class.compiled_class.COMPILED_CLASS_VERSION"
+            "starkware.starknet.core.os.contract_class.compiled_class_struct.COMPILED_CLASS_VERSION"
         ),
+        (ContractClassLeafVersion, "starkware.starknet.core.os.state.commitment.CONTRACT_CLASS_LEAF_VERSION"),
         (
             DeprecatedCompiledClassVersion,
             "starkware.starknet.core.os.contract_class.deprecated_compiled_class.\
@@ -304,6 +338,7 @@ define_string_enum! {
             EntryPointInitialBudget,
             "starkware.starknet.core.os.constants.ENTRY_POINT_INITIAL_BUDGET"
         ),
+        (GlobalStateVersion, "starkware.starknet.core.os.state.commitment.GLOBAL_STATE_VERSION"),
         (InitialAvailableAlias, "starkware.starknet.core.os.state.aliases.INITIAL_AVAILABLE_ALIAS"),
         (MinValueForAliasAlloc, "starkware.starknet.core.os.state.aliases.MIN_VALUE_FOR_ALIAS_ALLOC"),
         (
@@ -314,6 +349,7 @@ define_string_enum! {
         (NUpdatesSmallPackingBound, "starkware.starknet.core.os.state.output.N_UPDATES_SMALL_PACKING_BOUND"),
         (ShaBatchSize, "starkware.cairo.common.cairo_sha256.sha256_utils.BATCH_SIZE"),
         (Sha256InputChunkSize, "starkware.cairo.common.cairo_sha256.sha256_utils.SHA256_INPUT_CHUNK_SIZE_FELTS"),
+        (StarknetOsConfigVersion, "starkware.starknet.core.os.os_config.os_config.STARKNET_OS_CONFIG_VERSION"),
         (StoredBlockHashBuffer, "starkware.starknet.core.os.constants.STORED_BLOCK_HASH_BUFFER"),
         (Validated, "starkware.starknet.core.os.constants.VALIDATED"),
     }
@@ -323,6 +359,11 @@ impl Const {
     pub fn fetch<'a>(&self, constants: &'a HashMap<String, Felt>) -> Result<&'a Felt, HintError> {
         let identifier = (*self).into();
         constants.get(identifier).ok_or(HintError::MissingConstant(Box::new(identifier)))
+    }
+
+    pub fn fetch_from_os_program(&self) -> Result<Felt, HintError> {
+        let path: &str = (*self).into();
+        OS_PROGRAM.constants.get(path).cloned().ok_or(HintError::MissingConstant(Box::new(path)))
     }
 
     pub fn fetch_as<T: TryFrom<Felt>>(
@@ -355,6 +396,7 @@ impl Const {
 }
 
 define_string_enum! {
+    #[cfg_attr(any(test, feature = "testing"), derive(strum_macros::EnumIter))]
     #[derive(Copy, Clone)]
     pub enum CairoStruct {
         (BigInt3, "starkware.starknet.core.os.data_availability.bls_field.BigInt3"),
@@ -362,14 +404,18 @@ define_string_enum! {
         (BuiltinParamsPtr, "starkware.starknet.core.os.builtins.BuiltinParams*"),
         (BuiltinPointersPtr, "starkware.starknet.core.os.builtins.BuiltinPointers*"),
         (CallContractResponse, "starkware.starknet.common.new_syscalls.CallContractResponse"),
-        (CompiledClass, "starkware.starknet.core.os.contract_class.compiled_class.CompiledClass"),
+        (CompiledClass, "starkware.starknet.core.os.contract_class.compiled_class_struct.CompiledClass"),
         (
             CompiledClassEntryPoint,
-            "starkware.starknet.core.os.contract_class.compiled_class.CompiledClassEntryPoint"
+            "starkware.starknet.core.os.contract_class.compiled_class_struct.CompiledClassEntryPoint"
         ),
         (
             CompiledClassFact,
-            "starkware.starknet.core.os.contract_class.compiled_class.CompiledClassFact"
+            "starkware.starknet.core.os.contract_class.compiled_class_struct.CompiledClassFact"
+        ),
+        (
+            CompiledClassFactPtr,
+            "starkware.starknet.core.os.contract_class.compiled_class_struct.CompiledClassFact*"
         ),
         (DeployResponse, "starkware.starknet.common.new_syscalls.DeployResponse"),
         (DeprecatedCallContractResponse, "starkware.starknet.common.syscalls.CallContractResponse"),
@@ -407,13 +453,15 @@ define_string_enum! {
         ),
         (HashBuiltin, "starkware.cairo.common.cairo_builtins.HashBuiltin"),
         (HashBuiltinPtr, "starkware.cairo.common.cairo_builtins.HashBuiltin*"),
+        (L1ToL2MessageHeader,"starkware.starknet.core.os.output.MessageToL2Header"),
+        (L2ToL1MessageHeader, "starkware.starknet.core.os.output.MessageToL1Header"),
         (NodeEdge, "starkware.cairo.common.patricia_utils.NodeEdge"),
         (NonSelectableBuiltins, "starkware.starknet.core.os.builtins.NonSelectableBuiltins"),
         (OsStateUpdate, "starkware.starknet.core.os.state.state.OsStateUpdate"),
         (ResourceBounds, "starkware.starknet.common.new_syscalls.ResourceBounds"),
         (SecpNewResponsePtr, "starkware.starknet.common.new_syscalls.SecpNewResponse*"),
         (SelectableBuiltins, "starkware.starknet.core.os.builtins.SelectableBuiltins"),
-        (Sha256ProcessBlock, "starkware.cairo.common.sha256_state.Sha256ProcessBlock"),
+        (Sha256ProcessBlockResponsePtr, "starkware.starknet.common.new_syscalls.Sha256ProcessBlockResponse*"),
         (SpongeHashBuiltin, "starkware.cairo.common.sponge_as_hash.SpongeHashBuiltin"),
         (StateEntry, "starkware.starknet.core.os.state.commitment.StateEntry"),
         (StorageReadPtr, "starkware.starknet.common.syscalls.StorageRead*"),

@@ -5,6 +5,7 @@ mod state_reader_test;
 use std::cell::Cell;
 
 use apollo_class_manager_types::SharedClassManagerClient;
+use apollo_storage::class_hash::ClassHashStorageReader;
 use apollo_storage::state::StateStorageReader;
 use apollo_storage::{StorageError, StorageReader};
 use blockifier::execution::contract_class::{
@@ -16,7 +17,7 @@ use blockifier::state::errors::StateError;
 use blockifier::state::state_api::{StateReader as BlockifierStateReader, StateResult};
 use papyrus_common::pending_classes::{ApiContractClass, PendingClassesTrait};
 use papyrus_common::state::DeclaredClassHashEntry;
-use starknet_api::contract_class::{ContractClass, SierraVersion};
+use starknet_api::contract_class::ContractClass;
 use starknet_api::core::{ClassHash, CompiledClassHash, ContractAddress, Nonce};
 use starknet_api::state::{StateNumber, StorageKey};
 use starknet_types_core::felt::Felt;
@@ -93,8 +94,7 @@ impl BlockifierStateReader for ExecutionStateReader {
                 match api_contract_class {
                     ApiContractClass::ContractClass(sierra) => {
                         if let Some(pending_casm) = pending_classes.get_compiled_class(class_hash) {
-                            let sierra_version =
-                                SierraVersion::extract_from_program(&sierra.sierra_program)?;
+                            let sierra_version = sierra.get_sierra_version()?;
                             let runnable_compiled_class = RunnableCompiledClass::V1(
                                 CompiledClassV1::try_from((pending_casm, sierra_version))
                                     .map_err(StateError::ProgramError)?,
@@ -170,15 +170,21 @@ impl BlockifierStateReader for ExecutionStateReader {
                 }
             }
         }
-        let block_number = self
+
+        let maybe_block_number = self
             .storage_reader
             .begin_ro_txn()
             .map_err(storage_err_to_state_err)?
             .get_state_reader()
             .map_err(storage_err_to_state_err)?
             .get_class_definition_block_number(&class_hash)
-            .map_err(storage_err_to_state_err)?
-            .ok_or(StateError::UndeclaredClassHash(class_hash))?;
+            .map_err(storage_err_to_state_err)?;
+
+        // Cairo 0 classes (and undeclared classes) do not have a compiled class hash.
+        // According to the trait, return the default value.
+        let Some(block_number) = maybe_block_number else {
+            return Ok(CompiledClassHash::default());
+        };
 
         let state_diff = self
             .storage_reader
@@ -190,18 +196,42 @@ impl BlockifierStateReader for ExecutionStateReader {
                 "Inner storage error. Missing state diff at block {block_number}."
             )))?;
 
-        let compiled_class_hash = state_diff.declared_classes.get(&class_hash).ok_or(
-            StateError::StateReadError(format!(
+        let compiled_class_hash = state_diff
+            .class_hash_to_compiled_class_hash
+            .get(&class_hash)
+            .ok_or(StateError::StateReadError(format!(
                 "Inner storage error. Missing class declaration at block {block_number}, class \
                  {class_hash}."
-            )),
-        )?;
+            )))?;
 
         Ok(*compiled_class_hash)
     }
+
+    fn get_compiled_class_hash_v2(
+        &self,
+        class_hash: ClassHash,
+        _compiled_class: &RunnableCompiledClass,
+    ) -> StateResult<CompiledClassHash> {
+        let maybe_hash =
+            if let Some((class_manager_client, run_time_handle)) = &self.class_manager_handle {
+                // First, try getting from class manager if available.
+                run_time_handle
+                    .block_on(class_manager_client.get_executable_class_hash_v2(class_hash))
+                    .map_err(|e| StateError::StateReadError(e.to_string()))?
+            } else {
+                // Fall back to reading from storage.
+                self.storage_reader
+                    .begin_ro_txn()
+                    .map_err(storage_err_to_state_err)?
+                    .get_executable_class_hash_v2(&class_hash)
+                    .map_err(storage_err_to_state_err)?
+            };
+
+        maybe_hash.ok_or(StateError::MissingCompiledClassHashV2(class_hash))
+    }
 }
 
-// Converts a storage error to the error type of the state reader.
+/// Converts a storage error to the error type of the state reader.
 fn storage_err_to_state_err(err: StorageError) -> StateError {
     StateError::StateReadError(err.to_string())
 }

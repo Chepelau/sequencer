@@ -61,7 +61,7 @@ pub enum TransactionFeeError {
     MaxFeeExceedsBalance { max_fee: Fee, balance: BigUint },
     #[error("Max fee ({}) is too low. Minimum fee: {}.", max_fee.0, min_fee.0)]
     MaxFeeTooLow { min_fee: Fee, max_fee: Fee },
-    #[error("Resource bounds were not satisfied: {}", errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>().join("\n"))]
+    #[error("Resource bounds were not satisfied: {}", errors.iter().map(|e| format!("{e}")).collect::<Vec<_>>().join("\n"))]
     InsufficientResourceBounds { errors: Vec<ResourceBoundsError> },
     #[error("Missing L1 gas bounds in resource bounds.")]
     MissingL1GasBounds,
@@ -78,11 +78,11 @@ pub enum TransactionExecutionError {
     ContractClassVersionMismatch { declare_version: TransactionVersion, cairo_version: u64 },
     #[error("{}", gen_tx_execution_error_trace(self))]
     ContractConstructorExecutionFailed(#[from] ConstructorEntryPointExecutionError),
-    #[error("Class with hash {:#064x} is already declared.", **class_hash)]
+    #[error("Class with hash {:#066x} is already declared.", **class_hash)]
     DeclareTransactionError { class_hash: ClassHash },
     #[error("{}", gen_tx_execution_error_trace(self))]
     ExecutionError {
-        error: EntryPointExecutionError,
+        error: Box<EntryPointExecutionError>,
         class_hash: ClassHash,
         storage_address: ContractAddress,
         selector: EntryPointSelector,
@@ -105,9 +105,9 @@ pub enum TransactionExecutionError {
     #[error(transparent)]
     StateError(#[from] StateError),
     #[error(transparent)]
-    TransactionFeeError(#[from] TransactionFeeError),
+    TransactionFeeError(#[from] Box<TransactionFeeError>),
     #[error(transparent)]
-    TransactionPreValidationError(#[from] TransactionPreValidationError),
+    TransactionPreValidationError(#[from] Box<TransactionPreValidationError>),
     #[error(transparent)]
     TryFromIntError(#[from] std::num::TryFromIntError),
     #[error(
@@ -117,11 +117,13 @@ pub enum TransactionExecutionError {
     TransactionTooLarge { max_capacity: Box<BouncerWeights>, tx_size: Box<BouncerWeights> },
     #[error("{}", gen_tx_execution_error_trace(self))]
     ValidateTransactionError {
-        error: EntryPointExecutionError,
+        error: Box<EntryPointExecutionError>,
         class_hash: ClassHash,
         storage_address: ContractAddress,
         selector: EntryPointSelector,
     },
+    #[error("Cairo0 validate error with retdata: {0:?}")]
+    ValidateCairo0Error(Retdata),
     #[error(
         "Invalid segment structure: PC {0} was visited, but the beginning of the segment {1} was \
          not."
@@ -134,14 +136,14 @@ pub enum TransactionExecutionError {
 #[derive(Debug, Error)]
 pub enum TransactionPreValidationError {
     #[error(
-        "Invalid transaction nonce of contract at address {:#064x}. Account nonce: \
-         {:#064x}; got: {:#064x}.", ***address, **account_nonce, **incoming_tx_nonce
+        "Invalid transaction nonce of contract at address {:#066x}. Account nonce: \
+         {:#066x}; got: {:#066x}.", ***address, **account_nonce, **incoming_tx_nonce
     )]
     InvalidNonce { address: ContractAddress, account_nonce: Nonce, incoming_tx_nonce: Nonce },
     #[error(transparent)]
     StateError(#[from] StateError),
     #[error(transparent)]
-    TransactionFeeError(#[from] TransactionFeeError),
+    TransactionFeeError(#[from] Box<TransactionFeeError>),
 }
 
 #[derive(Debug, Error)]

@@ -67,9 +67,11 @@ const GENESIS_HASH: &str = "0x0";
 /// Maximum size of a supported transaction body - 10MB.
 pub const SERVER_MAX_BODY_SIZE: u32 = 10 * 1024 * 1024;
 
+pub const RPC_CONFIG_DEFAULT_PORT: u16 = 8090;
+
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Validate)]
 pub struct RpcConfig {
-    #[validate(custom = "validate_ascii")]
+    #[validate(custom(function = "validate_ascii"))]
     pub chain_id: ChainId,
     pub ip: IpAddr,
     pub port: u16,
@@ -87,7 +89,7 @@ impl Default for RpcConfig {
         RpcConfig {
             chain_id: ChainId::Mainnet,
             ip: "0.0.0.0".parse().unwrap(),
-            port: 8090,
+            port: RPC_CONFIG_DEFAULT_PORT,
             max_events_chunk_size: 1000,
             max_events_keys: 100,
             collect_metrics: false,
@@ -219,6 +221,7 @@ pub async fn run_server(
     node_version: &'static str,
     class_manager_client: Option<SharedClassManagerClient>,
 ) -> anyhow::Result<(SocketAddr, ServerHandle)> {
+    debug!("Started get_last_synced_block");
     let starting_block = get_last_synced_block(storage_reader.clone())?;
     debug!("Starting JSON-RPC.");
     let methods = get_methods_from_supported_apis(

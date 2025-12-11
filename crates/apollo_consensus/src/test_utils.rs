@@ -1,20 +1,25 @@
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use apollo_protobuf::consensus::{ProposalInit, Vote, VoteType};
+use apollo_protobuf::consensus::{ProposalCommitment, ProposalInit, Vote, VoteType};
 use apollo_protobuf::converters::ProtobufConversionError;
+use apollo_storage::db::DbConfig;
+use apollo_storage::StorageConfig;
 use async_trait::async_trait;
 use futures::channel::{mpsc, oneshot};
 use mockall::mock;
-use starknet_api::block::{BlockHash, BlockNumber};
+use starknet_api::block::BlockNumber;
 use starknet_types_core::felt::Felt;
 
-use crate::types::{ConsensusContext, ConsensusError, ProposalCommitment, Round, ValidatorId};
+use crate::storage::{HeightVotedStorageError, HeightVotedStorageTrait};
+use crate::types::{ConsensusContext, ConsensusError, Round, ValidatorId};
 
 /// Define a consensus block which can be used to enable auto mocking Context.
 #[derive(Debug, PartialEq, Clone)]
 pub struct TestBlock {
     pub content: Vec<u32>,
-    pub id: BlockHash,
+    pub id: ProposalCommitment,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -97,14 +102,46 @@ mock! {
 }
 
 pub fn prevote(block_felt: Option<Felt>, height: u64, round: u32, voter: ValidatorId) -> Vote {
-    let block_hash = block_felt.map(BlockHash);
-    Vote { vote_type: VoteType::Prevote, height, round, block_hash, voter }
+    let proposal_commitment = block_felt.map(ProposalCommitment);
+    Vote { vote_type: VoteType::Prevote, height, round, proposal_commitment, voter }
 }
 
 pub fn precommit(block_felt: Option<Felt>, height: u64, round: u32, voter: ValidatorId) -> Vote {
-    let block_hash = block_felt.map(BlockHash);
-    Vote { vote_type: VoteType::Precommit, height, round, block_hash, voter }
+    let proposal_commitment = block_felt.map(ProposalCommitment);
+    Vote { vote_type: VoteType::Precommit, height, round, proposal_commitment, voter }
 }
 pub fn proposal_init(height: u64, round: u32, proposer: ValidatorId) -> ProposalInit {
     ProposalInit { height: BlockNumber(height), round, proposer, ..Default::default() }
+}
+
+#[derive(Debug)]
+pub struct NoOpHeightVotedStorage;
+
+impl HeightVotedStorageTrait for NoOpHeightVotedStorage {
+    fn get_prev_voted_height(&self) -> Result<Option<BlockNumber>, HeightVotedStorageError> {
+        Ok(None)
+    }
+    fn set_prev_voted_height(
+        &mut self,
+        _height: BlockNumber,
+    ) -> Result<(), HeightVotedStorageError> {
+        Ok(())
+    }
+    fn revert_height(&mut self, _height: BlockNumber) -> Result<(), HeightVotedStorageError> {
+        Ok(())
+    }
+}
+
+/// Returns a config for a new (i.e. empty) storage.
+pub fn get_new_storage_config() -> StorageConfig {
+    static DB_INDEX: AtomicUsize = AtomicUsize::new(0);
+    let db_file_path = format!(
+        "{}-{}",
+        tempfile::tempdir().unwrap().path().to_str().unwrap(),
+        DB_INDEX.fetch_add(1, Ordering::Relaxed)
+    );
+    StorageConfig {
+        db_config: DbConfig { path_prefix: PathBuf::from(db_file_path), ..Default::default() },
+        ..Default::default()
+    }
 }

@@ -21,6 +21,7 @@ use starknet_api::transaction::fields::{
     ContractAddressSalt,
     Fee,
     PaymasterData,
+    ProofFacts,
     ResourceBounds,
     Tip,
     TransactionSignature,
@@ -636,6 +637,10 @@ impl TryFrom<protobuf::InvokeV3> for InvokeTransactionV3 {
                 .collect::<Result<Vec<_>, _>>()?,
         );
 
+        let proof_facts = ProofFacts(
+            value.proof_facts.into_iter().map(Felt::try_from).collect::<Result<Vec<_>, _>>()?,
+        );
+
         Ok(Self {
             resource_bounds,
             tip,
@@ -647,6 +652,7 @@ impl TryFrom<protobuf::InvokeV3> for InvokeTransactionV3 {
             fee_data_availability_mode,
             paymaster_data,
             account_deployment_data,
+            proof_facts,
         })
     }
 }
@@ -679,6 +685,12 @@ impl From<InvokeTransactionV3> for protobuf::InvokeV3 {
                 .0
                 .iter()
                 .map(|account_deployment_data| (*account_deployment_data).into())
+                .collect(),
+            proof_facts: value
+                .proof_facts
+                .0
+                .iter()
+                .map(|proof_fact| (*proof_fact).into())
                 .collect(),
         }
     }

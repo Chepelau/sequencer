@@ -4,18 +4,19 @@ use std::fmt::Debug;
 use ethnum::U256;
 use serde_json::json;
 use starknet_api::core::{ClassHash, ContractAddress, Nonce};
+use starknet_api::hash::HashOutput;
 use starknet_committer::block_committer::input::{
     StarknetStorageKey,
     StarknetStorageValue,
     StateDiff,
 };
+use starknet_committer::block_committer::random_structs::DummyRandomValue;
+use starknet_committer::db::external_test_utils::single_tree_flow_test;
 use starknet_committer::forest::filled_forest::FilledForest;
 use starknet_committer::hash_function::hash::TreeHashFunctionImpl;
 use starknet_committer::patricia_merkle_tree::leaf::leaf_impl::ContractState;
 use starknet_committer::patricia_merkle_tree::tree::OriginalSkeletonStorageTrieConfig;
 use starknet_committer::patricia_merkle_tree::types::CompiledClassHash;
-use starknet_patricia::hash::hash_trait::HashOutput;
-use starknet_patricia::patricia_merkle_tree::external_test_utils::single_tree_flow_test;
 use starknet_patricia::patricia_merkle_tree::filled_tree::node::FilledNode;
 use starknet_patricia::patricia_merkle_tree::node_data::inner_node::{
     BinaryData,
@@ -34,12 +35,13 @@ use starknet_types_core::hash::{Pedersen, StarkHash};
 use thiserror;
 use tracing::{debug, error, info, warn};
 
-use super::utils::parse_from_python::TreeFlowInput;
 use crate::committer_cli::filled_tree_output::filled_forest::SerializedForest;
-use crate::committer_cli::parse_input::cast::InputImpl;
+use crate::committer_cli::parse_input::cast::CommitterInputImpl;
 use crate::committer_cli::parse_input::read::parse_input;
-use crate::committer_cli::tests::utils::parse_from_python::parse_input_single_storage_tree_flow_test;
-use crate::committer_cli::tests::utils::random_structs::DummyRandomValue;
+use crate::committer_cli::tests::parse_from_python::{
+    parse_input_single_storage_tree_flow_test,
+    TreeFlowInput,
+};
 use crate::shared_utils::types::{PythonTestError, PythonTestResult, PythonTestRunner};
 
 pub type CommitterPythonTestError = PythonTestError<CommitterSpecificTestError>;
@@ -107,7 +109,6 @@ impl PythonTestRunner for CommitterPythonTestRunner {
     type SpecificError = CommitterSpecificTestError;
 
     /// Runs the test with the given arguments.
-    #[allow(clippy::result_large_err)]
     async fn run(&self, input: Option<&str>) -> CommitterPythonTestResult {
         match self {
             Self::ExampleTest => {
@@ -135,15 +136,15 @@ impl PythonTestRunner for CommitterPythonTestRunner {
                 let committer_input = serde_json::from_str(Self::non_optional_input(input)?)?;
                 parse_input_test(committer_input)
             }
-            Self::StorageSerialize => storage_serialize_test(),
+            Self::StorageSerialize => storage_serialize_test().await,
             Self::NodeKey => Ok(test_node_db_key()),
             Self::ComparePythonHashConstants => Ok(python_hash_constants_compare()),
             Self::StorageNode => {
                 let storage_node_input: HashMap<String, String> =
                     serde_json::from_str(Self::non_optional_input(input)?)?;
-                test_storage_node(storage_node_input)
+                test_storage_node(storage_node_input).await
             }
-            Self::FilledForestOutput => filled_forest_output_test(),
+            Self::FilledForestOutput => filled_forest_output_test().await,
             Self::TreeHeightComparison => Ok(get_actual_tree_height()),
             Self::SerializeForRustCommitterFlowTest => {
                 // TODO(Aner, 8/7/2024): refactor using structs for deserialization.
@@ -153,12 +154,12 @@ impl PythonTestRunner for CommitterPythonTestRunner {
             }
             Self::ComputeHashSingleTree => {
                 // 1. Get and deserialize input.
-                let TreeFlowInput { leaf_modifications, storage, root_hash } =
+                let TreeFlowInput { leaf_modifications, mut storage, root_hash } =
                     serde_json::from_str(Self::non_optional_input(input)?)?;
                 // 2. Run the test.
                 let output = single_tree_flow_test::<StarknetStorageValue, TreeHashFunctionImpl>(
                     leaf_modifications,
-                    storage,
+                    &mut storage,
                     root_hash,
                     OriginalSkeletonStorageTrieConfig::new(false),
                 )
@@ -195,19 +196,17 @@ fn serialize_for_rust_committer_flow_test(input: HashMap<String, String>) -> Str
 
     // Create a json string to compare with the expected string in python.
     serde_json::to_string(&json!(
-        {"leaf_modifications": leaf_modifications_to_print, "storage": storage.storage, "root_hash": root_hash.0}
+        {"leaf_modifications": leaf_modifications_to_print, "storage": storage, "root_hash": root_hash.0}
     )).expect("serialization failed")
 }
 
-#[allow(clippy::result_large_err)]
 fn get_or_key_not_found<'a, T: Debug>(
     map: &'a HashMap<String, T>,
     key: &'a str,
 ) -> Result<&'a T, CommitterPythonTestError> {
     map.get(key).ok_or_else(|| {
         PythonTestError::SpecificError(CommitterSpecificTestError::KeyNotFound(format!(
-            "Failed to get value for key '{}' from {:?}.",
-            key, map
+            "Failed to get value for key '{key}' from {map:?}."
         )))
     })
 }
@@ -219,14 +218,14 @@ fn get_actual_tree_height() -> String {
 pub(crate) fn example_test(test_args: HashMap<String, String>) -> String {
     let x = test_args.get("x").expect("Failed to get value for key 'x'");
     let y = test_args.get("y").expect("Failed to get value for key 'y'");
-    format!("Calling example test with args: x: {}, y: {}", x, y)
+    format!("Calling example test with args: x: {x}, y: {y}")
 }
 
 /// Serializes a Felt into a string.
 pub(crate) fn felt_serialize_test(felt: u128) -> String {
     let bytes = Felt::from(felt).to_bytes_be().to_vec();
     serde_json::to_string(&bytes)
-        .unwrap_or_else(|error| panic!("Failed to serialize felt: {}", error))
+        .unwrap_or_else(|error| panic!("Failed to serialize felt: {error}"))
 }
 
 pub(crate) fn test_hash_function(hash_input: HashMap<String, u128>) -> String {
@@ -243,7 +242,7 @@ pub(crate) fn test_hash_function(hash_input: HashMap<String, u128>) -> String {
 
     // Serialize the hash result.
     serde_json::to_string(&hash_result)
-        .unwrap_or_else(|error| panic!("Failed to serialize hash result: {}", error))
+        .unwrap_or_else(|error| panic!("Failed to serialize hash result: {error}"))
 }
 
 /// Serializes binary data into a JSON string.
@@ -279,18 +278,19 @@ pub(crate) fn test_binary_serialize_test(binary_input: HashMap<String, u128>) ->
 
     // Serialize the map to a JSON string and handle serialization errors.
     serde_json::to_string(&map)
-        .unwrap_or_else(|error| panic!("Failed to serialize binary fact: {}", error))
+        .unwrap_or_else(|error| panic!("Failed to serialize binary fact: {error}"))
 }
 
-#[allow(clippy::result_large_err)]
 pub(crate) fn parse_input_test(committer_input: String) -> CommitterPythonTestResult {
     Ok(create_output_to_python(parse_input(&committer_input).map_err(|err| {
         PythonTestError::SpecificError(CommitterSpecificTestError::DeserializationTestFailure(err))
     })?))
 }
 
-fn create_output_to_python(actual_input: InputImpl) -> String {
-    let (storage_keys_hash, storage_values_hash) = hash_storage(&actual_input.storage);
+fn create_output_to_python(
+    CommitterInputImpl { input: actual_input, storage }: CommitterInputImpl,
+) -> String {
+    let (storage_keys_hash, storage_values_hash) = hash_storage(&storage);
     let (state_diff_keys_hash, state_diff_values_hash) = hash_state_diff(&actual_input.state_diff);
     format!(
         r#"
@@ -307,7 +307,7 @@ fn create_output_to_python(actual_input: InputImpl) -> String {
         "state_diff_keys_hash": {:?},
         "state_diff_values_hash": {:?}
         }}"#,
-        actual_input.storage.len(),
+        storage.0.len(),
         actual_input.state_diff.address_to_class_hash.len(),
         actual_input.state_diff.address_to_nonce.len(),
         actual_input.state_diff.class_hash_to_compiled_class_hash.len(),
@@ -388,10 +388,10 @@ generate_storage_map_xor_hasher!(
 generate_storage_map_xor_hasher!(hash_address_to_class_hash, ContractAddress, ClassHash);
 generate_storage_map_xor_hasher!(hash_address_to_nonce, ContractAddress, Nonce);
 
-fn hash_storage(storage: &HashMap<DbKey, DbValue>) -> (Vec<u8>, Vec<u8>) {
+fn hash_storage(storage: &MapStorage) -> (Vec<u8>, Vec<u8>) {
     let mut keys_hash = vec![0; 32];
     let mut values_hash = vec![0; 32];
-    for (key, value) in storage {
+    for (key, value) in &storage.0 {
         keys_hash = xor_hash(&keys_hash, &key.0);
         values_hash = xor_hash(&values_hash, &value.0);
     }
@@ -457,20 +457,19 @@ pub(crate) fn test_node_db_key() -> String {
 
     // Serialize the map to a JSON string and handle serialization errors.
     serde_json::to_string(&map)
-        .unwrap_or_else(|error| panic!("Failed to serialize storage prefix: {}", error))
+        .unwrap_or_else(|error| panic!("Failed to serialize storage prefix: {error}"))
 }
 
 /// This function storage_serialize_test generates a MapStorage containing DbKey and
 /// DbValue pairs for u128 values in the range 0..=1000,
 /// serializes it to a JSON string using Serde,
 /// and returns the serialized JSON string or panics with an error message if serialization fails.
-#[allow(clippy::result_large_err)]
-pub(crate) fn storage_serialize_test() -> CommitterPythonTestResult {
-    let mut storage = MapStorage { storage: HashMap::new() };
+pub(crate) async fn storage_serialize_test() -> CommitterPythonTestResult {
+    let mut storage = MapStorage::default();
     for i in 0..=99_u128 {
         let key = DbKey(Felt::from(i).to_bytes_be().to_vec());
         let value = DbValue(Felt::from(i).to_bytes_be().to_vec());
-        storage.set(key, value);
+        storage.set(key, value).await?;
     }
 
     Ok(serde_json::to_string(&storage)?)
@@ -501,10 +500,9 @@ fn python_hash_constants_compare() -> String {
 /// # Returns
 /// A `Result<String, CommitterTestError>` containing a serialized map of all nodes on
 /// success, or an error if keys are missing or parsing fails.
-#[allow(clippy::result_large_err)]
-fn test_storage_node(data: HashMap<String, String>) -> CommitterPythonTestResult {
+async fn test_storage_node(data: HashMap<String, String>) -> CommitterPythonTestResult {
     // Create a storage to store the nodes.
-    let mut rust_fact_storage = MapStorage { storage: HashMap::new() };
+    let mut rust_fact_storage = MapStorage::default();
 
     // Parse the binary node data from the input.
     let binary_json = get_or_key_not_found(&data, "binary")?;
@@ -520,7 +518,7 @@ fn test_storage_node(data: HashMap<String, String>) -> CommitterPythonTestResult
     };
 
     // Store the binary node in the storage.
-    rust_fact_storage.set(binary_rust.db_key(), binary_rust.serialize());
+    rust_fact_storage.set(binary_rust.db_key(), binary_rust.serialize()).await?;
 
     // Parse the edge node data from the input.
     let edge_json = get_or_key_not_found(&data, "edge")?;
@@ -547,7 +545,7 @@ fn test_storage_node(data: HashMap<String, String>) -> CommitterPythonTestResult
     };
 
     // Store the edge node in the storage.
-    rust_fact_storage.set(edge_rust.db_key(), edge_rust.serialize());
+    rust_fact_storage.set(edge_rust.db_key(), edge_rust.serialize()).await?;
 
     // Parse the storage leaf data from the input.
     let storage_leaf_json = get_or_key_not_found(&data, "storage")?;
@@ -563,7 +561,7 @@ fn test_storage_node(data: HashMap<String, String>) -> CommitterPythonTestResult
     };
 
     // Store the storage leaf node in the storage.
-    rust_fact_storage.set(storage_leaf_rust.db_key(), storage_leaf_rust.serialize());
+    rust_fact_storage.set(storage_leaf_rust.db_key(), storage_leaf_rust.serialize()).await?;
 
     // Parse the contract state leaf data from the input.
     let contract_state_leaf = get_or_key_not_found(&data, "contract_state_leaf")?;
@@ -588,7 +586,9 @@ fn test_storage_node(data: HashMap<String, String>) -> CommitterPythonTestResult
     };
 
     // Store the contract state leaf node in the storage.
-    rust_fact_storage.set(contract_state_leaf_rust.db_key(), contract_state_leaf_rust.serialize());
+    rust_fact_storage
+        .set(contract_state_leaf_rust.db_key(), contract_state_leaf_rust.serialize())
+        .await?;
 
     // Parse the compiled class leaf data from the input.
     let compiled_class_leaf = get_or_key_not_found(&data, "contract_class_leaf")?;
@@ -605,17 +605,18 @@ fn test_storage_node(data: HashMap<String, String>) -> CommitterPythonTestResult
     };
 
     // Store the compiled class leaf node in the storage.
-    rust_fact_storage.set(compiled_class_leaf_rust.db_key(), compiled_class_leaf_rust.serialize());
+    rust_fact_storage
+        .set(compiled_class_leaf_rust.db_key(), compiled_class_leaf_rust.serialize())
+        .await?;
 
     // Serialize the storage to a JSON string and handle serialization errors.
     Ok(serde_json::to_string(&rust_fact_storage)?)
 }
 
 /// Generates a dummy random filled forest and serializes it to a JSON string.
-#[allow(clippy::result_large_err)]
-pub(crate) fn filled_forest_output_test() -> CommitterPythonTestResult {
+pub(crate) async fn filled_forest_output_test() -> CommitterPythonTestResult {
     let dummy_forest = SerializedForest(FilledForest::dummy_random(&mut rand::thread_rng(), None));
-    let output = dummy_forest.forest_to_output();
+    let output = dummy_forest.forest_to_output().await;
     let output_string = serde_json::to_string(&output).expect("Failed to serialize");
     Ok(output_string)
 }

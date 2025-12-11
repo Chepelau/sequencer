@@ -2,6 +2,7 @@ import json
 import subprocess
 import sys
 from typing import List, Tuple
+
 from kubernetes import config
 
 
@@ -14,10 +15,7 @@ def run(
 def load_services(deployment_config_path: str) -> List[Tuple[str, str]]:
     with open(deployment_config_path, "r", encoding="utf-8") as f:
         deployment_config = json.load(f)
-    return [
-        (svc["name"], svc["controller"])
-        for svc in deployment_config.get("services", [])
-    ]
+    return [(svc["name"], svc["controller"]) for svc in deployment_config.get("services", [])]
 
 
 def copy_state(pod_name: str, data_dir: str) -> None:
@@ -78,7 +76,6 @@ def build_resource_name(service_name: str, controller: str) -> str:
 
 
 def main(deployment_config_path: str, data_dir: str) -> None:
-
     config.load_kube_config()
     services: List[Tuple[str, str]] = load_services(deployment_config_path)
 
@@ -130,6 +127,9 @@ def main(deployment_config_path: str, data_dir: str) -> None:
     for controller, resource_name in resources_to_wait_for:
         wait_for_resource(controller=controller, name=resource_name)
         print(f"✅ {controller}/{resource_name} is ready!")
+
+    print("\n📦 Current pod status:")
+    run(["kubectl", "get", "pods", "-o", "wide"])
 
     print("\n✅ All services are ready!")
 

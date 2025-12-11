@@ -1,8 +1,12 @@
 use std::collections::HashMap;
 
 use cairo_vm::vm::runners::cairo_runner::ExecutionResources;
+use starknet_api::core::{ClassHash, CompiledClassHash};
+use starknet_api::hash::StarkHash;
 
+use crate::blockifier::transaction_executor::CompiledClassHashV2ToV1;
 use crate::blockifier_versioned_constants::{BaseGasCosts, BuiltinGasCosts};
+use crate::state::state_api::{StateReader, StateResult};
 use crate::transaction::errors::NumericConversionError;
 
 #[cfg(test)]
@@ -77,7 +81,7 @@ pub fn get_gas_cost_from_vm_resources(
         .map(|(builtin, amount)| {
             let builtin_cost = builtin_costs
                 .get_builtin_gas_cost(builtin)
-                .unwrap_or_else(|err| panic!("Failed to get gas cost: {}", err));
+                .unwrap_or_else(|err| panic!("Failed to get gas cost: {err}"));
             builtin_cost * u64_from_usize(*amount)
         })
         .sum();
@@ -99,9 +103,35 @@ where
         dest.entry(key.clone())
             .and_modify(|existing| {
                 *existing = existing.checked_add(value).unwrap_or_else(|| {
-                    panic!("add counters: overflow when adding {:?} to {:?}", value, existing)
+                    panic!("add counters: overflow when adding {value:?} to {existing:?}")
                 });
             })
             .or_insert_with(|| value.clone());
+    }
+}
+
+// Class should migrate if his compiled class hash v2 is different from the one in the state.
+/// Returns a map of class hashes to their compiled class hashes for migration if the class should
+/// migrate, otherwise returns None.
+pub fn should_migrate(
+    state_reader: &impl StateReader,
+    class_hash: ClassHash,
+) -> StateResult<Option<(ClassHash, CompiledClassHashV2ToV1)>> {
+    let state_compiled_class_hash = state_reader.get_compiled_class_hash(class_hash)?;
+    match state_compiled_class_hash {
+        // Class hash does not exist in the state, or is a Cairo 0 class.
+        CompiledClassHash(hash) if hash == StarkHash::ZERO => Ok(None),
+        state_compiled_class_hash => {
+            let compiled_class_hash_v2 = state_reader.get_compiled_class_hash_v2(
+                class_hash,
+                &state_reader.get_compiled_class(class_hash)?,
+            )?;
+            // If the state compiled class hash is compiled class hash v2, the class should not
+            // migrate.
+            if state_compiled_class_hash == compiled_class_hash_v2 {
+                return Ok(None);
+            }
+            Ok(Some((class_hash, (compiled_class_hash_v2, state_compiled_class_hash))))
+        }
     }
 }

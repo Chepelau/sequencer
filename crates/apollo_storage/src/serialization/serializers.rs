@@ -28,6 +28,10 @@ use starknet_api::block::{
     GasPricePerToken,
     StarknetVersion,
 };
+use starknet_api::block_hash::block_hash_calculator::{
+    BlockHeaderCommitments,
+    PartialBlockHashComponents,
+};
 use starknet_api::contract_class::EntryPointType;
 use starknet_api::core::{
     ClassHash,
@@ -65,7 +69,7 @@ use starknet_api::deprecated_contract_class::{
     TypedParameter,
 };
 use starknet_api::execution_resources::{Builtin, ExecutionResources, GasAmount, GasVector};
-use starknet_api::hash::{PoseidonHash, StarkHash};
+use starknet_api::hash::{HashOutput, PoseidonHash, StarkHash, StateRoots};
 use starknet_api::rpc_transaction::EntryPointByType;
 use starknet_api::state::{
     EntryPoint,
@@ -81,6 +85,7 @@ use starknet_api::transaction::fields::{
     ContractAddressSalt,
     Fee,
     PaymasterData,
+    ProofFacts,
     Resource,
     ResourceBounds,
     Tip,
@@ -135,6 +140,7 @@ use crate::compression_utils::{
     serialize_and_compress,
     IsCompressed,
 };
+use crate::consensus::LastVotedMarker;
 use crate::db::serialization::{StorageSerde, StorageSerdeError};
 use crate::db::table_types::NoValue;
 use crate::header::StorageBlockHeader;
@@ -150,6 +156,7 @@ const COMPRESSION_THRESHOLD_BYTES: usize = 384;
 
 auto_storage_serde! {
     pub struct AccountDeploymentData(pub Vec<Felt>);
+    pub struct ProofFacts(pub Vec<Felt>);
     pub struct AllResourceBounds {
         pub l1_gas: ResourceBounds,
         pub l2_gas: ResourceBounds,
@@ -177,6 +184,13 @@ auto_storage_serde! {
         pub n_transactions: usize,
         pub n_events: usize,
     }
+    pub struct BlockHeaderCommitments {
+        pub transaction_commitment: TransactionCommitment,
+        pub event_commitment: EventCommitment,
+        pub receipt_commitment: ReceiptCommitment,
+        pub state_diff_commitment: StateDiffCommitment,
+        pub concatenated_counts: Felt,
+    }
     pub struct BlockSignature(pub Signature);
     pub enum BlockStatus {
         Pending = 0,
@@ -188,6 +202,10 @@ auto_storage_serde! {
     pub struct Calldata(pub Arc<Vec<Felt>>);
     pub struct CompiledClassHash(pub StarkHash);
     pub struct ClassHash(pub StarkHash);
+    pub struct StateRoots {
+        pub contracts_trie_root_hash: HashOutput,
+        pub classes_trie_root_hash: HashOutput,
+    }
     pub struct ContractAddressSalt(pub StarkHash);
     pub enum ContractClassAbiEntry {
         Event(EventAbiEntry) = 0,
@@ -300,6 +318,7 @@ auto_storage_serde! {
     }
     pub struct GlobalRoot(pub StarkHash);
     pub struct H160(pub [u8; 20]);
+    pub struct HashOutput(pub Felt);
     pub struct IndexedDeprecatedContractClass {
         pub block_number: BlockNumber,
         pub location_in_file: LocationInFile,
@@ -319,6 +338,9 @@ auto_storage_serde! {
     }
     pub struct L1ToL2Payload(pub Vec<Felt>);
     pub struct L2ToL1Payload(pub Vec<Felt>);
+    pub struct LastVotedMarker {
+        pub height: BlockNumber,
+    }
     enum MarkerKind {
         Header = 0,
         Body = 1,
@@ -329,6 +351,7 @@ auto_storage_serde! {
         BaseLayerBlock = 6,
         ClassManagerBlock = 7,
         CompilerBackwardCompatibility = 8,
+        BlockHash = 9,
     }
     pub struct MessageToL1 {
         pub to_address: EthAddress,
@@ -351,6 +374,16 @@ auto_storage_serde! {
         DeprecatedContractClass = 3,
         TransactionOutput = 4,
         Transaction = 5,
+    }
+    pub struct PartialBlockHashComponents {
+        pub header_commitments: BlockHeaderCommitments,
+        pub block_number: BlockNumber,
+        pub l1_gas_price: GasPricePerToken,
+        pub l1_data_gas_price: GasPricePerToken,
+        pub l2_gas_price: GasPricePerToken,
+        pub sequencer: SequencerContractAddress,
+        pub timestamp: BlockTimestamp,
+        pub starknet_version: StarknetVersion,
     }
     pub struct PaymasterData(pub Vec<Felt>);
     pub struct PoseidonHash(pub Felt);
@@ -396,29 +429,32 @@ auto_storage_serde! {
         Struct = 0,
     }
     pub enum StarknetVersion {
-        V0_9_1 = 0,
-        V0_10_0 = 1,
-        V0_10_1 = 2,
-        V0_10_2 = 3,
-        V0_10_3 = 4,
-        V0_11_0 = 5,
-        V0_11_0_2 = 6,
-        V0_11_1 = 7,
-        V0_11_2 = 8,
-        V0_12_0 = 9,
-        V0_12_1 = 10,
-        V0_12_2 = 11,
-        V0_12_3 = 12,
-        V0_13_0 = 13,
-        V0_13_1 = 14,
-        V0_13_1_1 = 15,
-        V0_13_2 = 16,
-        V0_13_2_1 = 17,
-        V0_13_3 = 18,
-        V0_13_4 = 19,
-        V0_13_5 = 20,
-        V0_13_6 = 21,
-        V0_14_0 = 22,
+        PreV0_9_1 = 0,
+        V0_9_1 = 1,
+        V0_10_0 = 2,
+        V0_10_1 = 3,
+        V0_10_2 = 4,
+        V0_10_3 = 5,
+        V0_11_0 = 6,
+        V0_11_0_2 = 7,
+        V0_11_1 = 8,
+        V0_11_2 = 9,
+        V0_12_0 = 10,
+        V0_12_1 = 11,
+        V0_12_2 = 12,
+        V0_12_3 = 13,
+        V0_13_0 = 14,
+        V0_13_1 = 15,
+        V0_13_1_1 = 16,
+        V0_13_2 = 17,
+        V0_13_2_1 = 18,
+        V0_13_3 = 19,
+        V0_13_4 = 20,
+        V0_13_5 = 21,
+        V0_13_6 = 22,
+        V0_14_0 = 23,
+        V0_14_1 = 24,
+        V0_15_0 = 25,
     }
     pub struct StateDiffCommitment(pub PoseidonHash);
     pub struct Tip(pub u64);
@@ -511,6 +547,7 @@ auto_storage_serde! {
 
     (BlockNumber, TransactionOffsetInBlock);
     (BlockHash, ClassHash);
+    (ClassHash, BlockNumber);
     (ContractAddress, BlockHash);
     (ContractAddress, BlockNumber);
     (ContractAddress, Nonce);
@@ -719,6 +756,16 @@ impl StorageSerde for StorageKey {
 ////////////////////////////////////////////////////////////////////////
 //  Primitive types.
 ////////////////////////////////////////////////////////////////////////
+impl StorageSerde for () {
+    fn serialize_into(&self, _: &mut impl std::io::Write) -> Result<(), StorageSerdeError> {
+        Ok(())
+    }
+
+    fn deserialize_from(_: &mut impl std::io::Read) -> Option<Self> {
+        Some(())
+    }
+}
+
 impl StorageSerde for bool {
     fn serialize_into(&self, res: &mut impl std::io::Write) -> Result<(), StorageSerdeError> {
         u8::from(*self).serialize_into(res)
@@ -1105,7 +1152,7 @@ impl StorageSerde for ThinStateDiff {
         let mut to_compress: Vec<u8> = Vec::new();
         self.deployed_contracts.serialize_into(&mut to_compress)?;
         self.storage_diffs.serialize_into(&mut to_compress)?;
-        self.declared_classes.serialize_into(&mut to_compress)?;
+        self.class_hash_to_compiled_class_hash.serialize_into(&mut to_compress)?;
         self.deprecated_declared_classes.serialize_into(&mut to_compress)?;
         self.nonces.serialize_into(&mut to_compress)?;
         if to_compress.len() > crate::compression_utils::MAX_DECOMPRESSED_SIZE {
@@ -1128,7 +1175,7 @@ impl StorageSerde for ThinStateDiff {
         Some(Self {
             deployed_contracts: IndexMap::deserialize_from(data)?,
             storage_diffs: IndexMap::deserialize_from(data)?,
-            declared_classes: IndexMap::deserialize_from(data)?,
+            class_hash_to_compiled_class_hash: IndexMap::deserialize_from(data)?,
             deprecated_declared_classes: Vec::deserialize_from(data)?,
             nonces: IndexMap::deserialize_from(data)?,
         })
@@ -1247,6 +1294,7 @@ auto_storage_serde_conditionally_compressed! {
         pub fee_data_availability_mode: DataAvailabilityMode,
         pub paymaster_data: PaymasterData,
         pub account_deployment_data: AccountDeploymentData,
+        pub proof_facts: ProofFacts,
     }
 
     pub struct L1HandlerTransaction {

@@ -15,6 +15,7 @@ use super::{Behaviour, DiscoveryConfig};
 use crate::mixed_behaviour;
 use crate::mixed_behaviour::{BridgedBehaviour, MixedBehaviour};
 use crate::peer_manager::PeerManagerConfig;
+use crate::prune_dead_connections::{DEFAULT_PING_INTERVAL, DEFAULT_PING_TIMEOUT};
 use crate::utils::StreamMap;
 
 #[derive(NetworkBehaviour)]
@@ -27,13 +28,17 @@ struct DiscoveryMixedBehaviour {
 impl DiscoveryMixedBehaviour {
     pub fn new(key: Keypair, bootstrap_peer_multiaddr: Option<Vec<Multiaddr>>) -> Self {
         let mixed_behaviour = MixedBehaviour::new(
-            key,
-            bootstrap_peer_multiaddr,
             Default::default(),
-            ChainId::Mainnet,
-            None,
             DiscoveryConfig::default(),
             PeerManagerConfig::default(),
+            None, // No event tracker for tests
+            None, // No latency metrics for tests
+            key,
+            bootstrap_peer_multiaddr,
+            ChainId::Mainnet,
+            None,
+            DEFAULT_PING_INTERVAL,
+            DEFAULT_PING_TIMEOUT,
         );
         Self {
             identify: mixed_behaviour.identify,
@@ -48,7 +53,7 @@ async fn all_nodes_have_same_bootstrap_peer() {
     const NUM_NODES: usize = 2;
 
     let mut bootstrap_swarm =
-        Swarm::new_ephemeral(|keypair| DiscoveryMixedBehaviour::new(keypair, None));
+        Swarm::new_ephemeral_tokio(|keypair| DiscoveryMixedBehaviour::new(keypair, None));
     bootstrap_swarm.listen().with_memory_addr_external().await;
 
     let bootstrap_peer_id = *bootstrap_swarm.local_peer_id();
@@ -61,7 +66,7 @@ async fn all_nodes_have_same_bootstrap_peer() {
         .unwrap();
 
     let swarms = (0..NUM_NODES).map(|_| {
-        Swarm::new_ephemeral(|keypair| {
+        Swarm::new_ephemeral_tokio(|keypair| {
             DiscoveryMixedBehaviour::new(keypair, Some(vec![bootstrap_peer_multiaddr.clone()]))
         })
     });

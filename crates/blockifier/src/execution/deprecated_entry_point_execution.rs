@@ -44,7 +44,6 @@ pub const CAIRO0_BUILTINS_NAMES: [BuiltinName; 6] = [
 ];
 
 /// Executes a specific call to a contract entry point and returns its output.
-#[allow(clippy::result_large_err)]
 pub fn execute_entry_point_call(
     call: ExecutableCallEntryPoint,
     compiled_class: CompiledClassV0,
@@ -207,7 +206,6 @@ pub fn prepare_call_arguments(
 }
 
 /// Runs the runner from the given PC.
-#[allow(clippy::result_large_err)]
 pub fn run_entry_point(
     runner: &mut CairoRunner,
     hint_processor: &mut DeprecatedSyscallHintProcessor<'_>,
@@ -217,13 +215,15 @@ pub fn run_entry_point(
     let verify_secure = true;
     let program_segment_size = None; // Infer size from program.
     let args: Vec<&CairoArg> = args.iter().collect();
-    let result = runner.run_from_entrypoint(
-        entry_point_pc,
-        &args,
-        verify_secure,
-        program_segment_size,
-        hint_processor,
-    );
+    let result = runner
+        .run_from_entrypoint(
+            entry_point_pc,
+            &args,
+            verify_secure,
+            program_segment_size,
+            hint_processor,
+        )
+        .map_err(Box::new);
 
     Ok(result?)
 }
@@ -289,6 +289,7 @@ pub fn finalize_execution(
             ..Default::default()
         },
         builtin_counters: vm_resources_without_inner_calls.prover_builtins(),
+        syscalls_usage: syscall_handler.syscalls_usage,
     })
 }
 

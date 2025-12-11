@@ -1,7 +1,10 @@
 use blockifier::abi::constants::STORED_BLOCK_HASH_BUFFER;
 use blockifier::blockifier_versioned_constants::{GasCosts, VersionedConstants};
 use blockifier::execution::execution_utils::ReadOnlySegment;
-use blockifier::execution::syscalls::hint_processor::{ENTRYPOINT_FAILED_ERROR, INVALID_ARGUMENT};
+use blockifier::execution::syscalls::hint_processor::{
+    ENTRYPOINT_FAILED_ERROR_FELT,
+    INVALID_ARGUMENT_FELT,
+};
 use blockifier::execution::syscalls::secp::SecpHintProcessor;
 use blockifier::execution::syscalls::syscall_executor::SyscallExecutor;
 use blockifier::execution::syscalls::vm_syscall_utils::{
@@ -46,6 +49,7 @@ use starknet_api::abi::abi_utils::selector_from_name;
 use starknet_api::execution_resources::GasAmount;
 use starknet_api::transaction::constants::EXECUTE_ENTRY_POINT_NAME;
 use starknet_api::transaction::TransactionVersion;
+use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
 use starknet_types_core::felt::Felt;
 
 use crate::hint_processor::execution_helper::ExecutionHelperError;
@@ -173,7 +177,7 @@ impl<S: StateReader> SyscallExecutor for SnosHintProcessor<'_, S> {
         remaining_gas: &mut u64,
     ) -> Result<CallContractResponse, Self::Error> {
         if request.function_selector == selector_from_name(EXECUTE_ENTRY_POINT_NAME) {
-            return Err(handle_failure(Felt::from_hex_unchecked(INVALID_ARGUMENT)));
+            return Err(handle_failure(INVALID_ARGUMENT_FELT));
         }
         call_contract_helper(vm, syscall_handler, remaining_gas)
     }
@@ -302,7 +306,7 @@ impl<S: StateReader> SyscallExecutor for SnosHintProcessor<'_, S> {
         remaining_gas: &mut u64,
     ) -> Result<MetaTxV0Response, Self::Error> {
         if request.entry_point_selector != selector_from_name(EXECUTE_ENTRY_POINT_NAME) {
-            return Err(handle_failure(Felt::from_hex_unchecked(INVALID_ARGUMENT)));
+            return Err(handle_failure(INVALID_ARGUMENT_FELT));
         }
         call_contract_helper(vm, syscall_handler, remaining_gas)
     }
@@ -355,26 +359,14 @@ impl<S: StateReader> SyscallExecutor for SnosHintProcessor<'_, S> {
         VersionedConstants::latest_constants()
     }
 
-    fn write_sha256_state(
+    fn write_sha256_out_state(
         &mut self,
         state: &[MaybeRelocatable],
         vm: &mut VirtualMachine,
     ) -> Result<Relocatable, Self::Error> {
-        let block_size = get_size_of_cairo_struct(CairoStruct::Sha256ProcessBlock, self.program)?;
-        let out_state_offset =
-            get_field_offset(CairoStruct::Sha256ProcessBlock, "out_state", self.program)?;
-        let syscall_hint_processor =
-            &mut self.get_mut_current_execution_helper()?.syscall_hint_processor;
-        let segment_start =
-            syscall_hint_processor.sha256_segment.expect("SHA256 segment must be set in OS.");
-        let entries_offset = block_size * syscall_hint_processor.sha256_block_count;
-        let total_offset = entries_offset + out_state_offset;
-        let state_start = (segment_start + total_offset)?;
-        vm.load_data(state_start, state)?;
-
-        // Increment the block count for the next call.
-        syscall_hint_processor.sha256_block_count += 1;
-        Ok(state_start)
+        let temp_segment = vm.add_temporary_segment();
+        vm.load_data(temp_segment, state)?;
+        Ok(temp_segment)
     }
 }
 
@@ -420,7 +412,8 @@ fn allocate_or_return_execution_info_segment<IG: IdentifierGetter>(
         // Verify all resource bounds are present.
         assert!(resource_bounds_size != 0);
         assert!(
-            (resource_bounds_end.offset - resource_bounds_start.offset) % resource_bounds_size == 0,
+            (resource_bounds_end.offset - resource_bounds_start.offset)
+                .is_multiple_of(resource_bounds_size),
             "Resource bounds segment length is not a multiple of resource bounds size."
         );
         if (resource_bounds_end.offset - resource_bounds_start.offset) / resource_bounds_size != 3 {
@@ -453,10 +446,9 @@ fn call_contract_helper(
     let next_call_execution = syscall_handler.get_next_call_execution()?;
     *remaining_gas -= next_call_execution.gas_consumed;
     let retdata = &next_call_execution.retdata.0;
-    let revert_error_code = Felt::from_hex_unchecked(ENTRYPOINT_FAILED_ERROR);
     if next_call_execution.failed {
         let mut retdata = retdata.clone();
-        retdata.push(revert_error_code);
+        retdata.push(ENTRYPOINT_FAILED_ERROR_FELT);
         let revert_data = RevertData::new_temp(retdata);
         return Err(SnosSyscallError::Revert(revert_data));
     };

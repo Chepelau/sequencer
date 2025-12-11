@@ -1,7 +1,8 @@
 use rstest::rstest;
 use starknet_api::block::BlockNumber;
 
-use crate::state_reader::utils::{get_block_numbers_for_reexecution, reexecute_block_for_testing};
+use crate::state_reader::cli::get_block_numbers_for_reexecution;
+use crate::state_reader::utils::reexecute_block_for_testing;
 
 #[rstest]
 #[case::v_0_13_0(600001)]
@@ -12,6 +13,8 @@ use crate::state_reader::utils::{get_block_numbers_for_reexecution, reexecute_bl
 #[case::v_0_13_3(1000000)]
 #[case::v_0_13_4(1257000)]
 #[case::v_0_13_5(1300000)]
+#[case::v_0_13_6(1743490)]
+#[case::v_0_14_0(2509604)]
 #[case::first_v_0_13_5_rpc_v8(1400000)]
 #[case::second_v_0_13_5_rpc_v8(1450000)]
 #[case::invoke_with_replace_class_syscall(780008)]

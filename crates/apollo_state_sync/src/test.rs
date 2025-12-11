@@ -1,5 +1,7 @@
-// TODO(shahak): Test is_class_declared_at.
+use std::sync::Arc;
+
 use apollo_infra::component_definitions::ComponentRequestHandler;
+use apollo_starknet_client::reader::{MockStarknetReader, StarknetReader};
 use apollo_state_sync_types::communication::{StateSyncRequest, StateSyncResponse};
 use apollo_state_sync_types::errors::StateSyncError;
 use apollo_storage::body::BodyStorageWriter;
@@ -10,9 +12,11 @@ use apollo_storage::StorageWriter;
 use apollo_test_utils::{get_rng, get_test_block, get_test_state_diff, GetTestInstance};
 use futures::channel::mpsc::channel;
 use indexmap::IndexMap;
+use mockall::predicate;
 use rand_chacha::rand_core::RngCore;
-use starknet_api::block::{Block, BlockHeader, BlockNumber};
+use starknet_api::block::{Block, BlockHash, BlockHeader, BlockNumber};
 use starknet_api::core::{ClassHash, ContractAddress, Nonce};
+use starknet_api::hash::StarkHash;
 use starknet_api::state::{StorageKey, ThinStateDiff};
 use starknet_types_core::felt::Felt;
 
@@ -20,7 +24,8 @@ use crate::StateSync;
 
 fn setup() -> (StateSync, StorageWriter) {
     let ((storage_reader, storage_writer), _) = get_test_storage();
-    let state_sync = StateSync { storage_reader, new_block_sender: channel(0).0 };
+    let state_sync =
+        StateSync { storage_reader, new_block_sender: channel(0).0, starknet_client: None };
     (state_sync, storage_writer)
 }
 
@@ -53,11 +58,8 @@ async fn test_get_block() {
             expected_header.block_header_without_hash.block_number,
         ))
         .await;
-    let StateSyncResponse::GetBlock(Ok(boxed_sync_block)) = response else {
-        panic!("Expected StateSyncResponse::GetBlock::Ok(Box(Some(_))), but got {:?}", response);
-    };
-    let Some(block) = *boxed_sync_block else {
-        panic!("Expected Box(Some(_)), but got {:?}", boxed_sync_block);
+    let StateSyncResponse::GetBlock(Ok(block)) = response else {
+        panic!("Expected StateSyncResponse::GetBlock::Ok(Box(_)), but got {response:?}");
     };
 
     assert_eq!(block.block_header_without_hash, expected_header.block_header_without_hash);
@@ -68,6 +70,71 @@ async fn test_get_block() {
     } else {
         assert_eq!(block.l1_transaction_hashes[0], expected_body.transaction_hashes[0]);
     }
+}
+
+#[tokio::test]
+async fn test_get_block_hash() {
+    let (mut state_sync, mut storage_writer) = setup();
+
+    let Block { header: mut expected_header, body: expected_body } =
+        get_test_block(1, None, None, None);
+
+    // get_test_block returns a block with parent_hash == block_hash. Need to change that to make
+    // sure we don't return the parent hash
+    expected_header.block_hash.0 =
+        expected_header.block_header_without_hash.parent_hash.0 + Felt::from(1);
+
+    storage_writer
+        .begin_rw_txn()
+        .unwrap()
+        .append_header(expected_header.block_header_without_hash.block_number, &expected_header)
+        .unwrap()
+        .append_state_diff(
+            expected_header.block_header_without_hash.block_number,
+            ThinStateDiff::from(get_test_state_diff()),
+        )
+        .unwrap()
+        .append_body(expected_header.block_header_without_hash.block_number, expected_body.clone())
+        .unwrap()
+        .commit()
+        .unwrap();
+    // Verify that the block was written and is returned correctly.
+    let response = state_sync
+        .handle_request(StateSyncRequest::GetBlockHash(
+            expected_header.block_header_without_hash.block_number,
+        ))
+        .await;
+    let StateSyncResponse::GetBlockHash(Ok(block_hash)) = response else {
+        panic!("Expected StateSyncResponse::GetBlockHash::Ok(_), but got {response:?}");
+    };
+
+    assert_eq!(block_hash, expected_header.block_hash);
+}
+
+#[tokio::test]
+async fn test_get_block_hash_fallback_to_starknet_client() {
+    let mut starknet_client = MockStarknetReader::new();
+    let block_number = BlockNumber(100);
+    let expected_block_hash = BlockHash(StarkHash::from_hex_unchecked("0x123"));
+    starknet_client
+        .expect_block_hash()
+        .with(predicate::eq(block_number))
+        .times(1)
+        .returning(move |_block_number| Ok(Some(expected_block_hash)));
+
+    let starknet_client: Option<Arc<dyn StarknetReader + Send + Sync>> =
+        Some(Arc::new(starknet_client));
+    let ((storage_reader, _storage_writer), _) = get_test_storage();
+    let mut state_sync =
+        StateSync { storage_reader, new_block_sender: channel(0).0, starknet_client };
+
+    // The block is not in storage, so it should fall back to starknet_client
+    let response = state_sync.handle_request(StateSyncRequest::GetBlockHash(block_number)).await;
+    let StateSyncResponse::GetBlockHash(Ok(block_hash)) = response else {
+        panic!("Expected StateSyncResponse::GetBlockHash::Ok(_), but got {response:?}");
+    };
+
+    assert_eq!(block_hash, expected_block_hash);
 }
 
 #[tokio::test]
@@ -105,7 +172,7 @@ async fn test_get_storage_at() {
         .await;
 
     let StateSyncResponse::GetStorageAt(Ok(value)) = response else {
-        panic!("Expected StateSyncResponse::GetStorageAt::Ok(_), but got {:?}", response);
+        panic!("Expected StateSyncResponse::GetStorageAt::Ok(_), but got {response:?}");
     };
 
     assert_eq!(value, expected_value);
@@ -144,7 +211,7 @@ async fn test_get_nonce_at() {
         .await;
 
     let StateSyncResponse::GetNonceAt(Ok(nonce)) = response else {
-        panic!("Expected StateSyncResponse::GetNonceAt::Ok(_), but got {:?}", response);
+        panic!("Expected StateSyncResponse::GetNonceAt::Ok(_), but got {response:?}");
     };
 
     assert_eq!(nonce, expected_nonce);
@@ -182,7 +249,7 @@ async fn get_class_hash_at() {
         .await;
 
     let StateSyncResponse::GetClassHashAt(Ok(class_hash)) = response else {
-        panic!("Expected StateSyncResponse::GetClassHashAt::Ok(_), but got {:?}", response);
+        panic!("Expected StateSyncResponse::GetClassHashAt::Ok(_), but got {response:?}");
     };
 
     assert_eq!(class_hash, expected_class_hash);
@@ -197,11 +264,14 @@ async fn test_block_not_found() {
 
     let response =
         state_sync.handle_request(StateSyncRequest::GetBlock(non_existing_block_number)).await;
-    let StateSyncResponse::GetBlock(Ok(maybe_block)) = response else {
-        panic!("Expected StateSyncResponse::GetBlock::Ok(_), but got {:?}", response);
+    let StateSyncResponse::GetBlock(get_block_result) = response else {
+        panic!("Expected StateSyncResponse::GetBlock(_), but got {response:?}");
     };
 
-    assert!(maybe_block.is_none());
+    assert_eq!(
+        get_block_result.unwrap_err(),
+        StateSyncError::BlockNotFound(non_existing_block_number)
+    );
 
     let response = state_sync
         .handle_request(StateSyncRequest::GetStorageAt(
@@ -211,7 +281,7 @@ async fn test_block_not_found() {
         ))
         .await;
     let StateSyncResponse::GetStorageAt(get_storage_at_result) = response else {
-        panic!("Expected StateSyncResponse::GetStorageAt(_), but got {:?}", response);
+        panic!("Expected StateSyncResponse::GetStorageAt(_), but got {response:?}");
     };
 
     assert_eq!(
@@ -223,7 +293,7 @@ async fn test_block_not_found() {
         .handle_request(StateSyncRequest::GetNonceAt(non_existing_block_number, Default::default()))
         .await;
     let StateSyncResponse::GetNonceAt(get_nonce_at_result) = response else {
-        panic!("Expected StateSyncResponse::GetNonceAt(_), but got {:?}", response);
+        panic!("Expected StateSyncResponse::GetNonceAt(_), but got {response:?}");
     };
 
     assert_eq!(get_nonce_at_result, Err(StateSyncError::BlockNotFound(non_existing_block_number)));
@@ -235,7 +305,7 @@ async fn test_block_not_found() {
         ))
         .await;
     let StateSyncResponse::GetClassHashAt(get_class_hash_at_result) = response else {
-        panic!("Expected StateSyncResponse::GetClassHashAt(_), but got {:?}", response);
+        panic!("Expected StateSyncResponse::GetClassHashAt(_), but got {response:?}");
     };
 
     assert_eq!(
@@ -277,7 +347,7 @@ async fn test_contract_not_found() {
         ))
         .await;
     let StateSyncResponse::GetStorageAt(get_storage_at_result) = response else {
-        panic!("Expected StateSyncResponse::GetStorageAt(_), but got {:?}", response);
+        panic!("Expected StateSyncResponse::GetStorageAt(_), but got {response:?}");
     };
 
     assert_eq!(get_storage_at_result, Err(StateSyncError::ContractNotFound(address)));
@@ -289,7 +359,7 @@ async fn test_contract_not_found() {
         ))
         .await;
     let StateSyncResponse::GetNonceAt(get_nonce_at_result) = response else {
-        panic!("Expected StateSyncResponse::GetNonceAt(_), but got {:?}", response);
+        panic!("Expected StateSyncResponse::GetNonceAt(_), but got {response:?}");
     };
 
     assert_eq!(get_nonce_at_result, Err(StateSyncError::ContractNotFound(address)));
@@ -301,7 +371,7 @@ async fn test_contract_not_found() {
         ))
         .await;
     let StateSyncResponse::GetClassHashAt(get_class_hash_at_result) = response else {
-        panic!("Expected StateSyncResponse::GetClassHashAt(_), but got {:?}", response);
+        panic!("Expected StateSyncResponse::GetClassHashAt(_), but got {response:?}");
     };
 
     assert_eq!(get_class_hash_at_result, Err(StateSyncError::ContractNotFound(address)));

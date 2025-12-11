@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use blockifier_test_utils::cairo_versions::{CairoVersion, RunnableCairo1};
 use blockifier_test_utils::contracts::FeatureContract;
 use starknet_api::abi::abi_utils::selector_from_name;
 use starknet_api::block::GasPrice;
+use starknet_api::contract_class::compiled_class_hash::HashVersion;
 use starknet_api::data_availability::DataAvailabilityMode;
 use starknet_api::execution_resources::GasAmount;
 use starknet_api::test_utils::{
@@ -22,9 +25,11 @@ use starknet_api::transaction::fields::{
     Resource,
     ResourceBounds,
     Tip,
+    TransactionSignature,
     ValidResourceBounds,
 };
 use starknet_api::transaction::{TransactionVersion, QUERY_VERSION_BASE};
+use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
 use starknet_api::{felt, nonce, tx_hash};
 use starknet_types_core::felt::Felt;
 use test_case::test_case;
@@ -34,7 +39,7 @@ use crate::context::ChainInfo;
 use crate::execution::common_hints::ExecutionMode;
 use crate::execution::entry_point::CallEntryPoint;
 use crate::test_utils::contracts::FeatureContractData;
-use crate::test_utils::initial_test_state::test_state_ex;
+use crate::test_utils::initial_test_state::test_state_inner;
 use crate::test_utils::{trivial_external_entry_point_with_address, BALANCE};
 use crate::transaction::objects::{
     CommonAccountFields,
@@ -320,8 +325,15 @@ fn test_get_execution_info(
         test_contract_data.class_hash =
             *VersionedConstants::latest_constants().os_constants.data_gas_accounts.first().unwrap();
     }
-    let state =
-        &mut test_state_ex(&ChainInfo::create_for_testing(), BALANCE, &[(test_contract_data, 1)]);
+    // Set the erc20 version to be the same as the test contract version.
+    let erc20_version = test_contract.cairo_version();
+    let state = &mut test_state_inner(
+        &ChainInfo::create_for_testing(),
+        BALANCE,
+        &[(test_contract_data, 1)],
+        &HashVersion::V2,
+        erc20_version,
+    );
     let expected_block_info = match execution_mode {
         ExecutionMode::Validate => [
             // Rounded block number.
@@ -344,7 +356,9 @@ fn test_get_execution_info(
         + if high_tip { 1 } else { 0 });
     let expected_tip = if version == TransactionVersion::THREE { tip } else { Tip(0) };
 
-    let expected_unsupported_fields = match test_contract {
+    let tx_hash = tx_hash!(1991);
+
+    let (expected_unsupported_fields, expected_signature) = match test_contract {
         FeatureContract::LegacyTestContract => {
             // Read and parse file content.
             let raw_contract: serde_json::Value =
@@ -355,20 +369,21 @@ fn test_get_execution_info(
             } else {
                 panic!("'compiler_version' not found or not a valid string in JSON.");
             };
-            vec![]
+            (vec![], vec![])
         }
         #[cfg(feature = "cairo_native")]
-        FeatureContract::SierraExecutionInfoV1Contract(RunnableCairo1::Native) => {
-            vec![]
-        }
+        FeatureContract::SierraExecutionInfoV1Contract(RunnableCairo1::Native) => (vec![], vec![]),
         _ => {
-            vec![
-                expected_tip.into(), // Tip.
-                Felt::ZERO,          // Paymaster data.
-                Felt::ZERO,          // Nonce DA.
-                Felt::ZERO,          // Fee DA.
-                Felt::ZERO,          // Account data.
-            ]
+            (
+                vec![
+                    expected_tip.into(), // Tip.
+                    Felt::ZERO,          // Paymaster data.
+                    Felt::ZERO,          // Nonce DA.
+                    Felt::ZERO,          // Fee DA.
+                    Felt::ZERO,          // Account data.
+                ],
+                vec![tx_hash.0],
+            )
         }
     };
 
@@ -380,10 +395,10 @@ fn test_get_execution_info(
         expected_version += simulate_version_base;
     }
 
-    let tx_hash = tx_hash!(1991);
     let max_fee = Fee(42);
     let nonce = nonce!(3_u16);
     let sender_address = test_contract_address;
+    let signature = TransactionSignature(Arc::new(expected_signature));
 
     let resource_bounds =
         ResourceBounds { max_amount: GasAmount(13), max_price_per_unit: GasPrice(61) };
@@ -430,10 +445,10 @@ fn test_get_execution_info(
             common_fields: CommonAccountFields {
                 transaction_hash: tx_hash,
                 version: TransactionVersion::ONE,
+                signature,
                 nonce,
                 sender_address,
                 only_query,
-                ..Default::default()
             },
             max_fee,
         });
@@ -452,10 +467,10 @@ fn test_get_execution_info(
             common_fields: CommonAccountFields {
                 transaction_hash: tx_hash,
                 version: TransactionVersion::THREE,
+                signature,
                 nonce,
                 sender_address,
                 only_query,
-                ..Default::default()
             },
             resource_bounds: all_resource_bounds,
             tip,
@@ -512,6 +527,6 @@ fn str_to_32_bytes_in_hex(s: &str) -> String {
     let prefix = "0x";
     let padding_zeros = "0".repeat(64 - s.len() * 2); // Each string char is 2 chars in hex.
     let word_in_hex: String =
-        s.as_bytes().iter().fold(String::new(), |s, byte| s + (&format!("{:02x}", byte)));
+        s.as_bytes().iter().fold(String::new(), |s, byte| s + (&format!("{byte:02x}")));
     [prefix, &padding_zeros, &word_in_hex].into_iter().collect()
 }

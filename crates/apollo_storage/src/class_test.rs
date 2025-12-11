@@ -2,7 +2,8 @@ use assert_matches::assert_matches;
 use indexmap::indexmap;
 use pretty_assertions::assert_eq;
 use starknet_api::block::BlockNumber;
-use starknet_api::core::{ClassHash, CompiledClassHash};
+use starknet_api::compiled_class_hash;
+use starknet_api::core::ClassHash;
 use starknet_api::deprecated_contract_class::ContractClass as DeprecatedContractClass;
 use starknet_api::hash::StarkHash;
 use starknet_api::state::{SierraContractClass, StateNumber, ThinStateDiff};
@@ -15,11 +16,9 @@ use crate::StorageError;
 
 #[test]
 fn append_classes_writes_correct_data() {
-    let class_json = read_json_file("class.json");
-    let expected_class: SierraContractClass = serde_json::from_value(class_json).unwrap();
-    let deprecated_class_json = read_json_file("deprecated_class.json");
+    let expected_class: SierraContractClass = read_json_file("class.json");
     let expected_deprecated_class: DeprecatedContractClass =
-        serde_json::from_value(deprecated_class_json).unwrap();
+        read_json_file("deprecated_class.json");
     let class_hash = ClassHash::default();
     let deprecated_class_hash = ClassHash(StarkHash::ONE);
 
@@ -31,7 +30,7 @@ fn append_classes_writes_correct_data() {
         .append_state_diff(
             BlockNumber(0),
             ThinStateDiff {
-                declared_classes: indexmap! { class_hash => CompiledClassHash::default() },
+                class_hash_to_compiled_class_hash: indexmap! { class_hash => compiled_class_hash!(1_u8) },
                 deprecated_declared_classes: vec![deprecated_class_hash],
                 ..Default::default()
             },
@@ -80,9 +79,8 @@ fn append_classes_marker_mismatch() {
 
 #[test]
 fn append_deprecated_class_not_in_state_diff() {
-    let deprecated_class_json = read_json_file("deprecated_class.json");
     let expected_deprecated_class: DeprecatedContractClass =
-        serde_json::from_value(deprecated_class_json).unwrap();
+        read_json_file("deprecated_class.json");
     let deprecated_class_hash = ClassHash::default();
 
     let ((reader, mut writer), _temp_dir) = get_test_storage();

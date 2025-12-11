@@ -1,7 +1,8 @@
 use blockifier::state::state_api::StateReader;
 use indoc::indoc;
 #[cfg(any(test, feature = "testing"))]
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use starknet_types_core::hash::{Blake2Felt252, Poseidon};
 #[cfg(any(test, feature = "testing"))]
 use strum::IntoEnumIterator;
 
@@ -9,15 +10,23 @@ use crate::hint_processor::aggregator_hint_processor::AggregatorHintProcessor;
 use crate::hint_processor::common_hint_processor::CommonHintProcessor;
 use crate::hint_processor::snos_hint_processor::SnosHintProcessor;
 use crate::hints::error::{OsHintError, OsHintExtensionResult, OsHintResult};
-use crate::hints::hint_implementation::aggregator::{
+use crate::hints::hint_implementation::aggregator::implementation::{
     allocate_segments_for_messages,
     disable_da_page_creation,
     get_aggregator_output,
+    get_chain_id_from_input,
+    get_fee_token_address_from_input,
     get_full_output_from_input,
     get_os_output_for_inner_blocks,
+    get_public_keys_from_aggregator_input,
     get_use_kzg_da_from_input,
     set_state_update_pointers_to_none,
     write_da_segment,
+};
+use crate::hints::hint_implementation::blake2s::implementation::{
+    check_packed_values_end_and_size,
+    naive_unpack_felt252_to_u32s,
+    unpack_felts_to_u32s,
 };
 use crate::hints::hint_implementation::block_context::{
     block_number,
@@ -28,13 +37,13 @@ use crate::hints::hint_implementation::block_context::{
     sequencer_address,
     write_use_kzg_da_to_memory,
 };
-use crate::hints::hint_implementation::bls_field::compute_ids_low;
+use crate::hints::hint_implementation::bls_field::implementation::compute_ids_low;
 use crate::hints::hint_implementation::builtins::{
     select_builtin,
     selected_builtins,
     update_builtin_ptrs,
 };
-use crate::hints::hint_implementation::cairo1_revert::{
+use crate::hints::hint_implementation::cairo1_revert::implementation::{
     generate_dummy_os_output_segment,
     prepare_state_entry_for_revert,
     read_storage_key_for_revert,
@@ -43,21 +52,23 @@ use crate::hints::hint_implementation::cairo1_revert::{
 use crate::hints::hint_implementation::compiled_class::implementation::{
     assert_end_of_bytecode_segments,
     assign_bytecode_segments,
-    bytecode_segment_structure,
     delete_memory_data,
+    enter_scope_with_bytecode_segment_structure,
     is_leaf,
     iter_current_segment_info,
     load_class,
-    load_class_inner,
+    load_classes_and_create_bytecode_segment_structures,
     set_ap_to_segment_hash,
-    validate_compiled_class_facts_post_execution,
 };
 use crate::hints::hint_implementation::deprecated_compiled_class::implementation::{
     load_deprecated_class,
     load_deprecated_class_facts,
     load_deprecated_class_inner,
 };
-use crate::hints::hint_implementation::execute_syscalls::is_block_number_in_block_hash_buffer;
+use crate::hints::hint_implementation::execute_syscalls::{
+    is_block_number_in_block_hash_buffer,
+    relocate_sha256_segment,
+};
 use crate::hints::hint_implementation::execute_transactions::implementation::{
     fill_holes_in_rc96_segment,
     log_remaining_txs,
@@ -66,7 +77,6 @@ use crate::hints::hint_implementation::execute_transactions::implementation::{
     segments_add_temp,
     set_ap_to_actual_fee,
     set_component_hashes,
-    set_sha256_segment_in_syscall_handler,
     sha2_finalize,
     skip_tx,
     start_tx,
@@ -129,6 +139,8 @@ use crate::hints::hint_implementation::os::{
     configure_kzg_manager,
     create_block_additional_hints,
     get_n_blocks,
+    get_n_class_hashes_to_migrate,
+    get_public_keys,
     init_state_update_pointer,
     initialize_class_hashes,
     initialize_state_changes,
@@ -144,7 +156,9 @@ use crate::hints::hint_implementation::os_logger::{
     os_logger_exit_syscall,
 };
 use crate::hints::hint_implementation::output::{
+    calculate_keys_using_sha256_hash,
     set_compressed_start,
+    set_encrypted_start,
     set_n_updates_small,
     set_state_updates_start,
     set_tree_structure,
@@ -184,13 +198,15 @@ use crate::hints::hint_implementation::state::{
     set_preimage_for_class_commitments,
     set_preimage_for_current_commitment_info,
     set_preimage_for_state_commitments,
+    should_use_read_optimized_patricia_update,
     update_classes_ptr,
     update_state_ptr,
 };
-use crate::hints::hint_implementation::stateful_compression::{
+use crate::hints::hint_implementation::stateful_compression::implementation::{
     assert_key_big_enough_for_alias,
     contract_address_le_max_for_compression,
     enter_scope_with_aliases,
+    get_class_hash_and_compiled_class_fact,
     guess_aliases_contract_storage_ptr,
     guess_contract_addr_storage_ptr,
     initialize_alias_counter,
@@ -246,7 +262,10 @@ pub(crate) const TEST_HINT_PREFIX: &str = "# TEST HINT";
 
 macro_rules! all_hints_enum {
     ($($inner_enum:ident),+) => {
-        #[cfg_attr(any(test, feature = "testing"),derive(Serialize, strum_macros::EnumIter))]
+        #[cfg_attr(
+            any(test, feature = "testing"),
+            derive(Deserialize, Serialize, Ord, PartialOrd, strum_macros::EnumIter)
+        )]
         #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
         pub enum AllHints {
             $($inner_enum($inner_enum),)+
@@ -488,11 +507,13 @@ define_stateless_hint_enum!(
         indoc! {r#"
     current_segment_info = next(bytecode_segments)
 
-    is_used = is_segment_used_callback(ids.data_ptr, current_segment_info.segment_length)
-    ids.is_segment_used = 1 if is_used else 0
+    should_load = ids.full_contract or is_segment_used_callback(
+        ids.data_ptr, current_segment_info.segment_length
+    )
+    ids.load_segment = 1 if should_load else 0
 
-    is_used_leaf = is_used and isinstance(current_segment_info.inner_structure, BytecodeLeaf)
-    ids.is_used_leaf = 1 if is_used_leaf else 0
+    is_leaf_and_loaded = should_load and isinstance(current_segment_info.inner_structure, BytecodeLeaf)
+    ids.is_leaf_and_loaded = 1 if is_leaf_and_loaded else 0
 
     ids.segment_length = current_segment_info.segment_length
     vm_enter_scope(new_scope_locals={
@@ -502,10 +523,16 @@ define_stateless_hint_enum!(
         }
     ),
     (
-        SetApToSegmentHash,
-        set_ap_to_segment_hash,
+        SetApToSegmentHashPoseidon,
+        set_ap_to_segment_hash::<Poseidon>,
+        indoc! {r#"memory[ap] = to_felt_or_relocatable(bytecode_segment_structure.poseidon_hash())"#
+        }
+    ),
+    (
+        SetApToSegmentHashBlake,
+        set_ap_to_segment_hash::<Blake2Felt252>,
         indoc! {r#"
-            memory[ap] = to_felt_or_relocatable(bytecode_segment_structure.hash())"#
+        memory[ap] = to_felt_or_relocatable(bytecode_segment_structure.hash_blake())"#
         }
     ),
     (
@@ -573,7 +600,7 @@ vm_enter_scope(dict(
     (
         SegmentsAddTemp,
         segments_add_temp,
-        indoc! {r#"memory[fp + 7] = to_felt_or_relocatable(segments.add_temp_segment())"#
+        indoc! {r#"memory[fp + 5] = to_felt_or_relocatable(segments.add_temp_segment())"#
         }
     ),
     (
@@ -795,11 +822,20 @@ segments.write_arg(ids.sha256_ptr_end, padding)"#}
     (
         SetCompressedStart,
         set_compressed_start,
-        indoc! {r#"if use_kzg_da:
+        indoc! {r#"if use_kzg_da or ids.n_keys > 0:
     ids.compressed_start = segments.add()
 else:
     # Assign a temporary segment, to be relocated into the output segment.
     ids.compressed_start = segments.add_temp_segment()"#}
+    ),
+    (
+        SetEncryptedStart,
+        set_encrypted_start,
+        indoc! {r#"if use_kzg_da:
+    ids.encrypted_start = segments.add()
+else:
+    # Assign a temporary segment, to be relocated into the output segment.
+    ids.encrypted_start = segments.add_temp_segment()"#}
     ),
     (
         SetNUpdatesSmall,
@@ -870,11 +906,6 @@ memory[ap] = 1 if case != 'both' else 0"#
         }
     ),
     (
-        LogRemainingBlocks,
-        log_remaining_blocks,
-        indoc! {r#"print(f"execute_blocks: {ids.n_blocks} blocks remaining.")"#}
-    ),
-    (
         AllocateSegmentsForMessages,
         allocate_segments_for_messages,
         r#"# Allocate segments for the messages.
@@ -882,6 +913,33 @@ ids.initial_carried_outputs = segments.gen_arg(
     [segments.add_temp_segment(), segments.add_temp_segment()]
 )"#
     ),
+    (
+        CheckPackedValuesEndAndSize,
+        check_packed_values_end_and_size,
+        "memory[ap] = to_felt_or_relocatable((ids.end != ids.packed_values) and \
+         (memory[ids.packed_values] < 2**63))"
+    ),
+    (NaiveUnpackFelt252ToU32s, naive_unpack_felt252_to_u32s, "NaiveUnpackFelt252ToU32s"),
+    (
+        UnpackFeltsToU32s,
+        unpack_felts_to_u32s,
+        indoc! {r#"
+    offset = 0
+    for i in range(ids.packed_values_len):
+        val = (memory[ids.packed_values + i] % PRIME)
+        val_len = 2 if val < 2**63 else 8
+        if val_len == 8:
+            val += 2**255
+        for i in range(val_len - 1, -1, -1):
+            val, memory[ids.unpacked_u32s + offset + i] = divmod(val, 2**32)
+        assert val == 0
+        offset += val_len"#}
+    ),
+    (
+        GenerateKeysUsingSha256Hash,
+        calculate_keys_using_sha256_hash,
+        "generate_keys_from_hash(ids.compressed_start, ids.compressed_end, ids.n_keys)"
+    )
 );
 
 define_common_hint_enum!(
@@ -1014,13 +1072,19 @@ define_hint_enum!(
         }
     ),
     (
-        BytecodeSegmentStructure,
-        bytecode_segment_structure,
+        RelocateSha256Segment,
+        relocate_sha256_segment,
         indoc! {r#"
-    vm_enter_scope({
-        "bytecode_segment_structure": bytecode_segment_structures[ids.compiled_class_fact.hash],
-        "is_segment_used_callback": is_segment_used_callback
-    })"#}
+    state_ptr = ids.response.state_ptr.address_
+    actual_out_state = ids.actual_out_state.address_
+    for i in range(8):
+        memory[actual_out_state + i] = memory[state_ptr + i]
+    memory.add_relocation_rule(src_ptr=state_ptr, dest_ptr=actual_out_state)"#}
+    ),
+    (
+        EnterScopeWithBytecodeSegmentStructure,
+        enter_scope_with_bytecode_segment_structure,
+        indoc! {r#"EnterScopeWithBytecodeSegmentStructure"#}
     ),
     (
         BlockNumber,
@@ -1050,7 +1114,7 @@ define_hint_enum!(
     (
         WriteUseKzgDaToMemory,
         write_use_kzg_da_to_memory,
-        indoc! {r#"memory[fp + 19] = to_felt_or_relocatable(os_hints_config.use_kzg_da and (
+        indoc! {r#"memory[fp + 17] = to_felt_or_relocatable(os_hints_config.use_kzg_da and (
     not os_hints_config.full_output
 ))"#}
     ),
@@ -1085,30 +1149,14 @@ define_hint_enum!(
         "storage.write(key=ids.storage_key, value=ids.value)"
     ),
     (
-        ValidateCompiledClassFactsPostExecution,
-        validate_compiled_class_facts_post_execution,
-        indoc! {r#"
-    from starkware.starknet.core.os.contract_class.compiled_class_hash import (
-        BytecodeAccessOracle,
-    )
-
-    # Build the bytecode segment structures.
-    bytecode_segment_structures = {
-        compiled_hash: create_bytecode_segment_structure(
-            bytecode=compiled_class.bytecode,
-            bytecode_segment_lengths=compiled_class.bytecode_segment_lengths,
-        ) for compiled_hash, compiled_class in sorted(os_input.compiled_classes.items())
-    }
-    bytecode_segment_access_oracle = BytecodeAccessOracle(is_pc_accessed_callback=is_accessed)
-    vm_enter_scope({
-        "bytecode_segment_structures": bytecode_segment_structures,
-        "is_segment_used_callback": bytecode_segment_access_oracle.is_segment_used
-    })"#}
-    ),
-    (
         ReadAliasFromKey,
         read_alias_from_key,
         "memory[fp + 0] = to_felt_or_relocatable(aliases.read(key=ids.key))"
+    ),
+    (
+        GetClassHashAndCompiledClassFact,
+        get_class_hash_and_compiled_class_fact,
+        "GetClassHashAndCompiledClassFact"
     ),
     (
         WriteNextAliasFromKey,
@@ -1218,11 +1266,6 @@ else:
         skip_tx,
         indoc! {r#"execution_helper.skip_tx()"#
         }
-    ),
-    (
-        SetSha256SegmentInSyscallHandler,
-        set_sha256_segment_in_syscall_handler,
-        indoc! {r#"syscall_handler.sha256_segment = ids.sha256_ptr"#}
     ),
     (
         SetComponentHashes,
@@ -1564,12 +1607,17 @@ ids.contract_class_component_hashes = segments.gen_arg(class_component_hashes)"#
     (
         GetBlocksNumber,
         get_n_blocks,
-        r#"memory[fp + 0] = to_felt_or_relocatable(len(os_input.block_inputs))"#
+        r#"memory[fp + 3] = to_felt_or_relocatable(len(os_input.block_inputs))"#
+    ),
+    (
+        GetNClassHashesToMigrate,
+        get_n_class_hashes_to_migrate,
+        r#"ids.n_classes_to_migrate = len(block_input.class_hashes_to_migrate)"#
     ),
     (
         WriteFullOutputToMemory,
         write_full_output_to_memory,
-        indoc! {r#"memory[fp + 20] = to_felt_or_relocatable(os_hints_config.full_output)"#}
+        indoc! {r#"memory[fp + 18] = to_felt_or_relocatable(os_hints_config.full_output)"#}
     ),
     (
         ConfigureKzgManager,
@@ -1647,7 +1695,7 @@ ids.contract_class_component_hashes = segments.gen_arg(class_component_hashes)"#
         indoc! {r#"
     if execution_helper.debug_mode:
         expected_initial_gas = execution_helper.call_info.call.initial_gas
-        call_initial_gas = ids.remaining_gas
+        call_initial_gas = ids.inner_remaining_gas
         assert expected_initial_gas == call_initial_gas, (
             f"Expected remaining_gas {expected_initial_gas}. Got: {call_initial_gas}.\n"
             f"{execution_helper.call_info=}"
@@ -1701,6 +1749,11 @@ preimage = {
 }
 assert commitment_info.tree_height == ids.MERKLE_HEIGHT"#
         }
+    ),
+    (
+        ShouldUseReadOptimizedPatriciaUpdate,
+        should_use_read_optimized_patricia_update,
+        "ShouldUseReadOptimizedPatriciaUpdate"
     ),
     (
         LoadEdge,
@@ -1798,7 +1851,17 @@ block_input = next(block_input_iterator)
 ) = get_execution_helper_and_syscall_handlers(
     block_input=block_input, global_hints=global_hints, os_hints_config=os_hints_config
 )"#}
-    )
+    ),
+    (
+        LogRemainingBlocks,
+        log_remaining_blocks,
+        indoc! {r#"print(f"execute_blocks: {ids.n_blocks} blocks remaining.")"#}
+    ),
+    (
+        GetPublicKeys,
+        get_public_keys,
+        "fill_public_keys_array(os_hints['public_keys'], public_keys, n_public_keys)"
+    ),
 );
 
 define_hint_enum!(
@@ -1865,6 +1928,26 @@ if da_path is not None:
         get_use_kzg_da_from_input,
         r#"memory[ap] = to_felt_or_relocatable(program_input["use_kzg_da"])"#
     ),
+    (
+        GetChainIdFromInput,
+        get_chain_id_from_input,
+        r#"memory[ap] = to_felt_or_relocatable(program_input["chain_id"])"#
+    ),
+    (
+        GetFeeTokenAddressFromInput,
+        get_fee_token_address_from_input,
+        r#"memory[ap] = to_felt_or_relocatable(program_input["fee_token_address"])"#
+    ),
+    (
+        GetPublicKeysFromAggregatorInput,
+        get_public_keys_from_aggregator_input,
+        indoc! {r#"
+        public_keys = program_input["public_keys"] if program_input["public_keys"] is not None else []
+        ids.public_keys = segments.gen_arg(public_keys)
+        ids.n_public_keys = len(public_keys)"#
+
+        }
+    ),
 );
 
 define_hint_extension_enum!(
@@ -1885,44 +1968,8 @@ define_hint_extension_enum!(
         }
     ),
     (
-        LoadClassInner,
-        load_class_inner,
-        indoc! {r#"
-    from starkware.starknet.core.os.contract_class.compiled_class_hash import (
-        create_bytecode_segment_structure,
-    )
-    from starkware.starknet.core.os.contract_class.compiled_class_hash_cairo_hints import (
-        get_compiled_class_struct,
-    )
-
-    ids.n_compiled_class_facts = len(os_input.compiled_classes)
-    ids.compiled_class_facts = segments.add()
-    for i, (compiled_class_hash, compiled_class) in enumerate(
-        sorted(os_input.compiled_classes.items())
-    ):
-        # Load the compiled class.
-        cairo_contract = get_compiled_class_struct(
-            identifiers=ids._context.identifiers,
-            compiled_class=compiled_class,
-            # Load the entire bytecode - the unaccessed segments will be overriden and skipped
-            # after the execution, in `validate_compiled_class_facts_post_execution`.
-            bytecode=compiled_class.bytecode,
-        )
-        segments.load_data(
-            ptr=ids.compiled_class_facts[i].address_,
-            data=(compiled_class_hash, segments.gen_arg(cairo_contract))
-        )
-
-        bytecode_ptr = ids.compiled_class_facts[i].compiled_class.bytecode_ptr
-        # Compiled classes are expected to end with a `ret` opcode followed by a pointer to
-        # the builtin costs.
-        segments.load_data(
-            ptr=bytecode_ptr + cairo_contract.bytecode_length,
-            data=[0x208b7fff7fff7ffe, ids.builtin_costs]
-        )
-
-        # Load hints and debug info.
-        vm_load_program(
-            compiled_class.get_runnable_program(entrypoint_builtins=[]), bytecode_ptr)"#}
+        LoadClassesAndBuildBytecodeSegmentStructures,
+        load_classes_and_create_bytecode_segment_structures,
+        indoc! {r#"LoadClassesAndBuildBytecodeSegmentStructures"#}
     ),
 );

@@ -2,7 +2,7 @@
 
 use std::str::FromStr;
 
-use apollo_state_reader::papyrus_state::PapyrusReader;
+use apollo_state_reader::apollo_state::ApolloReader;
 use blockifier::blockifier::config::{ContractClassManagerConfig, TransactionExecutorConfig};
 use blockifier::blockifier::transaction_executor::{
     BlockExecutionSummary,
@@ -14,6 +14,7 @@ use blockifier::bouncer::BouncerConfig;
 use blockifier::context::{BlockContext, ChainInfo, FeeTokenAddresses};
 use blockifier::state::contract_class_manager::ContractClassManager;
 use blockifier::state::state_reader_and_contract_manager::StateReaderAndContractManager;
+use blockifier::transaction::account_transaction::AccountTransaction;
 use blockifier::transaction::objects::TransactionExecutionInfo;
 use blockifier::transaction::transaction_execution::Transaction;
 use pyo3::prelude::*;
@@ -21,14 +22,18 @@ use pyo3::types::{PyBytes, PyList};
 use pyo3::{FromPyObject, PyAny, Python};
 use shared_execution_objects::central_objects::CentralTransactionExecutionInfo;
 use starknet_api::block::BlockNumber;
-use starknet_api::contract_class::SierraVersion;
+use starknet_api::contract_class::compiled_class_hash::{HashVersion, HashableCompiledClass};
+use starknet_api::contract_class::{ContractClass, SierraVersion};
 use starknet_api::core::{ChainId, ContractAddress};
+use starknet_api::executable_transaction::AccountTransaction as ExecTx;
+use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
 use starknet_types_core::felt::Felt;
 
 use crate::errors::{NativeBlockifierError, NativeBlockifierResult};
 use crate::py_objects::{
     PyBouncerConfig,
     PyCasmHashComputationData,
+    PyCompiledClassHashesForMigration,
     PyConcurrencyConfig,
     PyContractClassManagerConfig,
     PyVersionedConstantsOverrides,
@@ -45,6 +50,7 @@ use crate::storage::{
 };
 
 pub(crate) type RawTransactionExecutionResult = Vec<u8>;
+pub type ApolloStateReaderAndContractManager = StateReaderAndContractManager<ApolloReader>;
 const RESULT_SERIALIZE_ERR: &str = "Failed serializing execution info.";
 
 /// Return type for the finalize method containing state diffs, bouncer weights, and CASM hash
@@ -55,6 +61,7 @@ type FinalizeResult = (
     Py<PyBytes>,
     PyCasmHashComputationData,
     PyCasmHashComputationData,
+    PyCompiledClassHashesForMigration,
 );
 
 #[cfg(test)]
@@ -74,7 +81,7 @@ pub struct PyBlockExecutor {
     pub tx_executor_config: TransactionExecutorConfig,
     pub chain_info: ChainInfo,
     pub versioned_constants: VersionedConstants,
-    pub tx_executor: Option<TransactionExecutor<StateReaderAndContractManager<PapyrusReader>>>,
+    pub tx_executor: Option<TransactionExecutor<ApolloStateReaderAndContractManager>>,
     /// `Send` trait is required for `pyclass` compatibility as Python objects must be threadsafe.
     pub storage: Box<dyn Storage + Send>,
     pub contract_class_manager: ContractClassManager,
@@ -96,8 +103,9 @@ impl PyBlockExecutor {
         log::debug!("Initializing Block Executor...");
         let storage =
             PapyrusStorage::new(target_storage_config).expect("Failed to initialize storage.");
-        let versioned_constants =
-            VersionedConstants::get_versioned_constants(py_versioned_constants_overrides.into());
+        let versioned_constants = VersionedConstants::get_versioned_constants(Some(
+            py_versioned_constants_overrides.into(),
+        ));
         log::debug!("Initialized Block Executor.");
 
         Self {
@@ -120,7 +128,6 @@ impl PyBlockExecutor {
 
     /// Initializes the transaction executor for the given block.
     #[pyo3(signature = (next_block_info, old_block_number_and_hash))]
-    #[allow(clippy::result_large_err)]
     fn setup_block_execution(
         &mut self,
         next_block_info: PyBlockInfo,
@@ -152,7 +159,6 @@ impl PyBlockExecutor {
     }
 
     #[pyo3(signature = (tx, optional_py_class_info))]
-    #[allow(clippy::result_large_err)]
     pub fn execute(
         &mut self,
         tx: &PyAny,
@@ -181,6 +187,9 @@ impl PyBlockExecutor {
                 py_tx(tx, optional_py_class_info).expect(PY_TX_PARSING_ERR)
             })
             .collect();
+
+        // store compiled_class_hash_v2 for every declared class.
+        self.store_declared_compiled_class_hashes_v2(&txs);
 
         // Run.
         let results =
@@ -219,7 +228,6 @@ impl PyBlockExecutor {
     }
 
     /// Returns the state diff, the stateful-compressed state diff and the block weights.
-    #[allow(clippy::result_large_err)]
     pub fn finalize(&mut self) -> NativeBlockifierResult<FinalizeResult> {
         log::debug!("Finalizing execution...");
         let BlockExecutionSummary {
@@ -228,12 +236,15 @@ impl PyBlockExecutor {
             bouncer_weights,
             casm_hash_computation_data_sierra_gas,
             casm_hash_computation_data_proving_gas,
+            compiled_class_hashes_for_migration,
+            ..
         } = self.tx_executor().finalize()?;
         let py_state_diff = PyStateDiff::from(state_diff);
         let py_compressed_state_diff = compressed_state_diff.map(PyStateDiff::from);
         let py_casm_hash_computation_data_sierra_gas = casm_hash_computation_data_sierra_gas.into();
         let py_casm_hash_computation_data_proving_gas =
             casm_hash_computation_data_proving_gas.into();
+        let compiled_class_hashes_for_migration = compiled_class_hashes_for_migration.into();
 
         let serialized_block_weights =
             serde_json::to_vec(&bouncer_weights).expect("Failed serializing bouncer weights.");
@@ -248,6 +259,7 @@ impl PyBlockExecutor {
             raw_block_weights,
             py_casm_hash_computation_data_sierra_gas,
             py_casm_hash_computation_data_proving_gas,
+            compiled_class_hashes_for_migration,
         ))
     }
 
@@ -264,7 +276,6 @@ impl PyBlockExecutor {
         declared_class_hash_to_class,
         deprecated_declared_class_hash_to_class
     ))]
-    #[allow(clippy::result_large_err)]
     pub fn append_block(
         &mut self,
         block_id: u64,
@@ -287,14 +298,12 @@ impl PyBlockExecutor {
     /// Returns the next block number, for which block header was not yet appended.
     /// Block header stream is usually ahead of the state diff stream, so this is the indicative
     /// marker.
-    #[allow(clippy::result_large_err)]
     pub fn get_header_marker(&self) -> NativeBlockifierResult<u64> {
         self.storage.get_header_marker()
     }
 
     /// Returns the unique identifier of the given block number in bytes.
     #[pyo3(signature = (block_number))]
-    #[allow(clippy::result_large_err)]
     fn get_block_id_at_target(&self, block_number: u64) -> NativeBlockifierResult<Option<PyFelt>> {
         let optional_block_id_bytes = self.storage.get_block_id(block_number)?;
         let Some(block_id_bytes) = optional_block_id_bytes else { return Ok(None) };
@@ -314,7 +323,6 @@ impl PyBlockExecutor {
     /// If header exists without a state diff (usually the case), only the header is reverted.
     /// (this is true for every partial existence of information at tables).
     #[pyo3(signature = (block_number))]
-    #[allow(clippy::result_large_err)]
     pub fn revert_block(&mut self, block_number: u64) -> NativeBlockifierResult<()> {
         // Clear global class cache, to properly revert classes declared in the reverted block.
         self.contract_class_manager.clear();
@@ -330,8 +338,19 @@ impl PyBlockExecutor {
         self.storage.close();
     }
 
-    #[pyo3(signature = (concurrency_config, contract_class_manager_config, os_config, path, max_state_diff_size, stack_size, min_sierra_version))]
+    #[pyo3(signature = (enable_casm_hash_migration))]
+    pub fn set_enable_casm_hash_migration_in_vc(&mut self, enable_casm_hash_migration: bool) {
+        self.versioned_constants.enable_casm_hash_migration = enable_casm_hash_migration;
+    }
+
+    #[pyo3(signature = (block_casm_hash_v1_declares))]
+    pub fn set_block_casm_hash_v1_declares_in_vc(&mut self, block_casm_hash_v1_declares: bool) {
+        self.versioned_constants.block_casm_hash_v1_declares = block_casm_hash_v1_declares;
+    }
+
+    #[pyo3(signature = (concurrency_config, contract_class_manager_config, os_config, path, max_state_diff_size, stack_size, min_sierra_version, enable_casm_hash_migration))]
     #[staticmethod]
+    #[allow(clippy::too_many_arguments)]
     fn create_for_testing(
         concurrency_config: PyConcurrencyConfig,
         contract_class_manager_config: PyContractClassManagerConfig,
@@ -340,6 +359,7 @@ impl PyBlockExecutor {
         max_state_diff_size: usize,
         stack_size: usize,
         min_sierra_version: Option<String>,
+        enable_casm_hash_migration: Option<bool>,
     ) -> Self {
         use blockifier::bouncer::BouncerWeights;
         // TODO(Meshi, 01/01/2025): Remove this once we fix all python tests that re-declare cairo0
@@ -353,13 +373,16 @@ impl PyBlockExecutor {
                     .expect("failed to parse sierra version.");
         }
 
+        if let Some(enable_casm_hash_migration) = enable_casm_hash_migration {
+            versioned_constants.enable_casm_hash_migration = enable_casm_hash_migration;
+        }
+
         Self {
             bouncer_config: BouncerConfig {
                 block_max_capacity: BouncerWeights {
                     state_diff_size: max_state_diff_size,
                     ..BouncerWeights::max()
                 },
-                // TODO(Meshi): Check what should be the values here.
                 ..BouncerConfig::max()
             },
             tx_executor_config: TransactionExecutorConfig {
@@ -378,24 +401,19 @@ impl PyBlockExecutor {
 }
 
 impl PyBlockExecutor {
-    pub fn tx_executor(
-        &mut self,
-    ) -> &mut TransactionExecutor<StateReaderAndContractManager<PapyrusReader>> {
+    pub fn tx_executor(&mut self) -> &mut TransactionExecutor<ApolloStateReaderAndContractManager> {
         self.tx_executor.as_mut().expect("Transaction executor should be initialized")
     }
 
     fn get_aligned_reader(
         &self,
         next_block_number: BlockNumber,
-    ) -> StateReaderAndContractManager<PapyrusReader> {
+    ) -> ApolloStateReaderAndContractManager {
         // Full-node storage must be aligned to the Python storage before initializing a reader.
         self.storage.validate_aligned(next_block_number.0);
-        let papyrus_reader = PapyrusReader::new(self.storage.reader().clone(), next_block_number);
+        let apollo_reader = ApolloReader::new(self.storage.reader().clone(), next_block_number);
 
-        StateReaderAndContractManager {
-            state_reader: papyrus_reader,
-            contract_class_manager: self.contract_class_manager.clone(),
-        }
+        StateReaderAndContractManager::new(apollo_reader, self.contract_class_manager.clone(), None)
     }
 
     pub fn create_for_testing_with_storage(storage: impl Storage + Send + 'static) -> Self {
@@ -410,6 +428,28 @@ impl PyBlockExecutor {
                 ContractClassManagerConfig::default(),
             ),
         }
+    }
+
+    fn store_declared_compiled_class_hashes_v2(&mut self, txs: &[Transaction]) {
+        txs.iter()
+            .filter_map(|tx| {
+                let Transaction::Account(AccountTransaction {
+                    tx: ExecTx::Declare(declare_tx),
+                    ..
+                }) = tx
+                else {
+                    return None;
+                };
+                let ContractClass::V1((casm, _)) = &declare_tx.class_info.contract_class else {
+                    return None;
+                };
+                Some((declare_tx.class_hash(), casm.hash(&HashVersion::V2)))
+            })
+            .for_each(|(class_hash, compiled_v2)| {
+                self.storage.set_executable_class_hash_v2(&class_hash, compiled_v2).unwrap_or_else(
+                    |e| panic!("set_executable_class_hash_v2 failed for {class_hash:?}: {e}"),
+                );
+            });
     }
 
     #[cfg(test)]
@@ -428,6 +468,7 @@ impl PyBlockExecutor {
             path,
             max_state_diff_size,
             stack_size,
+            None,
             None,
         )
     }
@@ -461,6 +502,7 @@ impl TryFrom<PyOsConfig> for ChainInfo {
                     py_os_config.fee_token_address.0,
                 )?,
             },
+            is_l3: false,
         })
     }
 }
@@ -477,5 +519,5 @@ impl Default for PyOsConfig {
 
 fn serialize_failure_reason(error: TransactionExecutorError) -> RawTransactionExecutionResult {
     // TODO(Yoni, 1/7/2024): re-consider this serialization.
-    serde_json::to_vec(&format!("{}", error)).expect(RESULT_SERIALIZE_ERR)
+    serde_json::to_vec(&format!("{error}")).expect(RESULT_SERIALIZE_ERR)
 }

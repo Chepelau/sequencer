@@ -5,13 +5,14 @@ import json
 import os
 from typing import Optional
 
+from common import const
 from common.grafana10_objects import (
     alert_expression_model_object,
     alert_query_model_object,
     alert_query_object,
     alert_rule_object,
 )
-from common.helpers import get_logger
+from common.helpers import EnvironmentName, alert_env_filename_suffix, get_logger
 from grafana_client import GrafanaApi
 from grafana_client.client import (
     GrafanaBadInputError,
@@ -19,7 +20,6 @@ from grafana_client.client import (
     GrafanaException,
     GrafanaServerError,
 )
-from common import const
 from tenacity import before_sleep_log, retry, stop_after_attempt, wait_fixed
 
 
@@ -174,11 +174,37 @@ def remove_expr_placeholder(expr: str) -> str:
     return expr.replace(const.ALERT_RULE_EXPRESSION_PLACEHOLDER, "")
 
 
+# TODO(Tsabary): remove the vanilla path option once we transition to per-env file.
+def resolve_dev_alerts_file_path(path: str, suffix: str) -> str:
+    """
+    Resolve a JSON path:
+    - If the original file exists, return it.
+    - Otherwise, check for `<name>_<suffix>.json`.
+    - Raise an error if neither exists.
+    """
+    if os.path.isfile(path):
+        return path
+
+    # Insert suffix before `.json`
+    base, ext = os.path.splitext(path)
+    if ext.lower() != ".json":
+        raise ValueError(f"Expected a .json file, got: {path}")
+
+    alternative_path = f"{base}_{suffix}{ext}"
+    if os.path.isfile(alternative_path):
+        return alternative_path
+
+    raise FileNotFoundError(f"Neither '{path}' nor '{alternative_path}' exists.")
+
+
 def alert_builder(args: argparse.Namespace):
     global logger
     logger = get_logger(name="alert_builder", debug=args.debug)
 
-    with open(args.dev_alerts_file, "r") as f:
+    suffix = alert_env_filename_suffix(env=EnvironmentName(args.env))
+    alert_file_path = resolve_dev_alerts_file_path(path=args.dev_alerts_file, suffix=suffix)
+
+    with open(alert_file_path, "r") as f:
         dev_alerts = json.load(f)
 
     if not args.dry_run:
@@ -207,7 +233,11 @@ def alert_builder(args: argparse.Namespace):
                 expr=expr,
                 conditions=dev_alert["conditions"],
                 datasource_uid=args.datasource_uid,
-                labels={"og_priority": dev_alert["severity"], "environment": args.env},
+                labels={
+                    "og_priority": dev_alert["severity"],
+                    "environment": args.env,
+                    "observer_applicable": dev_alert["observer_applicable"],
+                },
             )
         )
 

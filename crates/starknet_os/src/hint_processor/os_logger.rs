@@ -82,6 +82,7 @@ pub trait ResourceFinalizer {
     }
 }
 
+#[cfg_attr(any(test, feature = "testing"), derive(serde::Serialize, Debug, Clone))]
 pub struct SyscallTrace {
     selector: SyscallSelector,
     is_deprecated: bool,
@@ -142,6 +143,7 @@ impl TryFrom<&SyscallTrace> for String {
     }
 }
 
+#[cfg_attr(any(test, feature = "testing"), derive(serde::Serialize, Debug, Clone))]
 pub struct OsTransactionTrace {
     tx_type: TransactionType,
     tx_hash: TransactionHash,
@@ -400,7 +402,7 @@ impl OsLogger {
 
         if selector.is_calling_syscall() {
             let deprecated_str = if is_deprecated { "deprecated " } else { "" };
-            self.log(&format!("Entering {deprecated_str}{:?}.", selector), true);
+            self.log(&format!("Entering {deprecated_str}{selector:?}."), true);
         }
 
         Ok(())
@@ -477,7 +479,9 @@ impl OsLogger {
             os_program,
         )?);
         self.current_tx = Some(OsTransactionTrace::new(tx_type, tx_hash));
-        self.log(&format!("Entering {tx_type:?}: {tx_hash}."), true);
+        log::info!("Entering transaction: {tx_hash} (type: {tx_type:?})");
+        // Increment tab_count to match the decrement in exit_tx's log call.
+        self.tab_count += 1;
         Ok(())
     }
 
@@ -507,5 +511,10 @@ impl OsLogger {
         self.log(&format!("Exiting {}.", String::try_from(&current_tx)?), false);
         self.txs.push(current_tx);
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn get_txs(&self) -> &Vec<OsTransactionTrace> {
+        &self.txs
     }
 }

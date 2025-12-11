@@ -24,7 +24,6 @@
 //! 1. The outbound messages are not sent as responses to the inbound messages.
 //! 2. It generates and runs its own events (e.g. timeouts).
 
-pub mod config;
 #[allow(missing_docs)]
 pub mod types;
 pub use manager::{run_consensus, RunConsensusArguments};
@@ -32,6 +31,7 @@ pub use manager::{run_consensus, RunConsensusArguments};
 pub mod metrics;
 #[allow(missing_docs)]
 pub mod simulation_network_receiver;
+pub mod storage;
 pub mod stream_handler;
 
 mod manager;
@@ -42,5 +42,6 @@ mod state_machine;
 #[allow(missing_docs)]
 pub mod votes_threshold;
 
-#[cfg(test)]
-pub(crate) mod test_utils;
+#[cfg(any(test, feature = "testing"))]
+#[allow(missing_docs)]
+pub mod test_utils;

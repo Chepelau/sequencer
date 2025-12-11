@@ -5,6 +5,7 @@ use apollo_infra_utils::compile_time_cargo_manifest_dir;
 use blockifier::blockifier_versioned_constants::{OsConstants, VersionedConstants};
 use blockifier::execution::syscalls::vm_syscall_utils::SyscallSelector;
 use starknet_api::core::{ClassHash, ContractAddress, EntryPointSelector};
+use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
 use starknet_types_core::felt::Felt;
 
 const CONSTANTS_CONTENTS: &str = include_str!("cairo/starkware/starknet/core/os/constants.cairo");
@@ -46,9 +47,9 @@ fn stringify_class_hash_list(name: &str, class_hashes: &[ClassHash]) -> String {
         .map(|(i, class_hash)| {
             // If the line ends up longer than 100 chars, wrap the value in parenthesis, so the
             // formatter can split the lines.
-            let line = format!("const {name}_{i} = {:#064x};", class_hash.0);
+            let line = format!("const {name}_{i} = {:#066x};", class_hash.0);
             if line.len() > 100 {
-                format!("const {name}_{i} = ({:#064x});", class_hash.0)
+                format!("const {name}_{i} = ({:#066x});", class_hash.0)
             } else {
                 line
             }

@@ -1,22 +1,29 @@
+pub mod class_manager_types;
 pub mod transaction_converter;
 
 use std::error::Error;
 use std::sync::Arc;
 
-use apollo_compile_to_casm_types::SierraCompilerError;
+use apollo_compile_to_casm_types::{RawClass, RawExecutableClass, SierraCompilerError};
 use apollo_infra::component_client::{ClientError, LocalComponentClient, RemoteComponentClient};
-use apollo_infra::component_definitions::{ComponentClient, ComponentRequestAndResponseSender};
-use apollo_infra::impl_debug_for_infra_requests_and_responses;
+use apollo_infra::component_definitions::{
+    ComponentClient,
+    PrioritizedRequest,
+    RequestPriority,
+    RequestWrapper,
+};
+use apollo_infra::{impl_debug_for_infra_requests_and_responses, impl_labeled_request};
 use apollo_proc_macros::handle_all_response_variants;
 use async_trait::async_trait;
-#[cfg(feature = "testing")]
+#[cfg(any(feature = "testing", test))]
 use mockall::automock;
 use serde::{Deserialize, Serialize};
 use starknet_api::contract_class::ContractClass;
 use starknet_api::core::{ClassHash, CompiledClassHash};
 use starknet_api::deprecated_contract_class::ContractClass as DeprecatedClass;
 use starknet_api::state::SierraContractClass;
-use strum_macros::AsRefStr;
+use strum::EnumVariantNames;
+use strum_macros::{AsRefStr, EnumDiscriminants, EnumIter, IntoStaticStr};
 use thiserror::Error;
 
 pub type ClassManagerResult<T> = Result<T, ClassManagerError>;
@@ -27,8 +34,7 @@ pub type RemoteClassManagerClient =
     RemoteComponentClient<ClassManagerRequest, ClassManagerResponse>;
 
 pub type SharedClassManagerClient = Arc<dyn ClassManagerClient>;
-pub type ClassManagerRequestAndResponseSender =
-    ComponentRequestAndResponseSender<ClassManagerRequest, ClassManagerResponse>;
+pub type ClassManagerRequestWrapper = RequestWrapper<ClassManagerRequest, ClassManagerResponse>;
 
 // TODO(Elin): export.
 pub type ClassId = ClassHash;
@@ -39,13 +45,13 @@ pub type ExecutableClassHash = CompiledClassHash;
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClassHashes {
     pub class_hash: ClassHash,
-    pub executable_class_hash: ExecutableClassHash,
+    pub executable_class_hash_v2: ExecutableClassHash,
 }
 
 /// Serves as the class manager's shared interface.
 /// Requires `Send + Sync` to allow transferring and sharing resources (inputs, futures) across
 /// threads.
-#[cfg_attr(feature = "testing", automock)]
+#[cfg_attr(any(test, feature = "testing"), automock)]
 #[async_trait]
 pub trait ClassManagerClient: Send + Sync {
     async fn add_class(&self, class: Class) -> ClassManagerClientResult<ClassHashes>;
@@ -57,6 +63,11 @@ pub trait ClassManagerClient: Send + Sync {
     ) -> ClassManagerClientResult<Option<ExecutableClass>>;
 
     async fn get_sierra(&self, class_id: ClassId) -> ClassManagerClientResult<Option<Class>>;
+
+    async fn get_executable_class_hash_v2(
+        &self,
+        class_id: ClassId,
+    ) -> ClassManagerClientResult<Option<ExecutableClassHash>>;
 
     async fn add_deprecated_class(
         &self,
@@ -70,16 +81,15 @@ pub trait ClassManagerClient: Send + Sync {
         &self,
         class_id: ClassId,
         class: Class,
-        executable_class_id: ExecutableClassHash,
+        executable_class_hash_v2: ExecutableClassHash,
         executable_class: ExecutableClass,
     ) -> ClassManagerClientResult<()>;
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CachedClassStorageError<E: Error> {
-    // TODO(Elin): remove from, it's too permissive.
     #[error(transparent)]
-    Storage(#[from] E),
+    Storage(E),
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq, Serialize, Deserialize)]
@@ -104,6 +114,8 @@ pub enum ClassManagerError {
         contract_class_object_size: usize,
         max_contract_class_object_size: usize,
     },
+    #[error("Unsupported contract class version: {0}.")]
+    UnsupportedContractClassVersion(String),
 }
 
 impl<E: Error> From<CachedClassStorageError<E>> for ClassManagerError {
@@ -118,7 +130,7 @@ impl From<serde_json::Error> for ClassManagerError {
     }
 }
 
-#[derive(Clone, Debug, Error)]
+#[derive(Clone, Debug, Error, PartialEq)]
 pub enum ClassManagerClientError {
     #[error(transparent)]
     ClientError(#[from] ClientError),
@@ -126,23 +138,45 @@ pub enum ClassManagerClientError {
     ClassManagerError(#[from] ClassManagerError),
 }
 
-#[derive(Clone, Serialize, Deserialize, AsRefStr)]
+#[derive(Serialize, Deserialize, Clone, AsRefStr, EnumDiscriminants)]
+#[strum_discriminants(
+    name(ClassManagerRequestLabelValue),
+    derive(IntoStaticStr, EnumIter, EnumVariantNames),
+    strum(serialize_all = "snake_case")
+)]
 pub enum ClassManagerRequest {
-    AddClass(Class),
-    AddClassAndExecutableUnsafe(ClassId, Class, ExecutableClassHash, ExecutableClass),
-    AddDeprecatedClass(ClassId, DeprecatedClass),
+    AddClass(RawClass),
+    AddClassAndExecutableUnsafe(ClassId, RawClass, ExecutableClassHash, RawExecutableClass),
+    AddDeprecatedClass(ClassId, RawExecutableClass),
     GetExecutable(ClassId),
     GetSierra(ClassId),
+    GetExecutableClassHashV2(ClassId),
 }
 impl_debug_for_infra_requests_and_responses!(ClassManagerRequest);
+impl_labeled_request!(ClassManagerRequest, ClassManagerRequestLabelValue);
+impl PrioritizedRequest for ClassManagerRequest {
+    fn priority(&self) -> RequestPriority {
+        match self {
+            ClassManagerRequest::GetExecutable(_) | ClassManagerRequest::GetSierra(_) => {
+                RequestPriority::High
+            }
+
+            ClassManagerRequest::AddClass(_)
+            | ClassManagerRequest::AddClassAndExecutableUnsafe(_, _, _, _)
+            | ClassManagerRequest::AddDeprecatedClass(_, _)
+            | ClassManagerRequest::GetExecutableClassHashV2(_) => RequestPriority::Normal,
+        }
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize, AsRefStr)]
 pub enum ClassManagerResponse {
     AddClass(ClassManagerResult<ClassHashes>),
     AddClassAndExecutableUnsafe(ClassManagerResult<()>),
     AddDeprecatedClass(ClassManagerResult<()>),
-    GetExecutable(ClassManagerResult<Option<ExecutableClass>>),
-    GetSierra(ClassManagerResult<Option<Class>>),
+    GetExecutable(ClassManagerResult<Option<RawExecutableClass>>),
+    GetSierra(ClassManagerResult<Option<RawClass>>),
+    GetExecutableClassHashV2(ClassManagerResult<Option<ExecutableClassHash>>),
 }
 impl_debug_for_infra_requests_and_responses!(ClassManagerResponse);
 
@@ -152,7 +186,8 @@ where
     ComponentClientType: Send + Sync + ComponentClient<ClassManagerRequest, ClassManagerResponse>,
 {
     async fn add_class(&self, class: Class) -> ClassManagerClientResult<ClassHashes> {
-        let request = ClassManagerRequest::AddClass(class);
+        let raw_class = RawClass::try_from(class).map_err(ClassManagerError::from)?;
+        let request = ClassManagerRequest::AddClass(raw_class);
         handle_all_response_variants!(
             ClassManagerResponse,
             AddClass,
@@ -167,7 +202,9 @@ where
         class_id: ClassId,
         class: DeprecatedClass,
     ) -> ClassManagerClientResult<()> {
-        let request = ClassManagerRequest::AddDeprecatedClass(class_id, class);
+        let raw_executable = RawExecutableClass::try_from(ContractClass::V0(class))
+            .map_err(ClassManagerError::from)?;
+        let request = ClassManagerRequest::AddDeprecatedClass(class_id, raw_executable);
         handle_all_response_variants!(
             ClassManagerResponse,
             AddDeprecatedClass,
@@ -182,20 +219,44 @@ where
         class_id: ClassId,
     ) -> ClassManagerClientResult<Option<ExecutableClass>> {
         let request = ClassManagerRequest::GetExecutable(class_id);
-        handle_all_response_variants!(
+        let raw_result = handle_all_response_variants!(
             ClassManagerResponse,
             GetExecutable,
             ClassManagerClientError,
             ClassManagerError,
             Direct
-        )
+        )?;
+        let converted = match raw_result {
+            Some(raw) => Some(ExecutableClass::try_from(raw).map_err(ClassManagerError::from)?),
+            None => None,
+        };
+        Ok(converted)
     }
 
     async fn get_sierra(&self, class_id: ClassId) -> ClassManagerClientResult<Option<Class>> {
         let request = ClassManagerRequest::GetSierra(class_id);
-        handle_all_response_variants!(
+        let raw_result = handle_all_response_variants!(
             ClassManagerResponse,
             GetSierra,
+            ClassManagerClientError,
+            ClassManagerError,
+            Direct
+        )?;
+        let converted = match raw_result {
+            Some(raw) => Some(Class::try_from(raw).map_err(ClassManagerError::from)?),
+            None => None,
+        };
+        Ok(converted)
+    }
+
+    async fn get_executable_class_hash_v2(
+        &self,
+        class_id: ClassId,
+    ) -> ClassManagerClientResult<Option<ExecutableClassHash>> {
+        let request = ClassManagerRequest::GetExecutableClassHashV2(class_id);
+        handle_all_response_variants!(
+            ClassManagerResponse,
+            GetExecutableClassHashV2,
             ClassManagerClientError,
             ClassManagerError,
             Direct
@@ -206,14 +267,14 @@ where
         &self,
         class_id: ClassId,
         class: Class,
-        executable_class_id: ExecutableClassHash,
+        executable_class_hash_v2: ExecutableClassHash,
         executable_class: ExecutableClass,
     ) -> ClassManagerClientResult<()> {
         let request = ClassManagerRequest::AddClassAndExecutableUnsafe(
             class_id,
-            class,
-            executable_class_id,
-            executable_class,
+            RawClass::try_from(class).map_err(ClassManagerError::from)?,
+            executable_class_hash_v2,
+            RawExecutableClass::try_from(executable_class).map_err(ClassManagerError::from)?,
         );
         handle_all_response_variants!(
             ClassManagerResponse,
@@ -252,11 +313,18 @@ impl ClassManagerClient for EmptyClassManagerClient {
         Ok(Some(Default::default()))
     }
 
+    async fn get_executable_class_hash_v2(
+        &self,
+        _class_id: ClassId,
+    ) -> ClassManagerClientResult<Option<ExecutableClassHash>> {
+        Ok(Some(ExecutableClassHash::default()))
+    }
+
     async fn add_class_and_executable_unsafe(
         &self,
         _class_id: ClassId,
         _class: Class,
-        _executable_class_id: ExecutableClassHash,
+        _executable_class_hash_v2: ExecutableClassHash,
         _executable_class: ExecutableClass,
     ) -> ClassManagerClientResult<()> {
         Ok(())

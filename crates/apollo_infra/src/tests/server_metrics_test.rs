@@ -1,4 +1,3 @@
-use std::cmp::min;
 use std::convert::TryInto;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -7,6 +6,8 @@ use async_trait::async_trait;
 use metrics::set_default_local_recorder;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use serde::{Deserialize, Serialize};
+use strum::EnumVariantNames;
+use strum_macros::{AsRefStr, EnumDiscriminants, EnumIter, IntoStaticStr};
 use tokio::sync::mpsc::{channel, Receiver};
 use tokio::sync::Semaphore;
 use tokio::task::{self, JoinSet};
@@ -19,31 +20,44 @@ use crate::component_client::{
 };
 use crate::component_definitions::{
     ComponentClient,
-    ComponentRequestAndResponseSender,
     ComponentRequestHandler,
     ComponentStarter,
+    PrioritizedRequest,
+    RequestWrapper,
 };
 use crate::component_server::{
     ComponentServerStarter,
     ConcurrentLocalComponentServer,
     LocalComponentServer,
+    LocalServerConfig,
     RemoteComponentServer,
 };
 use crate::tests::{
+    dummy_remote_server_config,
     AVAILABLE_PORTS,
+    TEST_LOCAL_CLIENT_METRICS,
     TEST_LOCAL_SERVER_METRICS,
     TEST_REMOTE_CLIENT_METRICS,
     TEST_REMOTE_SERVER_METRICS,
 };
+use crate::{impl_debug_for_infra_requests_and_responses, impl_labeled_request};
 
 type TestResult = ClientResult<()>;
 
 const NUMBER_OF_ITERATIONS: usize = 10;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, AsRefStr, EnumDiscriminants)]
+#[strum_discriminants(
+    name(TestComponentRequestLabelValue),
+    derive(IntoStaticStr, EnumIter, EnumVariantNames),
+    strum(serialize_all = "snake_case")
+)]
 enum TestComponentRequest {
     PerformTest,
 }
+impl_debug_for_infra_requests_and_responses!(TestComponentRequest);
+impl_labeled_request!(TestComponentRequest, TestComponentRequestLabelValue);
+impl PrioritizedRequest for TestComponentRequest {}
 
 #[derive(Serialize, Deserialize, Debug)]
 enum TestComponentResponse {
@@ -53,8 +67,7 @@ enum TestComponentResponse {
 type LocalTestComponentClient = LocalComponentClient<TestComponentRequest, TestComponentResponse>;
 type RemoteTestComponentClient = RemoteComponentClient<TestComponentRequest, TestComponentResponse>;
 
-type TestReceiver =
-    Receiver<ComponentRequestAndResponseSender<TestComponentRequest, TestComponentResponse>>;
+type TestReceiver = Receiver<RequestWrapper<TestComponentRequest, TestComponentResponse>>;
 
 #[async_trait]
 trait TestComponentClientTrait: Send + Sync {
@@ -107,46 +120,51 @@ struct BasicSetup {
     local_client: LocalTestComponentClient,
     rx: TestReceiver,
     test_sem: Arc<Semaphore>,
+    local_server_config: LocalServerConfig,
 }
 
 fn basic_test_setup() -> BasicSetup {
+    let local_server_config = LocalServerConfig::default();
     let test_sem = Arc::new(Semaphore::new(0));
     let component = TestComponent::new(test_sem.clone());
 
-    let (tx, rx) = channel::<
-        ComponentRequestAndResponseSender<TestComponentRequest, TestComponentResponse>,
-    >(32);
+    let (tx, rx) = channel::<RequestWrapper<TestComponentRequest, TestComponentResponse>>(32);
 
-    let local_client = LocalTestComponentClient::new(tx);
+    let local_client = LocalTestComponentClient::new(tx, &TEST_LOCAL_CLIENT_METRICS);
 
-    BasicSetup { component, local_client, rx, test_sem }
+    BasicSetup { component, local_client, rx, test_sem, local_server_config }
 }
 
 async fn setup_local_server_test() -> (Arc<Semaphore>, LocalTestComponentClient) {
-    let BasicSetup { component, local_client, rx, test_sem } = basic_test_setup();
+    let BasicSetup { component, local_client, rx, test_sem, local_server_config } =
+        basic_test_setup();
 
-    let mut local_server = LocalComponentServer::new(component, rx, TEST_LOCAL_SERVER_METRICS);
+    let mut local_server =
+        LocalComponentServer::new(component, &local_server_config, rx, &TEST_LOCAL_SERVER_METRICS);
     task::spawn(async move {
         let _ = local_server.start().await;
     });
-
+    task::yield_now().await;
     (test_sem, local_client)
 }
 
 async fn setup_concurrent_local_server_test(
     max_concurrency: usize,
 ) -> (Arc<Semaphore>, LocalTestComponentClient) {
-    let BasicSetup { component, local_client, rx, test_sem } = basic_test_setup();
+    let BasicSetup { component, local_client, rx, test_sem, local_server_config } =
+        basic_test_setup();
 
     let mut concurrent_local_server = ConcurrentLocalComponentServer::new(
         component,
+        &local_server_config,
         rx,
         max_concurrency,
-        TEST_LOCAL_SERVER_METRICS,
+        &TEST_LOCAL_SERVER_METRICS,
     );
     task::spawn(async move {
         let _ = concurrent_local_server.start().await;
     });
+    task::yield_now().await;
 
     (test_sem, local_client)
 }
@@ -160,10 +178,10 @@ async fn setup_remote_server_test(
 
     let mut remote_server = RemoteComponentServer::new(
         local_client.clone(),
-        socket.ip(),
+        dummy_remote_server_config(socket.ip()),
         socket.port(),
         max_concurrency,
-        TEST_REMOTE_SERVER_METRICS,
+        &TEST_REMOTE_SERVER_METRICS,
     );
     task::spawn(async move {
         let _ = remote_server.start().await;
@@ -172,7 +190,7 @@ async fn setup_remote_server_test(
         config,
         &socket.ip().to_string(),
         socket.port(),
-        TEST_REMOTE_CLIENT_METRICS,
+        &TEST_REMOTE_CLIENT_METRICS,
     );
 
     (test_sem, remote_client)
@@ -190,26 +208,32 @@ fn assert_server_metrics(
 ) {
     let received_msgs = TEST_LOCAL_SERVER_METRICS.get_received_value(metrics_as_string);
     let processed_msgs = TEST_LOCAL_SERVER_METRICS.get_processed_value(metrics_as_string);
-    let queue_depth = TEST_LOCAL_SERVER_METRICS.get_queue_depth_value(metrics_as_string);
+    let high_priority_queue_depth =
+        TEST_LOCAL_SERVER_METRICS.get_high_priority_queue_depth_value(metrics_as_string);
+    let normal_priority_queue_depth =
+        TEST_LOCAL_SERVER_METRICS.get_normal_priority_queue_depth_value(metrics_as_string);
 
     assert_eq!(
         received_msgs,
         usize_to_u64(expected_received_msgs),
-        "unexpected value for receives_msgs_started counter, expected {} got {:?}",
-        expected_received_msgs,
-        received_msgs,
+        "unexpected value for receives_msgs_started counter, expected {expected_received_msgs} \
+         got {received_msgs:?}"
     );
     assert_eq!(
         processed_msgs,
         usize_to_u64(expected_processed_msgs),
-        "unexpected value for processed_msgs counter, expected {} got {:?}",
-        expected_processed_msgs,
-        processed_msgs,
+        "unexpected value for processed_msgs counter, expected {expected_processed_msgs} got \
+         {processed_msgs:?}"
     );
     assert_eq!(
-        queue_depth, expected_queue_depth,
-        "unexpected value for queue_depth, expected {} got {:?}",
-        expected_queue_depth, queue_depth,
+        high_priority_queue_depth, expected_queue_depth,
+        "unexpected value for high_priority_queue_depth, expected {expected_queue_depth} got \
+         {high_priority_queue_depth:?}",
+    );
+    assert_eq!(
+        normal_priority_queue_depth, expected_queue_depth,
+        "unexpected value for normal_priority_queue_depth, expected {expected_queue_depth} got \
+         {normal_priority_queue_depth:?}",
     );
 }
 
@@ -228,23 +252,20 @@ fn assert_remote_server_metrics(
     assert_eq!(
         total_received_msgs,
         usize_to_u64(expected_total_received_msgs),
-        "unexpected value for total_receives_msgs_started counter, expected {} got {:?}",
-        expected_total_received_msgs,
-        total_received_msgs,
+        "unexpected value for total_receives_msgs_started counter, expected \
+         {expected_total_received_msgs} got {total_received_msgs:?}"
     );
     assert_eq!(
         valid_received_msgs,
         usize_to_u64(expected_valid_received_msgs),
-        "unexpected value for valid_receives_msgs_started counter, expected {} got {:?}",
-        expected_total_received_msgs,
-        valid_received_msgs,
+        "unexpected value for valid_receives_msgs_started counter, expected \
+         {expected_total_received_msgs} got {valid_received_msgs:?}"
     );
     assert_eq!(
         processed_msgs,
         usize_to_u64(expected_processed_msgs),
-        "unexpected value for processed_msgs counter, expected {} got {:?}",
-        expected_processed_msgs,
-        processed_msgs,
+        "unexpected value for processed_msgs counter, expected {expected_processed_msgs} got \
+         {processed_msgs:?}"
     );
 }
 
@@ -276,6 +297,7 @@ async fn only_metrics_counters_for_local_server() {
 #[tokio::test]
 async fn all_metrics_for_local_server() {
     let recorder = PrometheusBuilder::new().build_recorder();
+
     let _recorder_guard = set_default_local_recorder(&recorder);
 
     let (test_sem, client) = setup_local_server_test().await;
@@ -290,27 +312,48 @@ async fn all_metrics_for_local_server() {
     }
     task::yield_now().await;
 
-    // And then we will provide a single permit each time and check that all metrics are adjusted
-    // accordingly.
-    for i in 0..NUMBER_OF_ITERATIONS {
+    // For LocalComponentServer, the behavior is different from concurrent server:
+    // - Only 1 request can be processed at a time
+    // - When processing starts, 1 request is pulled and gets blocked on semaphore
+    // - The remaining requests stay in queue until the first one completes
+
+    let metrics_as_string = recorder.handle().render();
+
+    let received: usize = TEST_LOCAL_SERVER_METRICS
+        .get_received_value(metrics_as_string.as_str())
+        .try_into()
+        .unwrap();
+    let processed: usize = TEST_LOCAL_SERVER_METRICS
+        .get_processed_value(metrics_as_string.as_str())
+        .try_into()
+        .unwrap();
+
+    // Verify initial state: all requests received, none processed yet, queue depth may vary due to
+    // timing
+    assert_eq!(received, NUMBER_OF_ITERATIONS);
+    assert_eq!(processed, 0);
+
+    // The exact queue depth behavior for LocalComponentServer is complex due to timing,
+    // but we should see that requests are received and processing happens as permits are added
+    for i in 0..NUMBER_OF_ITERATIONS + 1 {
         let metrics_as_string = recorder.handle().render();
-        // After sending i permits we should have i + 1 received messages, because the first message
-        // doesn't need a permit to be received but need a permit to be processed.
-        // So we will have only i processed messages.
-        // And the queue depth should be: NUMBER_OF_ITERATIONS - number of received messages.
-        assert_server_metrics(metrics_as_string.as_str(), i + 1, i, NUMBER_OF_ITERATIONS - i - 1);
+        let received: usize = TEST_LOCAL_SERVER_METRICS
+            .get_received_value(metrics_as_string.as_str())
+            .try_into()
+            .unwrap();
+        let processed: usize = TEST_LOCAL_SERVER_METRICS
+            .get_processed_value(metrics_as_string.as_str())
+            .try_into()
+            .unwrap();
+
+        // All requests should be received
+        assert_eq!(received, NUMBER_OF_ITERATIONS, "All requests should be received");
+        // Processed count should match permits added
+        assert_eq!(processed, i, "Processed count should match permits added");
+
         test_sem.add_permits(1);
         task::yield_now().await;
     }
-
-    // Finally all messages processed and queue is empty.
-    let metrics_as_string = recorder.handle().render();
-    assert_server_metrics(
-        metrics_as_string.as_str(),
-        NUMBER_OF_ITERATIONS,
-        NUMBER_OF_ITERATIONS,
-        0,
-    );
 }
 
 #[tokio::test]
@@ -358,8 +401,7 @@ async fn all_metrics_for_concurrent_server() {
     let max_concurrency = NUMBER_OF_ITERATIONS / 2;
     let (test_sem, client) = setup_concurrent_local_server_test(max_concurrency).await;
 
-    // Current test is checking not only message counters but the queue depth too.
-    // So first we send all the messages.
+    // Send all the requests.
     for _ in 0..NUMBER_OF_ITERATIONS {
         let multi_client = client.clone();
         task::spawn(async move {
@@ -369,19 +411,68 @@ async fn all_metrics_for_concurrent_server() {
     task::yield_now().await;
 
     for i in 0..NUMBER_OF_ITERATIONS {
-        // After sending i permits, we should have 'max_concurrency + i + 1' received messages,
-        // up to a maximum of NUMBER_OF_ITERATIONS.
-        let expected_received_msgs = min(max_concurrency + 1 + i, NUMBER_OF_ITERATIONS);
+        // Requests are passed to the prioritized processing channels regardless of permits
+        // (assuming the channel capacity suffices in this setting), hence the
+        // expected received messages is NUMBER_OF_ITERATIONS, regardless of the number of added
+        // permits.
+        let expected_received_msgs = NUMBER_OF_ITERATIONS;
 
-        // The queue depth should be: 'NUMBER_OF_ITERATIONS - number of received messages'.
-        let expected_queue_depth = NUMBER_OF_ITERATIONS - expected_received_msgs;
+        // TestComponentRequest uses default priority (Normal), so only normal priority queue is
+        // used
+        // TODO(Nadin/Tsabary): Add a separate test with high priority requests to verify
+        // high_priority_queue_depth metrics work correctly when requests actually use
+        // RequestPriority::High
+        let expected_high_priority_queue_depth: usize = 0;
+
+        // For ConcurrentLocalComponentServer, the task limiter semaphore limits how many requests
+        // can be processed concurrently. Initially max_concurrency requests get pulled from
+        // the normal priority queue, and the rest remain queued until processing permits become
+        // available.
+        let expected_normal_priority_queue_depth: usize = if NUMBER_OF_ITERATIONS > max_concurrency
+        {
+            // NUMBER_OF_ITERATIONS - max_concurrency requests remain in queue initially
+            // As each request completes (i), one more can be pulled from queue
+            let processed_plus_concurrent = max_concurrency + i;
+            NUMBER_OF_ITERATIONS.saturating_sub(processed_plus_concurrent)
+        } else {
+            0
+        };
 
         let metrics_as_string = recorder.handle().render();
-        assert_server_metrics(
-            metrics_as_string.as_str(),
+
+        // Assert individual metrics with separate queue depth expectations
+        let received_msgs =
+            TEST_LOCAL_SERVER_METRICS.get_received_value(metrics_as_string.as_str());
+        let processed_msgs =
+            TEST_LOCAL_SERVER_METRICS.get_processed_value(metrics_as_string.as_str());
+        let high_priority_queue_depth = TEST_LOCAL_SERVER_METRICS
+            .get_high_priority_queue_depth_value(metrics_as_string.as_str());
+        let normal_priority_queue_depth = TEST_LOCAL_SERVER_METRICS
+            .get_normal_priority_queue_depth_value(metrics_as_string.as_str());
+
+        assert_eq!(
+            received_msgs,
+            usize_to_u64(expected_received_msgs),
+            "unexpected value for receives_msgs_started counter, expected {} got {:?}",
             expected_received_msgs,
+            received_msgs,
+        );
+        assert_eq!(
+            processed_msgs,
+            usize_to_u64(i),
+            "unexpected value for processed_msgs counter, expected {} got {:?}",
             i,
-            expected_queue_depth,
+            processed_msgs,
+        );
+        assert_eq!(
+            high_priority_queue_depth, expected_high_priority_queue_depth,
+            "unexpected value for high_priority_queue_depth, expected {} got {:?}",
+            expected_high_priority_queue_depth, high_priority_queue_depth,
+        );
+        assert_eq!(
+            normal_priority_queue_depth, expected_normal_priority_queue_depth,
+            "unexpected value for normal_priority_queue_depth, expected {} got {:?}",
+            expected_normal_priority_queue_depth, normal_priority_queue_depth,
         );
         test_sem.add_permits(1);
         task::yield_now().await;

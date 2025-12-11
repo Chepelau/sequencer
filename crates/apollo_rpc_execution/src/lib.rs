@@ -62,7 +62,6 @@ use starknet_api::block::{
 };
 use starknet_api::contract_class::{ClassInfo, EntryPointType, SierraVersion};
 use starknet_api::core::{ChainId, ClassHash, ContractAddress, EntryPointSelector};
-use starknet_api::data_availability::L1DataAvailabilityMode;
 use starknet_api::deprecated_contract_class::ContractClass as DeprecatedContractClass;
 use starknet_api::execution_resources::GasAmount;
 use starknet_api::state::{StateNumber, ThinStateDiff};
@@ -81,6 +80,7 @@ use starknet_api::transaction::{
     TransactionVersion,
 };
 use starknet_api::transaction_hash::get_transaction_hash;
+use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
 use starknet_api::StarknetApiError;
 use starknet_types_core::felt::Felt;
 use state_reader::ExecutionStateReader;
@@ -170,7 +170,7 @@ impl SerializeConfig for ExecutionConfig {
 pub enum ExecutionError {
     #[error("Bad declare tx: {tx:?}. error: {err:?}")]
     BadDeclareTransaction {
-        tx: DeclareTransaction,
+        tx: Box<DeclareTransaction>,
         #[source]
         err: StarknetApiError,
     },
@@ -198,7 +198,7 @@ pub enum ExecutionError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
-    TransactionFeeError(#[from] blockifier::transaction::errors::TransactionFeeError),
+    TransactionFeeError(#[from] Box<blockifier::transaction::errors::TransactionFeeError>),
     #[error(
         "Execution failed at transaction {transaction_index:?} with error: {execution_error:?}"
     )]
@@ -221,7 +221,6 @@ type BlockifierError = anyhow::Error;
 #[allow(clippy::too_many_arguments)]
 // TODO(Dan, Yair): consider box large elements (because of BadDeclareTransaction) or use ID
 // instead.
-#[allow(clippy::result_large_err)]
 pub fn execute_call(
     storage_reader: StorageReader,
     maybe_pending_data: Option<PendingData>,
@@ -298,7 +297,6 @@ pub fn execute_call(
 
 // TODO(Dan, Yair): consider box large elements (because of BadDeclareTransaction) or use ID
 // instead.
-#[allow(clippy::result_large_err)]
 fn verify_contract_exists(
     contract_address: ContractAddress,
     storage_reader: &StorageReader,
@@ -319,7 +317,6 @@ fn verify_contract_exists(
 
 // TODO(Dan, Yair): consider box large elements (because of BadDeclareTransaction) or use ID
 // instead.
-#[allow(clippy::result_large_err)]
 fn create_block_context(
     cached_state: &mut CachedState<ExecutionStateReader>,
     block_context_number: BlockNumber,
@@ -367,15 +364,11 @@ fn create_block_context(
     };
     let ten_blocks_ago = get_10_blocks_ago(&block_context_number, cached_state)?;
 
-    let use_kzg_da = if override_kzg_da_to_false {
-        false
-    } else {
-        match l1_da_mode {
-            L1DataAvailabilityMode::Calldata => false,
-            L1DataAvailabilityMode::Blob => true,
-        }
-    };
-
+    let use_kzg_da = if override_kzg_da_to_false { false } else { l1_da_mode.is_use_kzg_da() };
+    let starknet_version = storage_reader
+        .begin_ro_txn()?
+        .get_starknet_version(block_number)?
+        .unwrap_or(StarknetVersion::LATEST);
     let block_info = BlockInfo {
         block_timestamp,
         sequencer_address: sequencer_address.0,
@@ -390,6 +383,7 @@ fn create_block_context(
             NonzeroGasPrice::new(l2_gas_price.price_in_wei).unwrap_or(NonzeroGasPrice::MIN),
             NonzeroGasPrice::new(l2_gas_price.price_in_fri).unwrap_or(NonzeroGasPrice::MIN),
         ),
+        starknet_version,
     };
     let chain_info = ChainInfo {
         chain_id,
@@ -397,11 +391,8 @@ fn create_block_context(
             strk_fee_token_address: execution_config.strk_fee_contract_address,
             eth_fee_token_address: execution_config.eth_fee_contract_address,
         },
+        is_l3: false,
     };
-    let starknet_version = storage_reader
-        .begin_ro_txn()?
-        .get_starknet_version(block_number)?
-        .unwrap_or(StarknetVersion::LATEST);
     let versioned_constants = VersionedConstants::get(&starknet_version)?;
 
     let block_context = BlockContext::new(
@@ -463,7 +454,6 @@ pub enum ExecutableTransactionInput {
 impl ExecutableTransactionInput {
     // TODO(Dan, Yair): consider box large elements (because of BadDeclareTransaction) or use ID
     // instead.
-    #[allow(clippy::result_large_err)]
     fn calc_tx_hash(self, chain_id: &ChainId) -> ExecutionResult<(Self, TransactionHash)> {
         match self.apply_on_transaction(|tx, only_query| {
             get_transaction_hash(tx, chain_id, &TransactionOptions { only_query })
@@ -591,7 +581,6 @@ impl ExecutableTransactionInput {
 /// Calculates the transaction hashes for a series of transactions without cloning the transactions.
 // TODO(Dan, Yair): consider box large elements (because of BadDeclareTransaction) or use ID
 // instead.
-#[allow(clippy::result_large_err)]
 fn calc_tx_hashes(
     txs: Vec<ExecutableTransactionInput>,
     chain_id: &ChainId,
@@ -621,7 +610,6 @@ pub type FeeEstimationResult = Result<Vec<FeeEstimation>, RevertedTransaction>;
 #[allow(clippy::too_many_arguments)]
 // TODO(Dan, Yair): consider box large elements (because of BadDeclareTransaction) or use ID
 // instead.
-#[allow(clippy::result_large_err)]
 pub fn estimate_fee(
     txs: Vec<ExecutableTransactionInput>,
     chain_id: &ChainId,
@@ -675,7 +663,6 @@ struct TransactionExecutionOutput {
 #[allow(clippy::too_many_arguments)]
 // TODO(Dan, Yair): consider box large elements (because of BadDeclareTransaction) or use ID
 // instead.
-#[allow(clippy::result_large_err)]
 fn execute_transactions(
     txs: Vec<ExecutableTransactionInput>,
     tx_hashes: Option<Vec<TransactionHash>>,
@@ -782,7 +769,6 @@ impl From<(usize, BlockifierTransactionExecutionError)> for ExecutionError {
 
 // TODO(Dan, Yair): consider box large elements (because of BadDeclareTransaction) or use ID
 // instead.
-#[allow(clippy::result_large_err)]
 fn get_10_blocks_ago(
     block_number: &BlockNumber,
     cached_state: &CachedState<ExecutionStateReader>,
@@ -804,7 +790,6 @@ fn get_10_blocks_ago(
 
 // TODO(Dan, Yair): consider box large elements (because of BadDeclareTransaction) or use ID
 // instead.
-#[allow(clippy::result_large_err)]
 fn to_blockifier_tx(
     tx: ExecutableTransactionInput,
     tx_hash: TransactionHash,
@@ -857,7 +842,7 @@ fn to_blockifier_tx(
                 SierraVersion::DEPRECATED,
             )
             .map_err(|err| ExecutionError::BadDeclareTransaction {
-                tx: DeclareTransaction::V0(declare_tx.clone()),
+                tx: DeclareTransaction::V0(declare_tx.clone()).into(),
                 err,
             })?;
 
@@ -886,7 +871,7 @@ fn to_blockifier_tx(
                 SierraVersion::DEPRECATED,
             )
             .map_err(|err| ExecutionError::BadDeclareTransaction {
-                tx: DeclareTransaction::V1(declare_tx.clone()),
+                tx: DeclareTransaction::V1(declare_tx.clone()).into(),
                 err,
             })?;
             let execution_flags =
@@ -916,7 +901,7 @@ fn to_blockifier_tx(
                 sierra_version,
             )
             .map_err(|err| ExecutionError::BadDeclareTransaction {
-                tx: DeclareTransaction::V2(declare_tx.clone()),
+                tx: DeclareTransaction::V2(declare_tx.clone()).into(),
                 err,
             })?;
             let execution_flags =
@@ -946,7 +931,7 @@ fn to_blockifier_tx(
                 sierra_version,
             )
             .map_err(|err| ExecutionError::BadDeclareTransaction {
-                tx: DeclareTransaction::V3(declare_tx.clone()),
+                tx: DeclareTransaction::V3(declare_tx.clone()).into(),
                 err,
             })?;
             let execution_flags =
@@ -981,7 +966,6 @@ fn to_blockifier_tx(
 // TODO(yair): Return structs instead of tuples.
 // TODO(Dan, Yair): consider box large elements (because of BadDeclareTransaction) or use ID
 // instead.
-#[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 pub fn simulate_transactions(
     txs: Vec<ExecutableTransactionInput>,

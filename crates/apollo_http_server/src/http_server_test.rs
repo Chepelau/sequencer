@@ -15,7 +15,6 @@ use apollo_infra::component_client::ClientError;
 use axum::body::{Bytes, HttpBody};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use hyper::StatusCode;
 use rstest::rstest;
 use serde_json::Value;
 use starknet_api::test_utils::read_json_file;
@@ -77,12 +76,10 @@ async fn gateway_output_json_conversion(
     let status_code = response.status();
     let response_bytes = &to_bytes(response).await;
 
-    assert_eq!(status_code, StatusCode::OK, "{response_bytes:?}");
+    assert_eq!(status_code, hyper::StatusCode::OK, "{response_bytes:?}");
     let gateway_response: GatewayOutput = serde_json::from_slice(response_bytes).unwrap();
 
-    let expected_gateway_response =
-        serde_json::from_value(read_json_file(expected_serialized_response_path))
-            .expect("Failed to deserialize json to GatewayOutput");
+    let expected_gateway_response = read_json_file(expected_serialized_response_path);
     assert_eq!(gateway_response, expected_gateway_response);
 }
 
@@ -101,7 +98,7 @@ async fn error_into_response() {
     let body = to_bytes(response).await;
     let json: Value = serde_json::from_slice(&body).unwrap();
 
-    assert!(!status.is_success(), "{:?}", status);
+    assert!(!status.is_success(), "{status:?}");
     assert_eq!(
         json.get("code").unwrap(),
         &serde_json::to_value(&KnownStarknetErrorCode::MalformedRequest).unwrap()
@@ -142,7 +139,7 @@ async fn record_region_test(#[case] index: u16, #[case] tx: impl GatewayTransact
     let region = "test";
     http_client.add_tx_with_headers(tx, [(CLIENT_REGION_HEADER, region)]).await;
     assert!(logs_contain(
-        format!("Recorded transaction transaction_hash={} region={}", tx_hash_2, region).as_str()
+        format!("Recorded transaction transaction_hash={tx_hash_2} region={region}").as_str()
     ));
 }
 
@@ -195,15 +192,19 @@ async fn test_response(#[case] index: u16, #[case] tx: impl GatewayTransaction) 
         }),
     ));
 
+    let expected_internal_err = GatewayClientError::ClientError(ClientError::UnexpectedResponse(
+        "mock response".to_string(),
+    ));
+
     // Set the failed Gateway ClientError response.
-    let expected_gateway_client_err_str =
-        serde_json::to_string(&StarknetError::internal("Internal error")).unwrap();
+    let expected_gateway_client_err_str = serde_json::to_string(
+        &StarknetError::internal_with_logging("mock", expected_internal_err.clone()),
+    )
+    .unwrap();
 
     mock_gateway_client.expect_add_tx().times(1).return_const(Err(
         // The error code needs to be mapped to a INTERNAL_SERVER_ERROR response (status code 500).
-        GatewayClientError::ClientError(ClientError::UnexpectedResponse(
-            "mock response".to_string(),
-        )),
+        expected_internal_err,
     ));
 
     let http_client = add_tx_http_client(mock_gateway_client, 5 + index).await;
@@ -213,11 +214,13 @@ async fn test_response(#[case] index: u16, #[case] tx: impl GatewayTransaction) 
     assert_eq!(tx_hash, EXPECTED_TX_HASH);
 
     // Test a failed bad request response.
-    let error_str = http_client.assert_add_tx_error(tx.clone(), StatusCode::BAD_REQUEST).await;
+    let error_str =
+        http_client.assert_add_tx_error(tx.clone(), reqwest::StatusCode::BAD_REQUEST).await;
     assert_eq!(error_str, expected_err_str);
 
     // Test a failed internal server error response.
-    let error_str = http_client.assert_add_tx_error(tx, StatusCode::INTERNAL_SERVER_ERROR).await;
+    let error_str =
+        http_client.assert_add_tx_error(tx, reqwest::StatusCode::INTERNAL_SERVER_ERROR).await;
     assert_eq!(error_str, expected_gateway_client_err_str);
 }
 
@@ -235,7 +238,7 @@ async fn test_response(#[case] index: u16, #[case] tx: impl GatewayTransaction) 
     Some("bad version"),
     StarknetError {
         code: StarknetErrorCode::KnownErrorCode(KnownStarknetErrorCode::MalformedRequest),
-        message: "Version field is not a valid hex string: bad version".to_string(),
+        message: "Version field is not a valid hex string: badversion".to_string(), //Note: whitespaces are removed when parsing malformed tx jsons
     }
 )]
 #[case::old_version(2, Some("0x1"), StarknetError {
@@ -273,7 +276,8 @@ async fn test_unsupported_tx_version(
     let mock_gateway_client = MockGatewayClient::new();
     let http_client = add_tx_http_client(mock_gateway_client, 9 + index).await;
 
-    let serialized_err = http_client.assert_add_tx_error(tx_json, StatusCode::BAD_REQUEST).await;
+    let serialized_err =
+        http_client.assert_add_tx_error(tx_json, reqwest::StatusCode::BAD_REQUEST).await;
     let starknet_error = serde_json::from_str::<StarknetError>(&serialized_err).unwrap();
     assert_eq!(starknet_error, expected_err);
 }
@@ -284,13 +288,15 @@ async fn sanitizing_error_message() {
     let mut tx_json =
         TransactionSerialization(serde_json::to_value(deprecated_gateway_invoke_tx()).unwrap());
     let tx_object = tx_json.0.as_object_mut().unwrap();
-    let malicious_version: &'static str = "<script>alert(1)</script>";
+    let malicious_version: &'static str =
+        "<script>alert(1)\n</script>'`[](){}_!@#$%^&*+=~\"'`[](){}_!@#$%^&*+=~";
     tx_object.insert("version".to_string(), Value::String(malicious_version.to_string())).unwrap();
 
     let mock_gateway_client = MockGatewayClient::new();
     let http_client = add_tx_http_client(mock_gateway_client, 13).await;
 
-    let serialized_err = http_client.assert_add_tx_error(tx_json, StatusCode::BAD_REQUEST).await;
+    let serialized_err =
+        http_client.assert_add_tx_error(tx_json, reqwest::StatusCode::BAD_REQUEST).await;
     let starknet_error: StarknetError =
         serde_json::from_str(&serialized_err).expect("Expected valid StarknetError JSON");
 
@@ -305,9 +311,9 @@ async fn sanitizing_error_message() {
         "Message should not contain unescaped script tag"
     );
 
-    // Make sure it is escaped.
+    // Make sure it is escaped correctly.
     assert!(
-        starknet_error.message.contains("?script?alert?1???script?"),
+        starknet_error.message.contains(" script alert(1) n  script ''[](){}_            "),
         "Escaped message not found. This is the returned error message: {}",
         starknet_error.message
     );

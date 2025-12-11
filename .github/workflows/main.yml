@@ -13,13 +13,12 @@ on:
       - opened
       - reopened
       - synchronize
-      - auto_merge_enabled
       - edited
 
 env:
   CI: 1
-  RUSTFLAGS: "-D warnings -C link-arg=-fuse-ld=lld"
-  RUSTDOCFLAGS: "-D warnings -C link-arg=-fuse-ld=lld"
+  RUSTFLAGS: "-D warnings"
+  RUSTDOCFLAGS: "-D warnings"
   EXTRA_RUST_TOOLCHAINS: nightly-2024-04-29
 
 # On PR events, cancel existing CI runs on this same PR for this workflow.
@@ -33,7 +32,7 @@ concurrency:
 
 jobs:
   code_style:
-    runs-on: starkware-ubuntu-24.04-medium
+    runs-on: namespace-profile-medium-ubuntu-24-04-amd64
     steps:
       # Environment setup.
       - uses: actions/checkout@v4
@@ -42,34 +41,30 @@ jobs:
           # be computed.
           fetch-depth: 0
 
+      # Install rust components + lld.
+      - uses: ./.github/actions/bootstrap
+        with:
+          extra_rust_toolchains: ${{ env.EXTRA_RUST_TOOLCHAINS }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
       # Setup pypy and link to the location expected by .cargo/config.toml.
       - uses: actions/setup-python@v5
         id: setup-pypy
         with:
           python-version: "pypy3.9"
-          cache: 'pip'
+          cache: "pip"
       - run: ln -s '${{ steps.setup-pypy.outputs.python-path }}' /usr/local/bin/pypy3.9
       - env:
-          LD_LIBRARY_PATH: ${{ steps.setup-pypy.outputs.pythonLocation }}/bin
+          LD_LIBRARY_PATH: ${{ env.Python3_ROOT_DIR }}/bin
         run: echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" >> $GITHUB_ENV
       - run: pip install -r scripts/requirements.txt
 
-      # Install rust components.
-      - uses: ./.github/actions/bootstrap
-        with:
-          extra_rust_toolchains: ${{ env.EXTRA_RUST_TOOLCHAINS }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
 
       # Check Cargo.lock is up to date.
       - name: "Check Cargo.lock"
         run: |
           cargo update -w --locked
           git diff --exit-code Cargo.lock
-
-      # Make sure no submodules are out of date or missing.
-      - name: "Check submodules"
-        run: git submodule status
 
       # Run code style on PR.
       - name: "Run TODO style pull request"
@@ -81,6 +76,9 @@ jobs:
       - name: "Run cargo doc pull request"
         if: github.event_name == 'pull_request'
         run: scripts/run_tests.py --command doc --changes_only --commit_id ${{ github.event.pull_request.base.sha }}
+      - name: "Run python code style pull request"
+        if: github.event_name == 'pull_request'
+        run: scripts/py_code_style.py
 
       # Run code style on push.
       - name: "Run rustfmt"
@@ -101,7 +99,7 @@ jobs:
         run: cargo machete
 
   run-workspace-tests:
-    runs-on: starkware-ubuntu-24.04-medium
+    runs-on: namespace-profile-medium-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/bootstrap
@@ -110,7 +108,7 @@ jobs:
       - run: cargo test -p workspace_tests
 
   run-tests:
-    runs-on: starkware-ubuntu-24.04-large
+    runs-on: namespace-profile-xlarge-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@v4
         with:
@@ -125,16 +123,12 @@ jobs:
         id: setup-pypy
         with:
           python-version: "pypy3.9"
-          cache: 'pip'
+          cache: "pip"
       - run: ln -s '${{ steps.setup-pypy.outputs.python-path }}' /usr/local/bin/pypy3.9
       - env:
           LD_LIBRARY_PATH: ${{ env.Python3_ROOT_DIR }}/bin
         run: echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" >> $GITHUB_ENV
       - run: pip install -r scripts/requirements.txt
-
-      # TODO(Gilad): only one test needs this (base_layer_test.rs), once it migrates to
-      # anvil, remove.
-      - run: npm install -g ganache@7.4.3
 
       - name: "Run tests pull request"
         if: github.event_name == 'pull_request'
@@ -152,7 +146,7 @@ jobs:
           SEED: 0
 
   run-integration-tests:
-    runs-on: starkware-ubuntu-24.04-large
+    runs-on: namespace-profile-large-ubuntu-24-04-amd64
     steps:
       - uses: actions/checkout@v4
         with:
@@ -167,16 +161,12 @@ jobs:
         id: setup-pypy
         with:
           python-version: "pypy3.9"
-          cache: 'pip'
+          cache: "pip"
       - run: ln -s '${{ steps.setup-pypy.outputs.python-path }}' /usr/local/bin/pypy3.9
       - env:
           LD_LIBRARY_PATH: ${{ env.Python3_ROOT_DIR }}/bin
         run: echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" >> $GITHUB_ENV
       - run: pip install -r scripts/requirements.txt
-      
-      # TODO(Gilad): only one test needs this (base_layer_test.rs), once it migrates to
-      # anvil, remove.
-      - run: npm install -g ganache@7.4.3
 
       - name: "Run integration tests pull request"
         if: github.event_name == 'pull_request'

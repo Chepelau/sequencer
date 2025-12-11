@@ -26,7 +26,7 @@ use starknet_api::core::{ClassHash, CompiledClassHash, Nonce};
 use starknet_api::deprecated_contract_class::ContractClass as DeprecatedContractClass;
 use starknet_api::hash::StarkHash;
 use starknet_api::state::{SierraContractClass, StateDiff};
-use starknet_api::{contract_address, felt, storage_key};
+use starknet_api::{compiled_class_hash, contract_address, felt, storage_key};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::sources::base_layer::MockBaseLayerSourceTrait;
@@ -57,17 +57,21 @@ fn state_sorted() {
     let storage_key_0 = storage_key!("0x0");
     let storage_key_1 = storage_key!("0x1");
     let declare_class_0 =
-        (ClassHash(hash0), (CompiledClassHash::default(), SierraContractClass::default()));
+        (ClassHash(hash0), (compiled_class_hash!(1_u8), SierraContractClass::default()));
     let declare_class_1 =
-        (ClassHash(hash1), (CompiledClassHash::default(), SierraContractClass::default()));
+        (ClassHash(hash1), (compiled_class_hash!(2_u8), SierraContractClass::default()));
     let deprecated_declared_0 = (ClassHash(hash0), DeprecatedContractClass::default());
     let deprecated_declared_1 = (ClassHash(hash1), DeprecatedContractClass::default());
     let nonce_0 = (contract_address_0, Nonce(hash0));
     let nonce_1 = (contract_address_1, Nonce(hash1));
+    let migrated_compiled_class_hash_0 = (ClassHash(hash0), compiled_class_hash!(3_u8));
+    let migrated_compiled_class_hash_1 = (ClassHash(hash1), compiled_class_hash!(4_u8));
 
     let unsorted_deployed_contracts = IndexMap::from([dep_contract_1, dep_contract_0]);
     let unsorted_declared_classes =
         IndexMap::from([declare_class_1.clone(), declare_class_0.clone()]);
+    let unsorted_migrated_compiled_classes =
+        IndexMap::from([migrated_compiled_class_hash_1, migrated_compiled_class_hash_0]);
     let unsorted_deprecated_declared =
         IndexMap::from([deprecated_declared_1.clone(), deprecated_declared_0.clone()]);
     let unsorted_nonces = IndexMap::from([nonce_1, nonce_0]);
@@ -82,6 +86,7 @@ fn state_sorted() {
         storage_diffs: unsorted_storage_diffs,
         deprecated_declared_classes: unsorted_deprecated_declared,
         declared_classes: unsorted_declared_classes,
+        migrated_compiled_classes: unsorted_migrated_compiled_classes,
         nonces: unsorted_nonces,
     };
 
@@ -94,6 +99,8 @@ fn state_sorted() {
         (contract_address_0, sorted_storage_entries.clone()),
         (contract_address_1, sorted_storage_entries.clone()),
     ]);
+    let sorted_migrated_compiled_classes =
+        IndexMap::from([migrated_compiled_class_hash_0, migrated_compiled_class_hash_1]);
 
     sort_state_diff(&mut state_diff);
     assert_eq!(
@@ -117,6 +124,10 @@ fn state_sorted() {
         sorted_storage_entries.get_index(0).unwrap(),
     );
     assert_eq!(state_diff.nonces.get_index(0).unwrap(), sorted_nonces.get_index(0).unwrap());
+    assert_eq!(
+        state_diff.migrated_compiled_classes.get_index(0).unwrap(),
+        sorted_migrated_compiled_classes.get_index(0).unwrap()
+    );
 }
 
 #[tokio::test]
@@ -782,3 +793,6 @@ async fn pending_sync_classes_are_cleaned_on_first_pending_data_from_latest_bloc
     )
     .await
 }
+
+// TODO(guy.f): Add a test for the case of a block with old classes and config is set to not store
+// classes. Make sure the old classes are still stored.

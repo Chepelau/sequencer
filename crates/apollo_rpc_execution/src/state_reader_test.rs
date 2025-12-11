@@ -37,7 +37,7 @@ use starknet_api::contract_class::{ContractClass, SierraVersion};
 use starknet_api::core::{ClassHash, CompiledClassHash, Nonce};
 use starknet_api::hash::StarkHash;
 use starknet_api::state::{SierraContractClass, StateNumber, ThinStateDiff};
-use starknet_api::{class_hash, contract_address, felt, storage_key};
+use starknet_api::{class_hash, compiled_class_hash, contract_address, felt, storage_key};
 use starknet_types_core::felt::Felt;
 
 use crate::objects::PendingData;
@@ -58,7 +58,7 @@ fn read_state() {
     let storage_value1 = felt!(888_u128);
     // The class is not used in the execution, so it can be default.
     let class0 = SierraContractClass::default();
-    let sierra_version0 = SierraVersion::extract_from_program(&class0.sierra_program).unwrap();
+    let sierra_version0 = class0.get_sierra_version().unwrap();
     let casm0 = get_test_casm();
     let blockifier_casm0 = RunnableCompiledClass::V1(
         CompiledClassV1::try_from((casm0.clone(), sierra_version0)).unwrap(),
@@ -77,7 +77,7 @@ fn read_state() {
     let mut casm2 = get_test_casm();
     casm2.bytecode[0] = BigUintAsHex { value: 12345u32.into() };
     let class2 = SierraContractClass::default();
-    let sierra_version2 = SierraVersion::extract_from_program(&class2.sierra_program).unwrap();
+    let sierra_version2 = class2.get_sierra_version().unwrap();
     let blockifier_casm2 = RunnableCompiledClass::V1(
         CompiledClassV1::try_from((casm2.clone(), sierra_version2)).unwrap(),
     );
@@ -123,7 +123,7 @@ fn read_state() {
                         storage_key0 => storage_value0,
                     ),
                 ),
-                declared_classes: indexmap!(
+                class_hash_to_compiled_class_hash: indexmap!(
                     class_hash0 => compiled_class_hash0,
                     class_hash5 => compiled_class_hash0,
                 ),
@@ -337,7 +337,7 @@ fn get_compiled_class() {
         .append_state_diff(
             BlockNumber(0),
             ThinStateDiff {
-                declared_classes: indexmap!(class_hash_0x2 => CompiledClassHash::default()),
+                class_hash_to_compiled_class_hash: indexmap!(class_hash_0x2 => compiled_class_hash!(1_u8)),
                 ..Default::default()
             },
         )
@@ -350,7 +350,7 @@ fn get_compiled_class() {
         .append_state_diff(
             BlockNumber(1),
             ThinStateDiff {
-                declared_classes: indexmap!(class_hash_0x3 => CompiledClassHash::default()),
+                class_hash_to_compiled_class_hash: indexmap!(class_hash_0x3 => compiled_class_hash!(2_u8)),
                 ..Default::default()
             },
         )
@@ -416,6 +416,6 @@ fn get_compiled_class_with_error() {
     let (exec_state_reader, _) = set_execution_state_reader(Arc::new(mock_class_manager_client), 0);
 
     let result = exec_state_reader.get_compiled_class(class_hash!("0x2"));
-    let expected_err_msg = format!("Internal client error: {}", internal_err_msg);
+    let expected_err_msg = format!("Internal client error: {internal_err_msg}");
     assert_matches!(result, Err(StateError::StateReadError(err_str)) if err_str == expected_err_msg);
 }

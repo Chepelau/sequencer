@@ -1,88 +1,152 @@
 use apollo_batcher::metrics::{
     BATCHED_TRANSACTIONS,
-    LAST_BATCHED_BLOCK,
-    PROPOSAL_FAILED,
-    PROPOSAL_STARTED,
-    PROPOSAL_SUCCEEDED,
+    BLOCK_CLOSE_REASON,
+    LABEL_NAME_BLOCK_CLOSE_REASON,
+    PROPOSER_DEFERRED_TXS,
+    REJECTED_TRANSACTIONS,
+    REVERTED_TRANSACTIONS,
+    STORAGE_HEIGHT,
+    VALIDATOR_WASTED_TXS,
 };
-use apollo_infra::metrics::{
-    BATCHER_LOCAL_MSGS_PROCESSED,
-    BATCHER_LOCAL_MSGS_RECEIVED,
-    BATCHER_LOCAL_QUEUE_DEPTH,
-    BATCHER_REMOTE_CLIENT_SEND_ATTEMPTS,
-    BATCHER_REMOTE_MSGS_PROCESSED,
-    BATCHER_REMOTE_MSGS_RECEIVED,
-    BATCHER_REMOTE_VALID_MSGS_RECEIVED,
+use apollo_consensus::metrics::CONSENSUS_BLOCK_NUMBER;
+use apollo_consensus_orchestrator::metrics::{
+    CONSENSUS_NUM_BATCHES_IN_PROPOSAL,
+    CONSENSUS_NUM_TXS_IN_PROPOSAL,
 };
+use apollo_metrics::metrics::MetricQueryName;
 
-use crate::dashboard::{Panel, PanelType, Row};
+use crate::dashboard::{Panel, PanelType, Row, Unit};
+use crate::query_builder::{increase, sum_by_label, DisplayMethod, DEFAULT_DURATION};
 
-fn get_panel_proposal_started() -> Panel {
-    Panel::from_counter(PROPOSAL_STARTED, PanelType::Stat)
-}
-fn get_panel_proposal_succeeded() -> Panel {
-    Panel::from_counter(PROPOSAL_SUCCEEDED, PanelType::Stat)
-}
-fn get_panel_proposal_aborted() -> Panel {
-    Panel::from_counter(PROPOSAL_FAILED, PanelType::Stat)
-}
-fn get_panel_proposal_failed() -> Panel {
-    Panel::from_counter(PROPOSAL_FAILED, PanelType::Stat)
-}
-fn get_panel_batched_transactions() -> Panel {
-    Panel::from_counter(BATCHED_TRANSACTIONS, PanelType::Stat)
-}
-fn get_panel_last_batched_block() -> Panel {
-    Panel::from_gauge(LAST_BATCHED_BLOCK, PanelType::Stat)
+pub(crate) fn get_panel_consensus_block_time_avg() -> Panel {
+    Panel::new(
+        "Average Block Time",
+        "Average block time (1m window)",
+        format!("1 / rate({}[1m])", CONSENSUS_BLOCK_NUMBER.get_name_with_filter()),
+        PanelType::TimeSeries,
+    )
+    .with_unit(Unit::Seconds)
 }
 
-fn get_panel_batcher_local_msgs_received() -> Panel {
-    Panel::from_counter(BATCHER_LOCAL_MSGS_RECEIVED, PanelType::TimeSeries)
+fn get_panel_validator_wasted_txs() -> Panel {
+    Panel::new(
+        "Proposal Validation: Wasted TXs",
+        format!(
+            "Number of txs executed by the validator but excluded from the block \
+             ({DEFAULT_DURATION} window)",
+        ),
+        increase(&VALIDATOR_WASTED_TXS, DEFAULT_DURATION),
+        PanelType::TimeSeries,
+    )
+    .with_log_query("Finished building block as validator. Started executing")
 }
-fn get_panel_batcher_local_msgs_processed() -> Panel {
-    Panel::from_counter(BATCHER_LOCAL_MSGS_PROCESSED, PanelType::TimeSeries)
+
+fn get_panel_proposer_deferred_txs() -> Panel {
+    Panel::new(
+        "Proposal Build: Deferred TXs",
+        format!(
+            "Number of txs started execution by the proposer but excluded from the block \
+             ({DEFAULT_DURATION} window)",
+        ),
+        increase(&PROPOSER_DEFERRED_TXS, DEFAULT_DURATION),
+        PanelType::TimeSeries,
+    )
+    .with_log_query("Finished building block as proposer. Started executing")
 }
-fn get_panel_batcher_remote_msgs_received() -> Panel {
-    Panel::from_counter(BATCHER_REMOTE_MSGS_RECEIVED, PanelType::TimeSeries)
+
+fn get_panel_storage_height() -> Panel {
+    Panel::new(
+        "Storage Height",
+        "The height of the batcher's storage",
+        STORAGE_HEIGHT.get_name_with_filter().to_string(),
+        PanelType::Stat,
+    )
+    .with_log_query("Committing block at height")
 }
-fn get_panel_batcher_remote_valid_msgs_received() -> Panel {
-    Panel::from_counter(BATCHER_REMOTE_VALID_MSGS_RECEIVED, PanelType::TimeSeries)
+
+fn get_panel_rejection_reverted_ratio() -> Panel {
+    let rejected_txs_expr = increase(&REJECTED_TRANSACTIONS, DEFAULT_DURATION);
+    let reverted_txs_expr = increase(&REVERTED_TRANSACTIONS, DEFAULT_DURATION);
+
+    let denominator_expr = format!(
+        "({} + {} + {})",
+        rejected_txs_expr,
+        reverted_txs_expr,
+        increase(&BATCHED_TRANSACTIONS, DEFAULT_DURATION),
+    );
+    Panel::new(
+        "Rejected / Reverted TXs Ratio",
+        format!(
+            "Ratio of rejected / reverted transactions out of all processed txs \
+             ({DEFAULT_DURATION} window)"
+        ),
+        vec![
+            format!("{rejected_txs_expr} / {denominator_expr}"),
+            format!("{reverted_txs_expr} / {denominator_expr}"),
+        ],
+        PanelType::TimeSeries,
+    )
+    .with_legends(vec!["Rejected", "Reverted"])
+    .with_unit(Unit::PercentUnit)
 }
-fn get_panel_batcher_remote_msgs_processed() -> Panel {
-    Panel::from_counter(BATCHER_REMOTE_MSGS_PROCESSED, PanelType::TimeSeries)
+
+pub(crate) fn get_panel_batched_transactions_rate() -> Panel {
+    Panel::new(
+        "Batched Transactions Rate (TPS)",
+        "The rate of transactions batched by the Batcher (1m window)",
+        format!("rate({}[1m])", BATCHED_TRANSACTIONS.get_name_with_filter()),
+        PanelType::TimeSeries,
+    )
+    .with_log_query("BATCHER_FIN_VALIDATOR")
 }
-fn get_panel_batcher_local_queue_depth() -> Panel {
-    Panel::from_gauge(BATCHER_LOCAL_QUEUE_DEPTH, PanelType::TimeSeries)
+
+fn get_panel_block_close_reasons() -> Panel {
+    Panel::new(
+        "Block Close Reasons",
+        format!("Number of blocks closed by reason ({} window)", DEFAULT_DURATION),
+        sum_by_label(
+            &BLOCK_CLOSE_REASON,
+            LABEL_NAME_BLOCK_CLOSE_REASON,
+            DisplayMethod::Increase(DEFAULT_DURATION),
+            false,
+        ),
+        PanelType::Stat,
+    )
+    .with_log_query("\"Block builder deadline reached.\" OR \"Block is full.\"")
 }
-fn get_panel_batcher_remote_client_send_attempts() -> Panel {
-    Panel::from_hist(BATCHER_REMOTE_CLIENT_SEND_ATTEMPTS, PanelType::TimeSeries)
+
+fn get_panel_num_batches_in_proposal() -> Panel {
+    Panel::new(
+        "Number of Chunks in Proposal",
+        "The number of transaction batches received in a valid proposal",
+        CONSENSUS_NUM_BATCHES_IN_PROPOSAL.get_name_with_filter().to_string(),
+        PanelType::TimeSeries,
+    )
+}
+
+fn get_panel_num_txs_in_proposal() -> Panel {
+    Panel::new(
+        "Number of Transactions in Proposal",
+        "The total number of individual transactions in a valid proposal received",
+        CONSENSUS_NUM_TXS_IN_PROPOSAL.get_name_with_filter().to_string(),
+        PanelType::TimeSeries,
+    )
+    .with_log_query("BATCHER_FIN_PROPOSER")
 }
 
 pub(crate) fn get_batcher_row() -> Row {
     Row::new(
         "Batcher",
         vec![
-            get_panel_proposal_aborted(),
-            get_panel_proposal_started(),
-            get_panel_proposal_succeeded(),
-            get_panel_proposal_failed(),
-            get_panel_batched_transactions(),
-            get_panel_last_batched_block(),
-        ],
-    )
-}
-
-pub(crate) fn get_batcher_infra_row() -> Row {
-    Row::new(
-        "Batcher Infra",
-        vec![
-            get_panel_batcher_local_msgs_received(),
-            get_panel_batcher_local_msgs_processed(),
-            get_panel_batcher_local_queue_depth(),
-            get_panel_batcher_remote_msgs_received(),
-            get_panel_batcher_remote_valid_msgs_received(),
-            get_panel_batcher_remote_msgs_processed(),
-            get_panel_batcher_remote_client_send_attempts(),
+            get_panel_storage_height(),
+            get_panel_consensus_block_time_avg(),
+            get_panel_batched_transactions_rate(),
+            get_panel_proposer_deferred_txs(),
+            get_panel_validator_wasted_txs(),
+            get_panel_rejection_reverted_ratio(),
+            get_panel_block_close_reasons(),
+            get_panel_num_batches_in_proposal(),
+            get_panel_num_txs_in_proposal(),
         ],
     )
 }

@@ -1,7 +1,9 @@
-import os
-import json
-import subprocess
 import argparse
+import json
+import os
+import socket
+import subprocess
+import time
 from enum import Enum
 
 
@@ -13,10 +15,12 @@ class NodeType(Enum):
 
 # TODO(Nadin): Add support for hybrid nodes.
 def get_service_label(node_type: NodeType, service: str) -> str:
-    if node_type == NodeType.DISTRIBUTED:
+    if (
+        node_type == NodeType.DISTRIBUTED
+        or node_type == NodeType.HYBRID
+        or node_type == NodeType.CONSOLIDATED
+    ):
         return f"sequencer-{service.lower()}"
-    elif node_type == NodeType.CONSOLIDATED:
-        return "sequencer-node"
     else:
         raise ValueError(f"Unknown node type: {node_type}")
 
@@ -52,14 +56,30 @@ def get_pod_name(service_label):
         "-o",
         "jsonpath={.items[0].metadata.name}",
     ]
-    return subprocess.run(
-        cmd, capture_output=True, check=True, text=True
-    ).stdout.strip()
+    return subprocess.run(cmd, capture_output=True, check=True, text=True).stdout.strip()
 
 
-def port_forward(pod_name, local_port, remote_port):
+def port_forward(pod_name, local_port, remote_port, wait_ready=True, max_attempts=25):
     cmd = ["kubectl", "port-forward", pod_name, f"{local_port}:{remote_port}"]
     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not wait_ready:
+        return
+    for attempt in range(max_attempts):
+        try:
+            with socket.create_connection(("localhost", local_port), timeout=1):
+                print(
+                    f"✅ Port-forward to {pod_name}:{remote_port} is ready on localhost:{local_port}"
+                )
+                return
+        except Exception:
+            print(
+                f"🔄 Port-forward to {pod_name}:{remote_port} failed, attempt: {attempt}/{max_attempts}"
+            )
+            time.sleep(1)
+
+    raise RuntimeError(
+        f"❌ Port-forward to {pod_name}:{remote_port} failed after {max_attempts} attempts."
+    )
 
 
 def run_simulator(http_port, monitoring_port, sender_address, receiver_address):
@@ -74,9 +94,7 @@ def run_simulator(http_port, monitoring_port, sender_address, receiver_address):
         "--receiver-address",
         receiver_address,
     ]
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-    )
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     with open("sequencer_simulator.log", "w", encoding="utf-8") as log_file:
         for line in proc.stdout:
             print(line, end="")
@@ -84,9 +102,7 @@ def run_simulator(http_port, monitoring_port, sender_address, receiver_address):
     return proc.wait()
 
 
-def setup_port_forwarding(
-    service_name, deployment_config_path, config_dir, config_key, node_type
-):
+def setup_port_forwarding(service_name, deployment_config_path, config_dir, config_key, node_type):
     ports = get_config_ports(
         service_name,
         deployment_config_path,
@@ -105,9 +121,7 @@ def setup_port_forwarding(
     return port
 
 
-def main(
-    deployment_config_path, config_dir, node_type_str, sender_address, receiver_address
-):
+def main(deployment_config_path, config_dir, node_type_str, sender_address, receiver_address):
     print("🚀 Running sequencer simulator....")
 
     try:
@@ -122,6 +136,9 @@ def main(
     elif node_type == NodeType.CONSOLIDATED:
         state_sync_service = "Node"
         http_server_service = "Node"
+    elif node_type == NodeType.HYBRID:
+        state_sync_service = "Core"
+        http_server_service = "HttpServer"
     else:
         print(f"❌ {node_type} node type is not supported for the sequencer simulator.")
         exit(1)
@@ -146,9 +163,7 @@ def main(
     print(
         f"Running the simulator with http port: {http_server_port} and monitoring port: {state_sync_port}"
     )
-    exit_code = run_simulator(
-        http_server_port, state_sync_port, sender_address, receiver_address
-    )
+    exit_code = run_simulator(http_server_port, state_sync_port, sender_address, receiver_address)
 
     if exit_code != 0:
         print("❌ Sequencer simulator failed!")

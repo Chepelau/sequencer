@@ -18,7 +18,7 @@ use cairo_native::starknet::{
 };
 use num_bigint::BigUint;
 use starknet_api::contract_class::EntryPointType;
-use starknet_api::core::{ClassHash, ContractAddress, EntryPointSelector, EthAddress};
+use starknet_api::core::{ClassHash, ContractAddress, EntryPointSelector, L1Address};
 use starknet_api::execution_resources::GasAmount;
 use starknet_api::state::StorageKey;
 use starknet_api::transaction::fields::{Calldata, ContractAddressSalt, TransactionSignature};
@@ -38,11 +38,12 @@ use crate::execution::errors::EntryPointExecutionError;
 use crate::execution::native::utils::{calculate_resource_bounds, default_tx_v2_info};
 use crate::execution::secp;
 use crate::execution::syscalls::common_syscall_logic::base_keccak;
-use crate::execution::syscalls::hint_processor::{SyscallExecutionError, OUT_OF_GAS_ERROR};
+use crate::execution::syscalls::hint_processor::{SyscallExecutionError, OUT_OF_GAS_ERROR_FELT};
 use crate::execution::syscalls::syscall_base::SyscallHandlerBase;
 use crate::execution::syscalls::vm_syscall_utils::{
     SelfOrRevert,
     SyscallExecutorBaseError,
+    SyscallSelector,
     TryExtractRevert,
 };
 use crate::state::state_api::State;
@@ -74,28 +75,31 @@ impl<'state> NativeSyscallHandler<'state> {
         self.base.context.gas_costs()
     }
 
-    /// Handles all gas-related logics and perform additional checks. In native,
-    /// we need to explicitly call this method at the beginning of each syscall.
-    #[allow(clippy::result_large_err)]
+    /// Handles all gas-related logics, syscall usage counting and perform additional checks. In
+    /// native, we need to explicitly call this method at the beginning of each syscall.
     fn pre_execute_syscall(
         &mut self,
         remaining_gas: &mut u64,
         total_gas_cost: u64,
+        selector: SyscallSelector,
     ) -> SyscallResult<()> {
         if self.unrecoverable_error.is_some() {
             // An unrecoverable error was found in a previous syscall, we return immediately to
             // accelerate the end of the execution. The returned data is not important
             return Err(vec![]);
         }
+
+        // Keccak syscall usages' increments are handled inside its implementation.
+        if !matches!(selector, SyscallSelector::Keccak) {
+            self.base.increment_syscall_count_by(selector, 1);
+        }
+
         // Refund `SYSCALL_BASE_GAS_COST` as it was pre-charged.
         let required_gas = total_gas_cost - self.gas_costs().base.syscall_base_gas_cost;
 
         if *remaining_gas < required_gas {
             // Out of gas failure.
-            return Err(vec![
-                Felt::from_hex(OUT_OF_GAS_ERROR)
-                    .expect("Failed to parse OUT_OF_GAS_ERROR hex string"),
-            ]);
+            return Err(vec![OUT_OF_GAS_ERROR_FELT]);
         }
 
         *remaining_gas -= required_gas;
@@ -146,7 +150,6 @@ impl<'state> NativeSyscallHandler<'state> {
         }
     }
 
-    #[allow(clippy::result_large_err)]
     fn execute_inner_call(
         &mut self,
         entry_point: CallEntryPoint,
@@ -208,7 +211,6 @@ impl<'state> NativeSyscallHandler<'state> {
         }
     }
 
-    #[allow(clippy::result_large_err)]
     fn get_tx_info_v2(&self) -> SyscallResult<TxV2Info> {
         let tx_info = &self.base.context.tx_context.tx_info;
         let native_tx_info = TxV2Info {
@@ -247,7 +249,6 @@ impl<'state> NativeSyscallHandler<'state> {
 }
 
 impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
-    #[allow(clippy::result_large_err)]
     fn get_block_hash(
         &mut self,
         block_number: u64,
@@ -256,6 +257,7 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.get_block_hash.base_syscall_cost(),
+            SyscallSelector::GetBlockHash,
         )?;
 
         match self.base.get_block_hash(block_number) {
@@ -264,11 +266,11 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         }
     }
 
-    #[allow(clippy::result_large_err)]
     fn get_execution_info(&mut self, remaining_gas: &mut u64) -> SyscallResult<ExecutionInfo> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.get_execution_info.base_syscall_cost(),
+            SyscallSelector::GetExecutionInfo,
         )?;
 
         Ok(ExecutionInfo {
@@ -280,7 +282,6 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         })
     }
 
-    #[allow(clippy::result_large_err)]
     fn get_class_hash_at(
         &mut self,
         contract_address: Felt,
@@ -289,7 +290,9 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.get_class_hash_at.base_syscall_cost(),
+            SyscallSelector::GetClassHashAt,
         )?;
+
         let request = ContractAddress::try_from(contract_address)
             .map_err(|err| self.handle_error(remaining_gas, err.into()))?;
 
@@ -300,11 +303,11 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         Ok(class_hash.0)
     }
 
-    #[allow(clippy::result_large_err)]
     fn get_execution_info_v2(&mut self, remaining_gas: &mut u64) -> SyscallResult<ExecutionInfoV2> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.get_execution_info.base_syscall_cost(),
+            SyscallSelector::GetExecutionInfo,
         )?;
 
         Ok(ExecutionInfoV2 {
@@ -316,7 +319,6 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         })
     }
 
-    #[allow(clippy::result_large_err)]
     fn deploy(
         &mut self,
         class_hash: Felt,
@@ -329,7 +331,8 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         // len.
         let total_gas_cost =
             self.gas_costs().syscalls.deploy.get_syscall_cost(u64_from_usize(calldata.len()));
-        self.pre_execute_syscall(remaining_gas, total_gas_cost)?;
+
+        self.pre_execute_syscall(remaining_gas, total_gas_cost, SyscallSelector::Deploy)?;
 
         let (deployed_contract_address, call_info) = self
             .base
@@ -347,11 +350,11 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
 
         Ok((Felt::from(deployed_contract_address), constructor_retdata))
     }
-    #[allow(clippy::result_large_err)]
     fn replace_class(&mut self, class_hash: Felt, remaining_gas: &mut u64) -> SyscallResult<()> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.replace_class.base_syscall_cost(),
+            SyscallSelector::ReplaceClass,
         )?;
 
         self.base
@@ -360,7 +363,6 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         Ok(())
     }
 
-    #[allow(clippy::result_large_err)]
     fn meta_tx_v0(
         &mut self,
         address: Felt,
@@ -373,7 +375,8 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         // len.
         let total_gas_cost =
             self.gas_costs().syscalls.meta_tx_v0.get_syscall_cost(u64_from_usize(calldata.len()));
-        self.pre_execute_syscall(remaining_gas, total_gas_cost)?;
+
+        self.pre_execute_syscall(remaining_gas, total_gas_cost, SyscallSelector::MetaTxV0)?;
 
         let contract_address = ContractAddress::try_from(address)
             .map_err(|error| self.handle_error(remaining_gas, error.into()))?;
@@ -393,7 +396,6 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         Ok(raw_data)
     }
 
-    #[allow(clippy::result_large_err)]
     fn library_call(
         &mut self,
         class_hash: Felt,
@@ -404,6 +406,7 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.library_call.base_syscall_cost(),
+            SyscallSelector::LibraryCall,
         )?;
 
         let class_hash = ClassHash(class_hash);
@@ -438,7 +441,6 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
             .0)
     }
 
-    #[allow(clippy::result_large_err)]
     fn call_contract(
         &mut self,
         address: Felt,
@@ -449,6 +451,7 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.call_contract.base_syscall_cost(),
+            SyscallSelector::CallContract,
         )?;
 
         let contract_address = ContractAddress::try_from(address)
@@ -500,7 +503,6 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
             .0)
     }
 
-    #[allow(clippy::result_large_err)]
     fn storage_read(
         &mut self,
         address_domain: u32,
@@ -510,6 +512,7 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.storage_read.base_syscall_cost(),
+            SyscallSelector::StorageRead,
         )?;
 
         if address_domain != 0 {
@@ -525,7 +528,6 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         Ok(value)
     }
 
-    #[allow(clippy::result_large_err)]
     fn storage_write(
         &mut self,
         address_domain: u32,
@@ -536,6 +538,7 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.storage_write.base_syscall_cost(),
+            SyscallSelector::StorageWrite,
         )?;
 
         if address_domain != 0 {
@@ -551,7 +554,6 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         Ok(())
     }
 
-    #[allow(clippy::result_large_err)]
     fn emit_event(
         &mut self,
         keys: &[Felt],
@@ -561,6 +563,7 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.emit_event.base_syscall_cost(),
+            SyscallSelector::EmitEvent,
         )?;
 
         let event = EventContent {
@@ -572,7 +575,6 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         Ok(())
     }
 
-    #[allow(clippy::result_large_err)]
     fn send_message_to_l1(
         &mut self,
         to_address: Felt,
@@ -582,20 +584,20 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.send_message_to_l1.base_syscall_cost(),
+            SyscallSelector::SendMessageToL1,
         )?;
 
-        let to_address = EthAddress::try_from(to_address)
-            .map_err(|err| self.handle_error(remaining_gas, err.into()))?;
+        let to_address = L1Address::from(to_address);
         let message = MessageToL1 { to_address, payload: L2ToL1Payload(payload.to_vec()) };
 
         self.base.send_message_to_l1(message).map_err(|err| self.handle_error(remaining_gas, err))
     }
 
-    #[allow(clippy::result_large_err)]
     fn keccak(&mut self, input: &[u64], remaining_gas: &mut u64) -> SyscallResult<U256> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.keccak.base_syscall_cost(),
+            SyscallSelector::Keccak,
         )?;
 
         match base_keccak(
@@ -603,15 +605,20 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
             input,
             remaining_gas,
         ) {
-            Ok((state, _n_rounds)) => Ok(U256 {
-                hi: u128::from(state[2]) | (u128::from(state[3]) << 64),
-                lo: u128::from(state[0]) | (u128::from(state[1]) << 64),
-            }),
+            Ok((state, n_rounds)) => {
+                // For the keccak system call we want to count the number of rounds rather than the
+                // number of syscall invocations.
+                self.base.increment_syscall_count_by(SyscallSelector::Keccak, n_rounds);
+
+                Ok(U256 {
+                    hi: u128::from(state[2]) | (u128::from(state[3]) << 64),
+                    lo: u128::from(state[0]) | (u128::from(state[1]) << 64),
+                })
+            }
             Err(err) => Err(self.handle_error(remaining_gas, err.into())),
         }
     }
 
-    #[allow(clippy::result_large_err)]
     fn secp256k1_new(
         &mut self,
         x: U256,
@@ -621,6 +628,7 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.secp256k1_new.base_syscall_cost(),
+            SyscallSelector::Secp256k1New,
         )?;
 
         Secp256Point::new(x, y)
@@ -628,7 +636,6 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
             .map_err(|e| self.handle_error(remaining_gas, e))
     }
 
-    #[allow(clippy::result_large_err)]
     fn secp256k1_add(
         &mut self,
         p0: Secp256k1Point,
@@ -638,12 +645,12 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.secp256k1_add.base_syscall_cost(),
+            SyscallSelector::Secp256k1Add,
         )?;
 
         Ok(Secp256Point::add(p0.into(), p1.into()).into())
     }
 
-    #[allow(clippy::result_large_err)]
     fn secp256k1_mul(
         &mut self,
         p: Secp256k1Point,
@@ -653,12 +660,12 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.secp256k1_mul.base_syscall_cost(),
+            SyscallSelector::Secp256k1Mul,
         )?;
 
         Ok(Secp256Point::mul(p.into(), m).into())
     }
 
-    #[allow(clippy::result_large_err)]
     fn secp256k1_get_point_from_x(
         &mut self,
         x: U256,
@@ -668,6 +675,7 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.secp256k1_get_point_from_x.base_syscall_cost(),
+            SyscallSelector::Secp256k1GetPointFromX,
         )?;
 
         Secp256Point::get_point_from_x(x, y_parity)
@@ -675,7 +683,6 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
             .map_err(|e| self.handle_error(remaining_gas, e))
     }
 
-    #[allow(clippy::result_large_err)]
     fn secp256k1_get_xy(
         &mut self,
         p: Secp256k1Point,
@@ -684,12 +691,12 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.secp256k1_get_xy.base_syscall_cost(),
+            SyscallSelector::Secp256k1GetXy,
         )?;
 
         Ok((p.x, p.y))
     }
 
-    #[allow(clippy::result_large_err)]
     fn secp256r1_new(
         &mut self,
         x: U256,
@@ -699,6 +706,7 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.secp256r1_new.base_syscall_cost(),
+            SyscallSelector::Secp256r1New,
         )?;
 
         Secp256Point::new(x, y)
@@ -706,7 +714,6 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
             .map_err(|err| self.handle_error(remaining_gas, err))
     }
 
-    #[allow(clippy::result_large_err)]
     fn secp256r1_add(
         &mut self,
         p0: Secp256r1Point,
@@ -716,11 +723,12 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.secp256r1_add.base_syscall_cost(),
+            SyscallSelector::Secp256r1Add,
         )?;
+
         Ok(Secp256Point::add(p0.into(), p1.into()).into())
     }
 
-    #[allow(clippy::result_large_err)]
     fn secp256r1_mul(
         &mut self,
         p: Secp256r1Point,
@@ -730,12 +738,12 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.secp256r1_mul.base_syscall_cost(),
+            SyscallSelector::Secp256r1Mul,
         )?;
 
         Ok(Secp256Point::mul(p.into(), m).into())
     }
 
-    #[allow(clippy::result_large_err)]
     fn secp256r1_get_point_from_x(
         &mut self,
         x: U256,
@@ -745,6 +753,7 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.secp256r1_get_point_from_x.base_syscall_cost(),
+            SyscallSelector::Secp256r1GetPointFromX,
         )?;
 
         Secp256Point::get_point_from_x(x, y_parity)
@@ -752,7 +761,6 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
             .map_err(|err| self.handle_error(remaining_gas, err))
     }
 
-    #[allow(clippy::result_large_err)]
     fn secp256r1_get_xy(
         &mut self,
         p: Secp256r1Point,
@@ -761,12 +769,12 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.secp256r1_get_xy.base_syscall_cost(),
+            SyscallSelector::Secp256r1GetXy,
         )?;
 
         Ok((p.x, p.y))
     }
 
-    #[allow(clippy::result_large_err)]
     fn sha256_process_block(
         &mut self,
         prev_state: &mut [u32; 8],
@@ -776,6 +784,7 @@ impl StarknetSyscallHandler for &mut NativeSyscallHandler<'_> {
         self.pre_execute_syscall(
             remaining_gas,
             self.gas_costs().syscalls.sha256_process_block.base_syscall_cost(),
+            SyscallSelector::Sha256ProcessBlock,
         )?;
 
         let data_as_bytes = sha2::digest::generic_array::GenericArray::from_exact_iter(
@@ -842,7 +851,6 @@ impl<Curve: SWCurveConfig> Secp256Point<Curve>
 where
     Curve::BaseField: PrimeField, // constraint for get_point_by_id
 {
-    #[allow(clippy::result_large_err)]
     fn wrap_secp_result<T>(
         result: Result<Option<T>, SyscallExecutionError>,
     ) -> Result<Option<Secp256Point<Curve>>, SyscallExecutionError>
@@ -861,7 +869,6 @@ where
     /// - Returns `Err` if either `x` or `y` is outside the modulus.
     /// - Returns `Ok(None)` if (x, y) are within the modulus but not on the curve.
     /// - Ok(Some(Point)) if (x,y) are on the curve.
-    #[allow(clippy::result_large_err)]
     fn new(x: U256, y: U256) -> Result<Option<Self>, SyscallExecutionError> {
         let x = u256_to_biguint(x);
         let y = u256_to_biguint(y);
@@ -879,7 +886,6 @@ where
         Secp256Point(result.into())
     }
 
-    #[allow(clippy::result_large_err)]
     fn get_point_from_x(x: U256, y_parity: bool) -> Result<Option<Self>, SyscallExecutionError> {
         let x = u256_to_biguint(x);
 

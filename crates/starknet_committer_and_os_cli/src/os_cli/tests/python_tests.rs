@@ -1,6 +1,6 @@
-use blake2s::encode_felts_to_u32s;
 use starknet_os::test_utils::errors::OsSpecificTestError;
 use starknet_types_core::felt::Felt;
+use starknet_types_core::hash::Blake2Felt252;
 
 use crate::os_cli::commands::{validate_os_input, AggregatorCliInput, OsCliInput};
 use crate::os_cli::tests::types::{OsPythonTestError, OsPythonTestResult};
@@ -29,7 +29,6 @@ impl TryFrom<String> for OsPythonTestRunner {
 
 impl PythonTestRunner for OsPythonTestRunner {
     type SpecificError = OsSpecificTestError;
-    #[allow(clippy::result_large_err)]
     async fn run(&self, input: Option<&str>) -> OsPythonTestResult {
         match self {
             Self::AggregatorInputDeserialization => {
@@ -40,14 +39,13 @@ impl PythonTestRunner for OsPythonTestRunner {
             }
             Self::EncodeFelts => {
                 let felts: Vec<Felt> = serde_json::from_str(Self::non_optional_input(input)?)?;
-                Ok(format!("{:?}", encode_felts_to_u32s(felts)))
+                Ok(format!("{:?}", Blake2Felt252::encode_felts_to_u32s(&felts)))
             }
         }
     }
 }
 
 /// Deserialize the OS input string into an `OsInput` struct.
-#[allow(clippy::result_large_err)]
 fn os_input_deserialization(input_str: &str) -> OsPythonTestResult {
     let input = serde_json::from_str::<OsCliInput>(input_str)?;
     validate_os_input(&input.os_hints.os_input);
@@ -55,7 +53,6 @@ fn os_input_deserialization(input_str: &str) -> OsPythonTestResult {
 }
 
 /// Deserialize the aggregator input string into an `AggregatorInput` struct.
-#[allow(clippy::result_large_err)]
 fn aggregator_input_deserialization(input_str: &str) -> OsPythonTestResult {
     let _input = serde_json::from_str::<AggregatorCliInput>(input_str)?;
     // TODO(Aner): Validate the aggregator input.

@@ -1,24 +1,38 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Display;
+use std::fs::File;
+use std::io::Read;
 use std::iter::once;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
-use apollo_config::dumping::SerializeConfig;
+use apollo_config::dumping::{prepend_sub_config_name, ser_param, SerializeConfig};
+use apollo_config::{ParamPath, ParamPrivacyInput, SerializedParam, FIELD_SEPARATOR, IS_NONE_MARK};
 use apollo_infra_utils::dumping::serialize_to_file;
 #[cfg(test)]
 use apollo_infra_utils::dumping::serialize_to_file_test;
-use apollo_node::config::component_config::ComponentConfig;
-use apollo_node::config::config_utils::config_to_preset;
-use indexmap::IndexMap;
+use apollo_node_config::component_config::ComponentConfig;
+use apollo_node_config::component_execution_config::{
+    ReactiveComponentExecutionConfig,
+    DEFAULT_URL,
+};
+use apollo_node_config::config_utils::{config_to_preset, prune_by_is_none};
+use phf::phf_set;
+use serde::ser::SerializeSeq;
 use serde::{Serialize, Serializer};
-use serde_json::json;
+use serde_json::{from_str, json, Map, Value};
 use strum::{Display, EnumVariantNames, IntoEnumIterator};
 use strum_macros::{EnumDiscriminants, EnumIter, IntoStaticStr};
 
-use crate::deployment::{
-    build_service_namespace_domain_address,
-    ComponentConfigsSerializationWrapper,
+use crate::config_override::{deployment_replacer_file_path, instance_replacer_file_path};
+use crate::deployment::build_service_namespace_domain_address;
+use crate::deployment_definitions::{
+    ComponentConfigInService,
+    Environment,
+    InfraServicePort,
+    ServicePort,
+    CONFIG_BASE_DIR,
 };
-use crate::deployment_definitions::{Environment, CONFIG_BASE_DIR};
 use crate::deployments::consolidated::ConsolidatedNodeServiceName;
 use crate::deployments::distributed::DistributedNodeServiceName;
 use crate::deployments::hybrid::HybridNodeServiceName;
@@ -32,29 +46,66 @@ use crate::k8s::{
     Resources,
     Toleration,
 };
+use crate::replacers::insert_replacer_annotations;
+use crate::scale_policy::ScalePolicy;
 #[cfg(test)]
 use crate::test_utils::FIX_BINARY_NAME;
+use crate::update_strategy::UpdateStrategy;
 
 const SERVICES_DIR_NAME: &str = "services/";
+
+pub static KEYS_TO_BE_REPLACED: phf::Set<&'static str> = phf_set! {
+    "base_layer_config.bpo1_start_block_number",
+    "base_layer_config.bpo2_start_block_number",
+    "base_layer_config.fusaka_no_bpo_start_block_number",
+    "batcher_config.contract_class_manager_config.native_compiler_config.max_cpu_time",
+    "batcher_config.block_builder_config.bouncer_config.block_max_capacity.n_events",
+    "batcher_config.block_builder_config.bouncer_config.block_max_capacity.state_diff_size",
+    "batcher_config.block_builder_config.execute_config.n_workers",
+    "batcher_config.block_builder_config.proposer_idle_detection_delay_millis",
+    "batcher_config.contract_class_manager_config.cairo_native_run_config.native_classes_whitelist",
+    "class_manager_config.class_manager_config.max_compiled_contract_class_object_size",
+    "consensus_manager_config.consensus_manager_config.dynamic_config.timeouts.proposal.base",
+    "consensus_manager_config.consensus_manager_config.dynamic_config.timeouts.proposal.max",
+    "consensus_manager_config.context_config.build_proposal_margin_millis",
+    "consensus_manager_config.context_config.override_eth_to_fri_rate",
+    "consensus_manager_config.context_config.override_eth_to_fri_rate.#is_none",
+    "consensus_manager_config.context_config.override_l1_data_gas_price_wei",
+    "consensus_manager_config.context_config.override_l1_data_gas_price_wei.#is_none",
+    "consensus_manager_config.context_config.override_l1_gas_price_wei",
+    "consensus_manager_config.context_config.override_l1_gas_price_wei.#is_none",
+    "consensus_manager_config.context_config.override_l2_gas_price_fri",
+    "consensus_manager_config.context_config.override_l2_gas_price_fri.#is_none",
+    "gateway_config.authorized_declarer_accounts",
+    "gateway_config.authorized_declarer_accounts.#is_none",
+    "gateway_config.contract_class_manager_config.native_compiler_config.max_cpu_time",
+    "gateway_config.stateful_tx_validator_config.max_allowed_nonce_gap",
+    "gateway_config.stateless_tx_validator_config.min_gas_price",
+    "mempool_config.dynamic_config.transaction_ttl",
+    "sierra_compiler_config.max_bytecode_size",
+    "versioned_constants_overrides.max_n_events",
+};
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Service {
     #[serde(rename = "name")]
     node_service: NodeService,
-    // TODO(Tsabary): change config path to PathBuf type.
     controller: Controller,
+    #[serde(serialize_with = "serialize_vec_strip_prefix")]
     config_paths: Vec<String>,
     ingress: Option<Ingress>,
     k8s_service_config: Option<K8sServiceConfig>,
-    autoscale: bool,
+    #[serde(rename = "autoscale")]
+    scale_policy: ScalePolicy,
     replicas: usize,
     storage: Option<usize>,
     toleration: Option<Toleration>,
     resources: Resources,
     external_secret: Option<ExternalSecret>,
-    #[serde(skip_serializing)]
-    environment: Environment,
     anti_affinity: bool,
+    #[serde(rename = "update_strategy_type")]
+    update_strategy: UpdateStrategy,
+    ports: BTreeMap<ServicePort, u16>,
 }
 
 impl Service {
@@ -70,27 +121,22 @@ impl Service {
         // We first list the base config, and then follow with the overrides, and finally, the
         // service config file.
 
-        // TODO(Tsabary): the deployment override file can be in a higher directory.
-        // TODO(Tsabary): delete redundant directories in the path.
         // TODO(Tsabary): reduce visibility of relevant functions and consts.
 
-        let service_file_path = node_service.get_service_file_path();
-
-        let config_paths = config_filenames
-            .iter()
-            .cloned()
-            .chain(once(service_file_path))
-            .map(|p| {
-                // Strip the parent dir prefix.
-                Path::new(&p)
-                    .strip_prefix(CONFIG_BASE_DIR)
-                    .map(|stripped| stripped.to_string_lossy().into_owned())
-                    .expect("Failed to strip mutual prefix")
-            })
+        let components_in_service = node_service
+            .get_components_in_service()
+            .into_iter()
+            .flat_map(|c| c.get_component_config_file_paths())
+            .collect::<Vec<_>>();
+        let config_paths = components_in_service
+            .clone()
+            .into_iter()
+            .chain(config_filenames.clone())
+            .chain(once(node_service.get_service_file_path()))
             .collect();
 
         let controller = node_service.get_controller();
-        let autoscale = node_service.get_autoscale();
+        let scale_policy = node_service.get_scale_policy();
         let toleration = node_service.get_toleration(&environment);
         let ingress = node_service.get_ingress(&environment, ingress_params);
         let k8s_service_config = node_service.get_k8s_service_config(k8s_service_config_params);
@@ -98,27 +144,48 @@ impl Service {
         let resources = node_service.get_resources(&environment);
         let replicas = node_service.get_replicas(&environment);
         let anti_affinity = node_service.get_anti_affinity(&environment);
+        let ports = node_service.get_service_port_mapping();
+        let update_strategy = node_service.get_update_strategy();
         Self {
             node_service,
             config_paths,
             controller,
             ingress,
             k8s_service_config,
-            autoscale,
+            scale_policy,
             replicas,
             storage,
             toleration,
             resources,
             external_secret,
-            // TODO(Tsabary): consider removing `environment` from the `Service` struct.
-            environment,
             anti_affinity,
+            update_strategy,
+            ports,
         }
     }
 
-    pub fn get_config_paths(&self) -> Vec<String> {
+    pub fn get_service_config_paths(&self) -> Vec<String> {
         self.config_paths.clone()
     }
+}
+
+fn serialize_vec_strip_prefix<S>(vec: &Vec<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut seq = serializer.serialize_seq(Some(vec.len()))?;
+
+    for s in vec {
+        if let Some(stripped) = s.strip_prefix(CONFIG_BASE_DIR) {
+            seq.serialize_element(stripped)?;
+        } else {
+            return Err(serde::ser::Error::custom(format!(
+                "Expected all items to start with '{CONFIG_BASE_DIR}', got '{s}'"
+            )));
+        }
+    }
+
+    seq.end()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, EnumDiscriminants)]
@@ -133,11 +200,24 @@ pub enum NodeService {
     Distributed(DistributedNodeServiceName),
 }
 
+// TODO(Tsabary): move p2p ports from the application configs to the replacer format.
+
 impl NodeService {
+    pub fn replacer_deployment_file_path(&self) -> String {
+        PathBuf::from(CONFIG_BASE_DIR)
+            .join(SERVICES_DIR_NAME)
+            .join(NodeType::from(self).get_folder_name())
+            .join(format!("replacer_deployment_{}.json", self.as_inner()))
+            .to_string_lossy()
+            .to_string()
+    }
+
     fn get_config_file_path(&self) -> String {
-        let mut name = self.as_inner().to_string();
-        name.push_str(".json");
-        name
+        format!("{}.json", self.as_inner())
+    }
+
+    fn get_replacer_config_file_path(&self) -> String {
+        format!("replacer_{}.json", self.as_inner())
     }
 
     pub fn create_service(
@@ -170,8 +250,8 @@ impl NodeService {
         self.as_inner().get_controller()
     }
 
-    pub fn get_autoscale(&self) -> bool {
-        self.as_inner().get_autoscale()
+    pub fn get_scale_policy(&self) -> ScalePolicy {
+        self.as_inner().get_scale_policy()
     }
 
     pub fn get_toleration(&self, environment: &Environment) -> Option<Toleration> {
@@ -215,7 +295,9 @@ impl NodeService {
         self.as_inner().k8s_service_name()
     }
 
-    pub fn get_service_file_path(&self) -> String {
+    // TODO(Tsabary): deprecate this function after we complete the transition to the replacer
+    // format.
+    fn get_service_file_path(&self) -> String {
         PathBuf::from(CONFIG_BASE_DIR)
             .join(SERVICES_DIR_NAME)
             .join(NodeType::from(self).get_folder_name())
@@ -223,12 +305,98 @@ impl NodeService {
             .to_string_lossy()
             .to_string()
     }
+
+    fn get_replacer_service_file_path(&self) -> String {
+        PathBuf::from(CONFIG_BASE_DIR)
+            .join(SERVICES_DIR_NAME)
+            .join(NodeType::from(self).get_folder_name())
+            .join(self.get_replacer_config_file_path())
+            .to_string_lossy()
+            .to_string()
+    }
+
+    pub fn get_components_in_service(&self) -> BTreeSet<ComponentConfigInService> {
+        self.as_inner().get_components_in_service()
+    }
+
+    pub fn get_service_port_mapping(&self) -> BTreeMap<ServicePort, u16> {
+        self.as_inner().get_service_port_mapping()
+    }
+
+    pub fn get_update_strategy(&self) -> UpdateStrategy {
+        self.as_inner().get_update_strategy()
+    }
+
+    fn replacer_app_config_files(&self) -> Vec<(Value, String)> {
+        let components_in_service = self
+            .get_components_in_service()
+            .into_iter()
+            .flat_map(|c| c.get_component_config_file_paths())
+            .collect::<Vec<_>>();
+
+        let replacer_components_in_service = self
+            .get_components_in_service()
+            .into_iter()
+            .flat_map(|c| c.get_replacer_component_config_file_paths())
+            .collect::<Vec<_>>();
+
+        let replacer_app_config_data: Vec<Value> = components_in_service
+            .iter()
+            .map(|src| {
+                let src_path = Path::new(src);
+                // Read the app config file
+                let mut contents = String::new();
+                File::open(src_path).unwrap().read_to_string(&mut contents).unwrap();
+
+                // Parse it as a json
+                let map: Map<String, Value> =
+                    from_str(&contents).expect("JSON should be an object");
+                let original_app_config = Value::Object(map);
+
+                // Perform replacement
+                insert_replacer_annotations(original_app_config, replace_pred)
+            })
+            .collect();
+
+        let mut data_and_file_paths: Vec<(Value, String)> = replacer_app_config_data
+            .into_iter()
+            .zip(replacer_components_in_service.clone())
+            .collect();
+
+        let replacer_config_filenames: Vec<String> =
+            vec![deployment_replacer_file_path(), instance_replacer_file_path()];
+        let replacer_config_paths: Vec<String> = replacer_components_in_service
+            .into_iter()
+            .chain(replacer_config_filenames)
+            .chain(once(self.get_replacer_service_file_path()))
+            .collect();
+        let replacer_deployment_file_path = self.replacer_deployment_file_path();
+
+        data_and_file_paths.push((replacer_config_paths.into(), replacer_deployment_file_path));
+
+        data_and_file_paths
+    }
+
+    pub fn dump_node_service_replacer_app_config_files(&self) {
+        for (data, file_path) in self.replacer_app_config_files().into_iter() {
+            serialize_to_file(&data, &file_path);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn test_dump_node_service_replacer_app_config_files(&self) {
+        for (data, file_path) in self.replacer_app_config_files().into_iter() {
+            serialize_to_file_test(&data, &file_path, FIX_BINARY_NAME);
+        }
+    }
 }
 
 pub(crate) trait ServiceNameInner: Display {
     fn get_controller(&self) -> Controller;
 
-    fn get_autoscale(&self) -> bool;
+    fn get_scale_policy(&self) -> ScalePolicy;
+
+    fn get_retries(&self) -> usize;
 
     fn get_toleration(&self, environment: &Environment) -> Option<Toleration>;
 
@@ -270,11 +438,44 @@ pub(crate) trait ServiceNameInner: Display {
 
     fn get_anti_affinity(&self, environment: &Environment) -> bool;
 
+    fn get_service_ports(&self) -> BTreeSet<ServicePort>;
+
+    fn get_service_port_mapping(&self) -> BTreeMap<ServicePort, u16> {
+        let mut ports = BTreeMap::new();
+
+        for service_port in self.get_service_ports() {
+            let port = service_port.get_port();
+            ports.insert(service_port, port);
+        }
+        ports
+    }
+
+    fn get_infra_service_port_mapping(&self) -> BTreeMap<InfraServicePort, u16> {
+        let mut ports = BTreeMap::new();
+
+        for service_port in self.get_service_ports() {
+            match service_port {
+                ServicePort::Infra(service) => {
+                    let port = service.get_port();
+                    ports.insert(service, port);
+                }
+                ServicePort::BusinessLogic(_) => {
+                    continue;
+                }
+            }
+        }
+        ports
+    }
+
     // Kubernetes service name as defined by CDK8s.
     fn k8s_service_name(&self) -> String {
         let formatted_service_name = self.to_string().replace('_', "");
-        format!("sequencer-{}-service", formatted_service_name)
+        format!("sequencer-{formatted_service_name}-service")
     }
+
+    fn get_components_in_service(&self) -> BTreeSet<ComponentConfigInService>;
+
+    fn get_update_strategy(&self) -> UpdateStrategy;
 }
 
 impl NodeType {
@@ -295,10 +496,31 @@ impl NodeType {
         }
     }
 
+    pub fn get_services_of_components(
+        &self,
+        component_type: ComponentConfigInService,
+    ) -> HashSet<NodeService> {
+        let services: HashSet<_> = self
+            .all_service_names()
+            .into_iter()
+            .filter(|node_service| {
+                node_service.get_components_in_service().contains(&component_type)
+            })
+            .collect();
+
+        assert!(
+            !services.is_empty(),
+            "Expected at least one NodeService containing component type {:?}",
+            component_type
+        );
+
+        services
+    }
+
     pub fn get_component_configs(
         &self,
         ports: Option<Vec<u16>>,
-    ) -> IndexMap<NodeService, ComponentConfig> {
+    ) -> HashMap<NodeService, ComponentConfig> {
         match self {
             // TODO(Tsabary): avoid this code duplication.
             Self::Consolidated => ConsolidatedNodeServiceName::get_component_configs(ports),
@@ -312,11 +534,23 @@ impl NodeType {
         SerdeFn: Fn(&serde_json::Value, &str),
     {
         let component_configs = self.get_component_configs(ports);
-        for (node_service, config) in component_configs {
-            let wrapper = ComponentConfigsSerializationWrapper::from(config);
+        for (node_service, component_config) in component_configs {
+            let components_in_service = node_service.get_components_in_service();
+            let wrapper =
+                ComponentConfigsSerializationWrapper::new(component_config, components_in_service);
             let flattened = config_to_preset(&json!(wrapper.dump()));
+            let pruned = prune_by_is_none(flattened);
+            // TODO(Tsabary): deprecate this section after we complete the transition to the
+            // replacer format. Dumping in the original format.
             let file_path = node_service.get_service_file_path();
-            writer(&flattened, &file_path);
+            writer(&pruned, &file_path);
+
+            // Dumping in the replacer format.
+
+            let pruned_with_replacer_annotations =
+                insert_replacer_annotations(pruned, replace_pred);
+            let file_path = node_service.get_replacer_service_file_path();
+            writer(&pruned_with_replacer_annotations, &file_path);
         }
     }
 
@@ -332,12 +566,118 @@ impl NodeType {
             serialize_to_file_test(map, path, FIX_BINARY_NAME);
         });
     }
+
+    #[cfg(test)]
+    pub fn test_all_replacers_are_accounted_for(&self) {
+        // Obtain the application config keys of each service.
+        let application_config_keys: HashSet<String> = self
+            .all_service_names()
+            .iter()
+            .flat_map(|node_service| {
+                // TODO(Tsabary): consider wrapping this logic with a fn; more relevant once we're
+                // done transitioning to the new deployment mechanism.
+                node_service
+                    .get_components_in_service()
+                    .into_iter()
+                    .flat_map(|c| c.get_component_config_file_paths())
+                    .collect::<HashSet<_>>()
+                    .iter()
+                    .flat_map(|src| {
+                        let src_path = Path::new(src);
+                        // Read the app config file
+                        let mut contents = String::new();
+                        File::open(src_path).unwrap().read_to_string(&mut contents).unwrap();
+
+                        // Extract keys
+                        from_str::<Map<String, Value>>(&contents)
+                            .expect("JSON should be an object")
+                            .into_iter()
+                            .map(|(k, _)| k)
+                            .collect::<HashSet<_>>()
+                    })
+                    .collect::<HashSet<_>>()
+            })
+            .collect::<HashSet<_>>();
+
+        let replacer_keys: HashSet<String> =
+            KEYS_TO_BE_REPLACED.iter().copied().map(|item| item.to_string()).collect();
+
+        let unreplaced_keys: HashSet<String> =
+            replacer_keys.difference(&application_config_keys).cloned().collect();
+
+        assert!(
+            unreplaced_keys.is_empty(),
+            "Some replacer keys are not part of the config: {unreplaced_keys:#?}
+            \nPlease update 'KEYS_TO_BE_REPLACED'"
+        );
+    }
 }
 
-pub trait GetComponentConfigs {
-    // TODO(Tsabary): replace IndexMap with regular HashMap. Currently using IndexMap as the
-    // integration test relies on indices rather than service names.
-    fn get_component_configs(ports: Option<Vec<u16>>) -> IndexMap<NodeService, ComponentConfig>;
+fn replace_pred(key: &str, value: &Value) -> bool {
+    if KEYS_TO_BE_REPLACED.contains(key) {
+        return true;
+    }
+
+    // Condition 1: ports set by the infra: ".port" suffix and a non-zero integer value
+    let port_cond = key.ends_with(".port") && value.as_u64().map(|n| n != 0).unwrap_or(false);
+
+    // Condition 2: service urls: ".url" suffix and a non-localhost string value
+    let url_cond =
+        key.ends_with(".url") && value.as_str().map(|s| s != DEFAULT_URL).unwrap_or(false);
+
+    port_cond || url_cond
+}
+
+pub(crate) trait GetComponentConfigs: ServiceNameInner {
+    fn get_component_configs(ports: Option<Vec<u16>>) -> HashMap<NodeService, ComponentConfig>;
+
+    /// Returns a component execution config for a component that runs locally, and accepts inbound
+    /// connections from remote components.
+    fn component_config_for_local_service(&self, port: u16) -> ReactiveComponentExecutionConfig {
+        ReactiveComponentExecutionConfig::local_with_remote_enabled(
+            self.k8s_service_name(),
+            IpAddr::from(Ipv4Addr::UNSPECIFIED),
+            port,
+        )
+    }
+
+    /// Returns a component execution config for a component that is accessed remotely.
+    fn component_config_for_remote_service(&self, port: u16) -> ReactiveComponentExecutionConfig {
+        let idle_connections = self.get_scale_policy().idle_connections();
+        let retries = self.get_retries();
+        ReactiveComponentExecutionConfig::remote(
+            self.k8s_service_name(),
+            IpAddr::from(Ipv4Addr::UNSPECIFIED),
+            port,
+        )
+        .with_idle_connections(idle_connections)
+        .with_retries(retries)
+    }
+
+    fn component_config_pair(&self, port: u16) -> ComponentConfigPair {
+        ComponentConfigPair {
+            local: self.component_config_for_local_service(port),
+            remote: self.component_config_for_remote_service(port),
+        }
+    }
+}
+
+/// Component config bundling for node services: a config to run a component
+/// locally while being accessible to other remote components, and a suitable remote-access config
+/// to be used by such remotes.
+pub(crate) struct ComponentConfigPair {
+    local: ReactiveComponentExecutionConfig,
+    remote: ReactiveComponentExecutionConfig,
+}
+
+impl ComponentConfigPair {
+    pub(crate) fn local(&self) -> ReactiveComponentExecutionConfig {
+        self.local.clone()
+    }
+
+    pub(crate) fn remote(&self) -> ReactiveComponentExecutionConfig {
+        self.remote.clone()
+    }
 }
 
 impl Serialize for NodeService {
@@ -351,5 +691,47 @@ impl Serialize for NodeService {
             NodeService::Hybrid(inner) => inner.serialize(serializer),
             NodeService::Distributed(inner) => inner.serialize(serializer),
         }
+    }
+}
+
+// A helper struct for serializing the components config in the same hierarchy as of its
+// serialization as part of the entire config, i.e., by prepending "components.".
+#[derive(Clone, Debug, Default, Serialize)]
+struct ComponentConfigsSerializationWrapper {
+    component_config: ComponentConfig,
+    components_in_service: BTreeSet<ComponentConfigInService>,
+}
+
+impl ComponentConfigsSerializationWrapper {
+    fn new(
+        component_config: ComponentConfig,
+        components_in_service: BTreeSet<ComponentConfigInService>,
+    ) -> Self {
+        ComponentConfigsSerializationWrapper { component_config, components_in_service }
+    }
+}
+
+impl SerializeConfig for ComponentConfigsSerializationWrapper {
+    fn dump(&self) -> BTreeMap<ParamPath, SerializedParam> {
+        let mut map = prepend_sub_config_name(self.component_config.dump(), "components");
+        for component_config_in_service in ComponentConfigInService::iter() {
+            if component_config_in_service == ComponentConfigInService::General {
+                // General configs are not toggle-able, i.e., no need to add their existence to the
+                // service config.
+                continue;
+            }
+            let component_config_names = component_config_in_service.get_component_config_names();
+            let is_in_service = self.components_in_service.contains(&component_config_in_service);
+            for component_config_name in component_config_names {
+                let (param_path, serialized_param) = ser_param(
+                    &format!("{component_config_name}{FIELD_SEPARATOR}{IS_NONE_MARK}"),
+                    &!is_in_service, // Marking the config as None.
+                    "Placeholder description",
+                    ParamPrivacyInput::Public,
+                );
+                map.insert(param_path, serialized_param);
+            }
+        }
+        map
     }
 }

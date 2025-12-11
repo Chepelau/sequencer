@@ -6,28 +6,31 @@ use std::sync::LazyLock;
 use apollo_infra_utils::path::resolve_project_relative_path;
 use assert_matches::assert_matches;
 use blockifier_test_utils::cairo_versions::{CairoVersion, RunnableCairo1};
-use blockifier_test_utils::calldata::create_trivial_calldata;
+use blockifier_test_utils::calldata::{create_calldata, create_trivial_calldata};
 use blockifier_test_utils::contracts::FeatureContract;
-use papyrus_base_layer::ethereum_base_layer_contract::L1ToL2MessageArgs;
 use papyrus_base_layer::test_utils::DEFAULT_ANVIL_L1_ACCOUNT_ADDRESS;
 use starknet_api::abi::abi_utils::selector_from_name;
-use starknet_api::block::GasPrice;
 use starknet_api::core::{ClassHash, CompiledClassHash, ContractAddress, Nonce};
 use starknet_api::executable_transaction::{AccountTransaction, DeclareTransaction};
-use starknet_api::execution_resources::GasAmount;
 use starknet_api::hash::StarkHash;
 use starknet_api::rpc_transaction::RpcTransaction;
 use starknet_api::state::SierraContractClass;
 use starknet_api::test_utils::declare::rpc_declare_tx;
 use starknet_api::test_utils::deploy_account::rpc_deploy_account_tx;
-use starknet_api::test_utils::invoke::{rpc_invoke_tx, InvokeTxArgs};
-use starknet_api::test_utils::{NonceManager, TEST_ERC20_CONTRACT_ADDRESS2};
+use starknet_api::test_utils::invoke::{
+    executable_invoke_tx as starknet_api_executable_invoke_tx,
+    rpc_invoke_tx,
+    InvokeTxArgs,
+};
+use starknet_api::test_utils::{
+    valid_resource_bounds_for_testing,
+    NonceManager,
+    TEST_ERC20_CONTRACT_ADDRESS2,
+};
 use starknet_api::transaction::constants::TRANSFER_ENTRY_POINT_NAME;
 use starknet_api::transaction::fields::{
-    AllResourceBounds,
+    Calldata,
     ContractAddressSalt,
-    Fee,
-    ResourceBounds,
     Tip,
     TransactionSignature,
     ValidResourceBounds,
@@ -45,39 +48,7 @@ use starknet_types_core::felt::Felt;
 
 use crate::{COMPILED_CLASS_HASH_OF_CONTRACT_CLASS, CONTRACT_CLASS_FILE, TEST_FILES_FOLDER};
 
-pub const VALID_L1_GAS_MAX_AMOUNT: u64 = 203484;
-pub const VALID_L1_GAS_MAX_PRICE_PER_UNIT: u128 = 100000000000000;
-pub const VALID_L2_GAS_MAX_AMOUNT: u64 = 500000 * 200000; // Enough to declare the test class.
-pub const VALID_L2_GAS_MAX_PRICE_PER_UNIT: u128 = 100000000000000;
-pub const VALID_L1_DATA_GAS_MAX_AMOUNT: u64 = 203484;
-pub const VALID_L1_DATA_GAS_MAX_PRICE_PER_UNIT: u128 = 100000000000000;
-#[allow(clippy::as_conversions)]
-pub const VALID_ACCOUNT_BALANCE: Fee =
-    Fee(VALID_L2_GAS_MAX_AMOUNT as u128 * VALID_L2_GAS_MAX_PRICE_PER_UNIT * 1000);
-
 // Utils.
-
-// TODO(Noam): Merge this into test_valid_resource_bounds
-pub fn test_resource_bounds_mapping() -> AllResourceBounds {
-    AllResourceBounds {
-        l1_gas: ResourceBounds {
-            max_amount: GasAmount(VALID_L1_GAS_MAX_AMOUNT),
-            max_price_per_unit: GasPrice(VALID_L1_GAS_MAX_PRICE_PER_UNIT),
-        },
-        l2_gas: ResourceBounds {
-            max_amount: GasAmount(VALID_L2_GAS_MAX_AMOUNT),
-            max_price_per_unit: GasPrice(VALID_L2_GAS_MAX_PRICE_PER_UNIT),
-        },
-        l1_data_gas: ResourceBounds {
-            max_amount: GasAmount(VALID_L1_DATA_GAS_MAX_AMOUNT),
-            max_price_per_unit: GasPrice(VALID_L1_DATA_GAS_MAX_PRICE_PER_UNIT),
-        },
-    }
-}
-
-pub fn test_valid_resource_bounds() -> ValidResourceBounds {
-    ValidResourceBounds::AllResources(test_resource_bounds_mapping())
-}
 
 /// Get the contract class used for testing.
 pub fn contract_class() -> SierraContractClass {
@@ -103,7 +74,7 @@ pub fn declare_tx() -> RpcTransaction {
         declare_tx_args!(
             signature: TransactionSignature(vec![Felt::ZERO].into()),
             sender_address: account_address,
-            resource_bounds: test_valid_resource_bounds(),
+            resource_bounds: valid_resource_bounds_for_testing(),
             nonce,
             compiled_class_hash: compiled_class_hash
         ),
@@ -119,12 +90,13 @@ pub fn invoke_tx(cairo_version: CairoVersion) -> RpcTransaction {
     let account_contract = FeatureContract::AccountWithoutValidations(cairo_version);
     let sender_address = account_contract.get_instance_address(0);
     let mut nonce_manager = NonceManager::default();
+    let calldata = create_trivial_calldata(test_contract.get_instance_address(0));
 
     rpc_invoke_tx(invoke_tx_args!(
-        resource_bounds: test_valid_resource_bounds(),
+        resource_bounds: valid_resource_bounds_for_testing(),
         nonce : nonce_manager.next(sender_address),
         sender_address,
-        calldata: create_trivial_calldata(test_contract.get_instance_address(0))
+        calldata,
     ))
 }
 
@@ -133,7 +105,7 @@ pub fn executable_invoke_tx(cairo_version: CairoVersion) -> AccountTransaction {
 
     let mut tx_generator = MultiAccountTransactionGenerator::new();
     tx_generator.register_deployed_account(default_account);
-    tx_generator.account_with_id_mut(0).generate_executable_invoke()
+    tx_generator.account_with_id_mut(0).generate_trivial_executable_invoke_tx()
 }
 
 pub fn deploy_account_tx() -> RpcTransaction {
@@ -149,7 +121,7 @@ pub fn generate_deploy_account_with_salt(
 ) -> RpcTransaction {
     let deploy_account_args = deploy_account_tx_args!(
         class_hash: account.get_class_hash(),
-        resource_bounds: test_valid_resource_bounds(),
+        resource_bounds: valid_resource_bounds_for_testing(),
         contract_address_salt
     );
 
@@ -162,34 +134,34 @@ pub type AccountId = usize;
 
 type SharedNonceManager = Rc<RefCell<NonceManager>>;
 
+#[derive(Debug, Default)]
 struct L1HandlerTransactionGenerator {
-    // The L1 nonce for the next created L1 handler transaction.
-    l1_tx_nonce: u64,
-}
-
-impl Default for L1HandlerTransactionGenerator {
-    /// The Anvil instance is spawned with a nonce of 1 for the account [Self::L1_ACCOUNT_ADDRESS].
-    fn default() -> Self {
-        Self { l1_tx_nonce: 1 }
-    }
+    n_generated_txs: usize,
 }
 
 impl L1HandlerTransactionGenerator {
     const L1_ACCOUNT_ADDRESS: StarkHash = DEFAULT_ANVIL_L1_ACCOUNT_ADDRESS;
 
-    /// Creates an L1 handler transaction calling the "l1_handler_set_value" entry point in
+    /// Creates an L1 handler transaction calling either "l1_handler_set_value" or
+    /// "l1_handler_set_value_and_revert" entry point in
     /// [TestContract](FeatureContract::TestContract).
-    fn create_l1_to_l2_message_args(&mut self) -> L1ToL2MessageArgs {
-        let l1_tx_nonce = self.l1_tx_nonce;
-        self.l1_tx_nonce += 1;
+    fn create_l1_to_l2_message_args(&mut self, should_revert: bool) -> L1HandlerTransaction {
+        self.n_generated_txs += 1;
+
         // TODO(Arni): Get test contract from test setup.
         let test_contract =
             FeatureContract::TestContract(CairoVersion::Cairo1(RunnableCairo1::Casm));
 
-        let l1_handler_tx = L1HandlerTransaction {
+        // TODO(Arni): Consider saving this value as a lazy constant.
+        let entry_point_selector = if should_revert {
+            selector_from_name("l1_handler_set_value_and_revert")
+        } else {
+            selector_from_name("l1_handler_set_value")
+        };
+
+        L1HandlerTransaction {
             contract_address: test_contract.get_instance_address(0),
-            // TODO(Arni): Consider saving this value as a lazy constant.
-            entry_point_selector: selector_from_name("l1_handler_set_value"),
+            entry_point_selector,
             calldata: calldata![
                 Self::L1_ACCOUNT_ADDRESS,
                 // Arbitrary key and value.
@@ -197,13 +169,7 @@ impl L1HandlerTransactionGenerator {
                 felt!("0x44")   // value
             ],
             ..Default::default()
-        };
-
-        L1ToL2MessageArgs { tx: l1_handler_tx, l1_tx_nonce }
-    }
-
-    fn n_generated_txs(&self) -> u64 {
-        self.l1_tx_nonce - 1
+        }
     }
 }
 
@@ -237,9 +203,12 @@ impl L1HandlerTransactionGenerator {
 /// tx_generator.register_deployed_account(some_account_type.clone());
 /// tx_generator.register_deployed_account(some_account_type.clone());
 ///
-/// let account_0_tx_with_nonce_0 = tx_generator.account_with_id_mut(0).generate_invoke_with_tip(1);
-/// let account_1_tx_with_nonce_0 = tx_generator.account_with_id_mut(1).generate_invoke_with_tip(3);
-/// let account_0_tx_with_nonce_1 = tx_generator.account_with_id_mut(0).generate_invoke_with_tip(1);
+/// let account_0_tx_with_nonce_0 =
+///     tx_generator.account_with_id_mut(0).generate_trivial_rpc_invoke_tx(1);
+/// let account_1_tx_with_nonce_0 =
+///     tx_generator.account_with_id_mut(1).generate_trivial_rpc_invoke_tx(3);
+/// let account_0_tx_with_nonce_1 =
+///     tx_generator.account_with_id_mut(0).generate_trivial_rpc_invoke_tx(1);
 ///
 /// // Initialize an undeployed account.
 /// let salt = ContractAddressSalt(123_u64.into());
@@ -278,8 +247,9 @@ impl MultiAccountTransactionGenerator {
                 contract_address_salt: tx_gen.contract_address_salt,
             })
             .collect();
-        let l1_handler_tx_generator =
-            L1HandlerTransactionGenerator { l1_tx_nonce: self.l1_handler_tx_generator.l1_tx_nonce };
+        let l1_handler_tx_generator = L1HandlerTransactionGenerator {
+            n_generated_txs: self.l1_handler_tx_generator.n_generated_txs,
+        };
 
         Self { account_tx_generators, nonce_manager, l1_handler_tx_generator }
     }
@@ -361,15 +331,12 @@ impl MultiAccountTransactionGenerator {
             .collect()
     }
 
-    pub fn create_l1_to_l2_message_args(&mut self) -> L1ToL2MessageArgs {
-        self.l1_handler_tx_generator.create_l1_to_l2_message_args()
+    pub fn create_l1_to_l2_message_args(&mut self, should_revert: bool) -> L1HandlerTransaction {
+        self.l1_handler_tx_generator.create_l1_to_l2_message_args(should_revert)
     }
 
     pub fn n_l1_txs(&self) -> usize {
-        self.l1_handler_tx_generator
-            .n_generated_txs()
-            .try_into()
-            .expect("Failed to convert nonce to usize")
+        self.l1_handler_tx_generator.n_generated_txs
     }
 }
 
@@ -388,52 +355,111 @@ pub struct AccountTransactionGenerator {
 }
 
 impl AccountTransactionGenerator {
+    const TIP_FOR_TESTING: Tip = Tip(1);
+
     pub fn is_deployed(&self) -> bool {
         self.nonce_manager.borrow().get(self.sender_address()) != nonce!(0)
     }
 
-    /// Generate a valid `RpcTransaction` with default parameters.
-    pub fn generate_invoke_with_tip(&mut self, tip: u64) -> RpcTransaction {
+    pub fn build_invoke_tx_args(&mut self) -> InvokeTxArgs {
         assert!(
             self.is_deployed(),
             "Cannot invoke on behalf of an undeployed account: the first transaction of every \
              account must be a deploy account transaction."
         );
-        let nonce = self.next_nonce();
-        let invoke_args = invoke_tx_args!(
-            nonce,
-            tip : Tip(tip),
-            sender_address: self.sender_address(),
-            resource_bounds: test_valid_resource_bounds(),
-            calldata: create_trivial_calldata(self.sender_address()),
-        );
-        rpc_invoke_tx(invoke_args)
+        InvokeTxArgs::default()
+            .sender_address(self.sender_address())
+            .tip(Self::TIP_FOR_TESTING)
+            .nonce(self.next_nonce())
+            .resource_bounds(valid_resource_bounds_for_testing())
     }
 
-    pub fn generate_executable_invoke(&mut self) -> AccountTransaction {
-        assert!(
-            self.is_deployed(),
-            "Cannot invoke on behalf of an undeployed account: the first transaction of every \
-             account must be a deploy account transaction."
+    pub fn generate_trivial_rpc_invoke_tx(&mut self, tip: u64) -> RpcTransaction {
+        let test_contract = FeatureContract::TestContract(self.account.cairo_version());
+        let calldata = create_trivial_calldata(test_contract.get_instance_address(0));
+        rpc_invoke_tx(self.build_invoke_tx_args().tip(Tip(tip)).calldata(calldata))
+    }
+
+    fn generate_nested_call_invoke_tx(
+        &mut self,
+        outer_test_contract: &FeatureContract,
+        inner_contract_pointer: &Felt,
+        outer_fn_name: &str,
+        inner_fn_name: &str,
+        inner_fn_args: &[Felt],
+    ) -> RpcTransaction {
+        let mut inner_calldata_args =
+            vec![*inner_contract_pointer, selector_from_name(inner_fn_name).0];
+        inner_calldata_args.extend_from_slice(inner_fn_args);
+        let inner_calldata = Calldata(inner_calldata_args.into());
+
+        let calldata = create_calldata(
+            outer_test_contract.get_instance_address(0),
+            outer_fn_name,
+            &inner_calldata.0,
         );
+        rpc_invoke_tx(self.build_invoke_tx_args().calldata(calldata))
+    }
+
+    pub fn generate_library_call_invoke_tx(
+        &mut self,
+        outer_contract: &FeatureContract,
+        inner_contract: &FeatureContract,
+        fn_name: &str,
+        fn_args: &[Felt],
+    ) -> RpcTransaction {
+        self.generate_nested_call_invoke_tx(
+            outer_contract,
+            &inner_contract.get_class_hash().0,
+            "test_library_call",
+            fn_name,
+            fn_args,
+        )
+    }
+
+    pub fn generate_call_contract_invoke_tx(
+        &mut self,
+        outer_contract: &FeatureContract,
+        inner_contract: &ContractAddress,
+        fn_name: &str,
+        fn_args: &[Felt],
+    ) -> RpcTransaction {
+        self.generate_nested_call_invoke_tx(
+            outer_contract,
+            inner_contract.0.key(),
+            "test_call_contract",
+            fn_name,
+            fn_args,
+        )
+    }
+
+    pub fn generate_rpc_declare_tx(
+        &mut self,
+        compiled_class_hash: CompiledClassHash,
+        contract_class: SierraContractClass,
+    ) -> RpcTransaction {
         let nonce = self.next_nonce();
-
-        let invoke_args = invoke_tx_args!(
+        let declare_args = declare_tx_args!(
             sender_address: self.sender_address(),
-            resource_bounds: test_valid_resource_bounds(),
+            resource_bounds: valid_resource_bounds_for_testing(),
             nonce,
-            calldata: create_trivial_calldata(self.sender_address()),
+            compiled_class_hash,
         );
+        rpc_declare_tx(declare_args, contract_class)
+    }
 
-        starknet_api::test_utils::invoke::executable_invoke_tx(invoke_args)
+    pub fn generate_trivial_executable_invoke_tx(&mut self) -> AccountTransaction {
+        let test_contract = FeatureContract::TestContract(self.account.cairo_version());
+        let calldata = create_trivial_calldata(test_contract.get_instance_address(0));
+        starknet_api_executable_invoke_tx(self.build_invoke_tx_args().calldata(calldata))
     }
 
     /// Generates an `RpcTransaction` with fully custom parameters.
     ///
     /// Caller must manually handle bumping nonce and fetching the correct sender address via
     /// [AccountTransactionGenerator::next_nonce] and [AccountTransactionGenerator::sender_address].
-    /// See [AccountTransactionGenerator::generate_invoke_with_tip] to have these filled up by
-    /// default.
+    /// See [AccountTransactionGenerator::generate_trivial_rpc_invoke_tx] to have these
+    /// filled up by default.
     ///
     /// Note: This is a best effort attempt to make the API more useful; amend or add new methods
     /// as needed.
@@ -457,7 +483,7 @@ impl AccountTransactionGenerator {
 
         let invoke_args = invoke_tx_args!(
             sender_address: self.sender_address(),
-            resource_bounds: test_valid_resource_bounds(),
+            resource_bounds: valid_resource_bounds_for_testing(),
             nonce,
             calldata
         );
@@ -475,23 +501,17 @@ impl AccountTransactionGenerator {
         assert_eq!(nonce, nonce!(0), "The deploy account tx should have nonce 0.");
         let deploy_account_args = deploy_account_tx_args!(
             class_hash: self.account.class_hash(),
-            resource_bounds: test_valid_resource_bounds(),
+            resource_bounds: valid_resource_bounds_for_testing(),
             contract_address_salt: ContractAddressSalt(self.contract_address_salt.0)
         );
         rpc_deploy_account_tx(deploy_account_args)
     }
 
-    pub fn generate_declare(&mut self) -> RpcTransaction {
-        let nonce = self.next_nonce();
-        let declare_args = declare_tx_args!(
-            signature: TransactionSignature(vec![Felt::ZERO].into()),
-            sender_address: self.sender_address(),
-            resource_bounds: test_valid_resource_bounds(),
-            nonce,
-            compiled_class_hash: *COMPILED_CLASS_HASH,
-        );
-        let contract_class = contract_class();
-        rpc_declare_tx(declare_args, contract_class)
+    /// Generates a declare transaction for the ContractClass in contract_class.cairo file.
+    /// TODO(Itamar): Rename contract_class.json, research and if it's possible than delete
+    /// contract_class.json and use empty contract instead.
+    pub fn generate_declare_of_contract_class(&mut self) -> RpcTransaction {
+        self.generate_rpc_declare_tx(*COMPILED_CLASS_HASH, contract_class())
     }
 
     pub fn sender_address(&self) -> ContractAddress {

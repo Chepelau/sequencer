@@ -1,5 +1,13 @@
+use std::collections::HashSet;
+use std::fmt;
+
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
+use strum_macros::EnumIter;
+
+pub(crate) const PENDING_DURATION_DEFAULT: &str = "30s";
+pub(crate) const EVALUATION_INTERVAL_SEC_DEFAULT: u64 = 30;
+pub(crate) const SECS_IN_MIN: u64 = 60;
 
 /// Alerts to be configured in the dashboard.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -8,35 +16,71 @@ pub struct Alerts {
 }
 
 impl Alerts {
-    pub(crate) const fn new(alerts: Vec<Alert>) -> Self {
-        Self { alerts }
+    pub(crate) fn new(alerts: Vec<Alert>, alert_env_filtering: AlertEnvFiltering) -> Self {
+        let filtered_alerts: Vec<Alert> = alerts
+            .into_iter()
+            .filter(|alert| alert.alert_env_filtering.matches(&alert_env_filtering))
+            .collect();
+        let mut alert_names: HashSet<&str> = HashSet::new();
+
+        for alert in &filtered_alerts {
+            if !alert_names.insert(alert.name.as_str()) {
+                panic!(
+                    "Duplicate alert name found: {} for env: {}",
+                    alert.name, alert.alert_env_filtering
+                );
+            }
+        }
+        Self { alerts: filtered_alerts }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, EnumIter)]
+pub enum AlertEnvFiltering {
+    All,
+    MainnetStyleAlerts,
+    TestnetStyleAlerts,
+}
+
+impl AlertEnvFiltering {
+    pub fn matches(&self, target: &AlertEnvFiltering) -> bool {
+        self == target || *self == AlertEnvFiltering::All
+    }
+}
+
+impl fmt::Display for AlertEnvFiltering {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            AlertEnvFiltering::All => {
+                unreachable!()
+            } // This variant is used for internal logic and should not be displayed.
+            AlertEnvFiltering::MainnetStyleAlerts => "mainnet",
+            AlertEnvFiltering::TestnetStyleAlerts => "testnet",
+        };
+        write!(f, "{s}")
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) enum AlertSeverity {
-    // Critical issues that demand immediate attention. These are high-impact incidents that
-    // affect the system's availability.
+    /// Critical issues that demand immediate attention. These are high-impact incidents that
+    /// affect the system's availability.
     #[serde(rename = "p1")]
-    // TODO(Tsabary): currently the `Sos` variant is used only in tests, and removing the
-    // `#[cfg(test)]` attribute results in a compilation error. When needed in non-test setup,
-    // remove the attribute.
-    #[cfg(test)]
     Sos,
-    // Standard alerts for production issues that require attention around the clock but are not
-    // as time-sensitive as SOS alerts.
+    /// Standard alerts for production issues that require attention around the clock but are not
+    /// as time-sensitive as SOS alerts.
     #[serde(rename = "p2")]
     Regular,
-    // Important alerts that do not require overnight attention. These are delayed during night
-    // hours to reduce unnecessary off-hours noise.
+    /// Important alerts that do not require overnight attention. These are delayed during night
+    /// hours to reduce unnecessary off-hours noise.
     #[serde(rename = "p3")]
     DayOnly,
-    // Alerts that are only triggered during official business hours. These do not trigger during
-    // holidays.
+    /// Alerts that are only triggered during official business hours. These do not trigger during
+    /// holidays.
     #[serde(rename = "p4")]
     WorkingHours,
-    // Non-critical alerts, meant purely for information. These are not intended to wake anyone up
-    // and are monitored only by the development team.
+    /// Non-critical alerts, meant purely for information. These are not intended to wake anyone up
+    /// and are monitored only by the development team.
     #[serde(rename = "p5")]
     Informational,
 }
@@ -113,6 +157,7 @@ pub(crate) enum AlertGroup {
     Batcher,
     Consensus,
     Gateway,
+    General,
     HttpServer,
     L1GasPrice,
     L1Messages,
@@ -124,22 +169,73 @@ pub(crate) enum AlertGroup {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct Alert {
     // The name of the alert.
-    pub(crate) name: &'static str,
+    name: String,
     // The title that will be displayed.
-    pub(crate) title: &'static str,
+    title: String,
     // The group that the alert will be displayed under.
     #[serde(rename = "ruleGroup")]
-    pub(crate) alert_group: AlertGroup,
+    alert_group: AlertGroup,
     // The expression to evaluate for the alert.
-    pub(crate) expr: String,
+    expr: String,
     // The conditions that must be met for the alert to be triggered.
-    pub(crate) conditions: &'static [AlertCondition],
+    conditions: Vec<AlertCondition>,
     // The time duration for which the alert conditions must be true before an alert is triggered.
     #[serde(rename = "for")]
-    pub(crate) pending_duration: &'static str,
+    pending_duration: String,
     // The interval in sec between evaluations of the alert.
     #[serde(rename = "intervalSec")]
-    pub(crate) evaluation_interval_sec: u64,
+    evaluation_interval_sec: u64,
     // The severity level of the alert.
-    pub(crate) severity: AlertSeverity,
+    severity: AlertSeverity,
+    // Indicates if relevant for observer nodes.
+    observer_applicable: ObserverApplicability,
+    #[serde(skip)]
+    alert_env_filtering: AlertEnvFiltering,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ObserverApplicability {
+    Applicable,
+    NotApplicable,
+}
+
+impl Serialize for ObserverApplicability {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            ObserverApplicability::Applicable => serializer.serialize_str("true"),
+            ObserverApplicability::NotApplicable => serializer.serialize_str("false"),
+        }
+    }
+}
+
+impl Alert {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        name: impl ToString,
+        title: impl ToString,
+        alert_group: AlertGroup,
+        expr: impl ToString,
+        conditions: Vec<AlertCondition>,
+        pending_duration: impl ToString,
+        evaluation_interval_sec: u64,
+        severity: AlertSeverity,
+        observer_applicable: ObserverApplicability,
+        alert_env_filtering: AlertEnvFiltering,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            title: title.to_string(),
+            alert_group,
+            expr: expr.to_string(),
+            conditions,
+            pending_duration: pending_duration.to_string(),
+            evaluation_interval_sec,
+            severity,
+            observer_applicable,
+            alert_env_filtering,
+        }
+    }
 }

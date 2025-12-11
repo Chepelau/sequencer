@@ -7,12 +7,16 @@ use apollo_l1_endpoint_monitor_types::{
 };
 use async_trait::async_trait;
 use starknet_api::block::BlockHashAndNumber;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info};
 use url::Url;
 
 use crate::ethereum_base_layer_contract::EthereumBaseLayerContract;
 use crate::{BaseLayerContract, L1BlockHeader, L1BlockNumber, L1BlockReference, L1Event};
+
+#[cfg(test)]
+#[path = "monitored_base_layer_test.rs"]
+pub mod monitored_base_layer_test;
 
 pub type MonitoredEthereumBaseLayer = MonitoredBaseLayer<EthereumBaseLayerContract>;
 
@@ -20,26 +24,25 @@ pub type MonitoredEthereumBaseLayer = MonitoredBaseLayer<EthereumBaseLayerContra
 // largely immutable API.
 pub struct MonitoredBaseLayer<B: BaseLayerContract + Send + Sync> {
     pub monitor: SharedL1EndpointMonitorClient,
-    current_node_url: Mutex<Url>,
+    current_node_url: RwLock<Url>,
     base_layer: Mutex<B>,
 }
 
 impl<B: BaseLayerContract + Send + Sync> MonitoredBaseLayer<B> {
-    pub fn new(
+    pub async fn new(
         base_layer: B,
         l1_endpoint_monitor_client: SharedL1EndpointMonitorClient,
-        initial_node_url: Url,
     ) -> Self {
         MonitoredBaseLayer {
+            current_node_url: RwLock::new(base_layer.get_url().await.unwrap()),
             base_layer: Mutex::new(base_layer),
             monitor: l1_endpoint_monitor_client,
-            current_node_url: Mutex::new(initial_node_url),
         }
     }
 
     /// Returns a guard to the inner base layer, wrapped in order to hide the inner Mutex type.
     async fn get(&self) -> Result<BaseLayerGuard<'_, B>, MonitoredBaseLayerError<B>> {
-        self.ensure_operational().await.unwrap();
+        self.ensure_operational().await?;
         Ok(BaseLayerGuard { inner: self.base_layer.lock().await })
     }
 
@@ -49,13 +52,17 @@ impl<B: BaseLayerContract + Send + Sync> MonitoredBaseLayer<B> {
     /// of an external HTTP call.
     async fn ensure_operational(&self) -> Result<(), MonitoredBaseLayerError<B>> {
         let active_l1_endpoint = self.monitor.get_active_l1_endpoint().await;
+        let current_node_url;
+        {
+            current_node_url = self.current_node_url.read().await.clone();
+        } // Drop the read lock
         match active_l1_endpoint {
-            Ok(new_node_url) if new_node_url != *self.current_node_url.lock().await => {
+            Ok(new_node_url) if new_node_url != current_node_url => {
                 info!(
                     "L1 endpoint {} is no longer operational, switching to new operational L1 \
                      endpoint: {}",
-                    self.current_node_url.lock().await,
-                    &new_node_url
+                    to_safe_string(&current_node_url),
+                    to_safe_string(&new_node_url)
                 );
 
                 let mut base_layer = self.base_layer.lock().await;
@@ -64,7 +71,7 @@ impl<B: BaseLayerContract + Send + Sync> MonitoredBaseLayer<B> {
                     .await
                     .map_err(|err| MonitoredBaseLayerError::BaseLayerContractError(err))?;
 
-                *self.current_node_url.lock().await = new_node_url;
+                *self.current_node_url.write().await = new_node_url;
             }
             Ok(_) => (), // Noop; the current node URL is still operational.
             Err(L1EndpointMonitorClientError::L1EndpointMonitorError(err)) => Err(err)?,
@@ -93,35 +100,10 @@ impl<B: BaseLayerContract + Send + Sync> BaseLayerContract for MonitoredBaseLaye
             .map_err(|err| MonitoredBaseLayerError::BaseLayerContractError(err))
     }
 
-    async fn latest_proved_block(
-        &self,
-        finality: u64,
-    ) -> Result<Option<BlockHashAndNumber>, Self::Error> {
+    async fn latest_l1_block_number(&self) -> Result<L1BlockNumber, Self::Error> {
         self.get()
             .await?
-            .latest_proved_block(finality)
-            .await
-            .map_err(|err| MonitoredBaseLayerError::BaseLayerContractError(err))
-    }
-
-    async fn latest_l1_block_number(
-        &self,
-        finality: u64,
-    ) -> Result<Option<L1BlockNumber>, Self::Error> {
-        self.get()
-            .await?
-            .latest_l1_block_number(finality)
-            .await
-            .map_err(|err| MonitoredBaseLayerError::BaseLayerContractError(err))
-    }
-
-    async fn latest_l1_block(
-        &self,
-        finality: u64,
-    ) -> Result<Option<L1BlockReference>, Self::Error> {
-        self.get()
-            .await?
-            .latest_l1_block(finality)
+            .latest_l1_block_number()
             .await
             .map_err(|err| MonitoredBaseLayerError::BaseLayerContractError(err))
     }
@@ -158,6 +140,10 @@ impl<B: BaseLayerContract + Send + Sync> BaseLayerContract for MonitoredBaseLaye
             .get_block_header(block_number)
             .await
             .map_err(|err| MonitoredBaseLayerError::BaseLayerContractError(err))
+    }
+
+    async fn get_url(&self) -> Result<Url, Self::Error> {
+        Ok(self.current_node_url.read().await.clone())
     }
 
     async fn set_provider_url(&mut self, url: Url) -> Result<(), Self::Error> {
@@ -222,8 +208,15 @@ impl<B: BaseLayerContract + Send + Sync> PartialEq for MonitoredBaseLayerError<B
 impl<B: BaseLayerContract + Send + Sync> std::fmt::Debug for MonitoredBaseLayerError<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MonitoredBaseLayerError::L1EndpointMonitorError(err) => write!(f, "{:?}", err),
-            MonitoredBaseLayerError::BaseLayerContractError(err) => write!(f, "{:?}", err),
+            MonitoredBaseLayerError::L1EndpointMonitorError(err) => write!(f, "{err:?}"),
+            MonitoredBaseLayerError::BaseLayerContractError(err) => write!(f, "{err:?}"),
         }
     }
+}
+
+// TODO(guyn): this is duplicated code from apollo_l1_endpoint_monitor/src/monitor.rs
+// TODO(guyn): when it is moved to apollo_infra_utils, we should import it instead.
+fn to_safe_string(url: &Url) -> String {
+    // We print only the hostnames to avoid leaking the API keys.
+    url.host().map_or_else(|| "no host in url!".to_string(), |host| host.to_string())
 }

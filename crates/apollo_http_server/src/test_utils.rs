@@ -3,17 +3,15 @@ use std::sync::Arc;
 
 use apollo_gateway_types::communication::MockGatewayClient;
 use apollo_gateway_types::gateway_types::GatewayOutput;
+use apollo_http_server_config::config::HttpServerConfig;
 use apollo_infra_utils::test_utils::{AvailablePorts, TestIdentifier};
-use axum::body::Body;
 use blockifier_test_utils::cairo_versions::CairoVersion;
-use hyper::StatusCode;
 use mempool_test_utils::starknet_api_test_utils::{declare_tx, deploy_account_tx, invoke_tx};
-use reqwest::{Client, Response};
+use reqwest::{Body, Client, Response, StatusCode};
 use serde::Serialize;
 use starknet_api::rpc_transaction::RpcTransaction;
 use starknet_api::transaction::TransactionHash;
 
-use crate::config::HttpServerConfig;
 use crate::deprecated_gateway_transaction::DeprecatedGatewayTransactionV3;
 use crate::http_server::HttpServer;
 
@@ -32,10 +30,11 @@ impl HttpTestClient {
     // TODO(Yael): add a check for the response content, for all GatewayOutput types.
     pub async fn assert_add_tx_success(&self, tx: impl GatewayTransaction) -> TransactionHash {
         let response = self.add_tx(tx).await;
-        assert!(response.status().is_success(), "{:?}", response.status());
+        let status_code = response.status();
         let text = response.text().await.unwrap();
+        assert!(status_code.is_success(), "{status_code:?}, {text}");
         let response: GatewayOutput = serde_json::from_str(&text)
-            .unwrap_or_else(|_| panic!("Gateway responded with: {}", text));
+            .unwrap_or_else(|_| panic!("Gateway responded with: {text}"));
         response.transaction_hash()
     }
 

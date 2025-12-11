@@ -71,7 +71,7 @@ fn positive_flow(runnable_version: RunnableCairo1) {
             l2_to_l1_messages: [],
             cairo_native: false,
             failed: false,
-            gas_consumed: 34580,
+            gas_consumed: 33010,
         }
     "#]]
     .assert_debug_eq(&call_info.execution);
@@ -140,7 +140,6 @@ fn event_number_exceeds_limit(runnable_version: RunnableCairo1) {
     assert!(error_message.contains(&expected_error.to_string()));
 }
 
-#[allow(clippy::result_large_err)]
 fn emit_events(
     test_contract: FeatureContract,
     n_emitted_events: &[Felt],

@@ -5,16 +5,15 @@ This script is meant to run a subset of the presubmit checks, the ones whose run
 It can be used to run these checks locally or part of the CI.
 """
 
+import argparse
 from abc import ABC, abstractmethod
 from enum import Enum
 from os import path
-from named_todos import enforce_named_todos
-from run_tests import run_test, BaseCommand
 from typing import TypeVar
-from utils import run_command
 
-import argparse
-import subprocess
+from named_todos import enforce_named_todos
+from run_tests import BaseCommand, run_test
+from utils import run_command
 
 SCRIPTS_LOCATION = path.dirname(__file__)
 
@@ -28,14 +27,10 @@ class PresubmitArg(Enum):
         "The commit hash of the top change, i.e. the most recent commit to be checked."
     )
 
-    EXTRA_RUST_TOOLCHAINS = (
-        "Extra rust toolchains to use. Required for the rust formatting checks."
-    )
+    EXTRA_RUST_TOOLCHAINS = "Extra rust toolchains to use. Required for the rust formatting checks."
 
     def add_args(self, parser: argparse.ArgumentParser):
-        parser.add_argument(
-            f"--{self.name.lower()}", required=True, type=str, help=self.value
-        )
+        parser.add_argument(f"--{self.name.lower()}", required=True, type=str, help=self.value)
 
 
 class Check(ABC):
@@ -81,9 +76,7 @@ class ExternalCommandCheck(Check):
 
     def run_check(self):
         for cmd in self.commands:
-            run_command(
-                command=" ".join(cmd), allow_error=False, print_output_on_error=True
-            )
+            run_command(command=" ".join(cmd), allow_error=False, print_output_on_error=True)
 
 
 class ClippyCheck(RunTestsCheck):
@@ -109,27 +102,6 @@ class DocCheck(RunTestsCheck):
 class GitSubmodulesCheck(ExternalCommandCheck):
     def __init__(self):
         super().__init__(commands=[["git", "submodule", "status"]])
-
-
-class CommitLintCheck(ExternalCommandCheck):
-    def __init__(self, from_commit_hash: str, to_commit_hash: str):
-        assert from_commit_hash, "from_commit_hash is required for commit lint check."
-        assert to_commit_hash, "to_commit_hash is required for commit lint check."
-        super().__init__(
-            commands=[
-                ["commitlint"] + ["--from", from_commit_hash] + ["--to", to_commit_hash]
-            ]
-        )
-
-    @classmethod
-    def required_args(cls: type[TCheck]) -> set[PresubmitArg]:
-        return {PresubmitArg.FROM_COMMIT_HASH, PresubmitArg.TO_COMMIT_HASH}
-
-    @classmethod
-    def from_args(cls, args: argparse.Namespace):
-        return CommitLintCheck(
-            from_commit_hash=args.from_commit_hash, to_commit_hash=args.to_commit_hash
-        )
 
 
 class TodosCheck(Check):
@@ -218,9 +190,7 @@ def parse_args(all_checks: dict[str, type[Check]]) -> argparse.Namespace:
     return parser.parse_args()
 
 
-def get_checks_to_run(
-    args: argparse.Namespace, all_checks: dict[str, type[Check]]
-) -> list[Check]:
+def get_checks_to_run(args: argparse.Namespace, all_checks: dict[str, type[Check]]) -> list[Check]:
     if args.command == "all":
         stages_to_run = all_checks.values()
     else:
@@ -235,7 +205,6 @@ def get_checks_to_run(
 
 def main():
     all_check_classes = [
-        CommitLintCheck,
         GitSubmodulesCheck,
         TodosCheck,
         CargoLockCheck,

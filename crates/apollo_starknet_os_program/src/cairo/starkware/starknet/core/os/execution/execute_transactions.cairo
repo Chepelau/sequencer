@@ -3,6 +3,7 @@ from starkware.cairo.common.bool import FALSE
 from starkware.cairo.common.builtin_poseidon.poseidon import poseidon_hash_many
 from starkware.cairo.common.cairo_builtins import (
     BitwiseBuiltin,
+    EcOpBuiltin,
     HashBuiltin,
     KeccakBuiltin,
     ModBuiltin,
@@ -114,7 +115,7 @@ func execute_transactions{
     range_check_ptr,
     ecdsa_ptr,
     bitwise_ptr: BitwiseBuiltin*,
-    ec_op_ptr,
+    ec_op_ptr: EcOpBuiltin*,
     keccak_ptr: KeccakBuiltin*,
     poseidon_ptr: PoseidonBuiltin*,
     range_check96_ptr: felt*,
@@ -130,7 +131,6 @@ func execute_transactions{
     // Prepare builtin pointers.
     let segment_arena_ptr = new_arena();
     let (sha256_ptr: Sha256ProcessBlock*) = alloc();
-    %{ syscall_handler.sha256_segment = ids.sha256_ptr %}
 
     let (__fp__, _) = get_fp_and_pc();
     local local_builtin_ptrs: BuiltinPointers = BuiltinPointers(
@@ -337,7 +337,7 @@ func charge_fee{
     assert_nn_le(calldata.amount.low, max_fee);
 
     // TODO(ilya, 01/01/2026): Consider caching the fee_token_class_hash.
-    local fee_token_address = block_context.starknet_os_config.fee_token_address;
+    local fee_token_address = block_context.os_global_context.starknet_os_config.fee_token_address;
     let (fee_state_entry: StateEntry*) = dict_read{dict_ptr=contract_state_changes}(
         key=fee_token_address
     );
@@ -387,7 +387,7 @@ func get_account_tx_common_fields(
         tx_hash_prefix=tx_hash_prefix,
         version=3,
         sender_address=sender_address,
-        chain_id=block_context.starknet_os_config.chain_id,
+        chain_id=block_context.os_global_context.starknet_os_config.chain_id,
         nonce=nondet %{ tx.nonce %},
         tip=nondet %{ tx.tip %},
         n_resource_bounds=3,
@@ -408,6 +408,8 @@ func fill_account_tx_info{range_check_ptr}(
     common_tx_fields: CommonTxFields*,
     account_deployment_data_size: felt,
     account_deployment_data: felt*,
+    proof_facts_size: felt,
+    proof_facts: felt*,
     tx_info_dst: TxInfo*,
     deprecated_tx_info_dst: DeprecatedTxInfo*,
 ) {
@@ -438,6 +440,8 @@ func fill_account_tx_info{range_check_ptr}(
         fee_data_availability_mode=common_tx_fields.fee_data_availability_mode,
         account_deployment_data_start=account_deployment_data,
         account_deployment_data_end=&account_deployment_data[account_deployment_data_size],
+        proof_facts_start=proof_facts,
+        proof_facts_end=&proof_facts[proof_facts_size],
     );
     fill_deprecated_tx_info(tx_info=tx_info_dst, dst=deprecated_tx_info_dst);
     assert_deprecated_tx_fields_consistency(tx_info=tx_info_dst);
@@ -479,6 +483,7 @@ func execute_invoke_function_transaction{
         nondet %{ segments.gen_arg(tx.account_deployment_data) %}, felt*
     );
     let poseidon_ptr = builtin_ptrs.selectable.poseidon;
+    // TODO(Meshi): use the invoke transaction proof facts once implemented.
     with poseidon_ptr {
         let transaction_hash = compute_invoke_transaction_hash(
             common_fields=common_tx_fields,
@@ -497,11 +502,14 @@ func execute_invoke_function_transaction{
 
     // Write the transaction info and complete the ExecutionInfo struct.
     tempvar tx_info = tx_execution_info.tx_info;
+    // TODO(Meshi): use the invoke transaction proof facts once implemented.
     fill_account_tx_info(
         transaction_hash=transaction_hash,
         common_tx_fields=common_tx_fields,
         account_deployment_data_size=account_deployment_data_size,
         account_deployment_data=account_deployment_data,
+        proof_facts_size=0,
+        proof_facts=cast(0, felt*),
         tx_info_dst=tx_info,
         deprecated_tx_info_dst=tx_execution_context.deprecated_tx_info,
     );
@@ -568,6 +576,15 @@ func execute_l1_handler_transaction{
 }(block_context: BlockContext*) {
     alloc_locals;
 
+    %{ execution_helper.start_tx() %}
+    // Skip the execution step for reverted transaction.
+    if (nondet %{ execution_helper.tx_execution_info.is_reverted %} != FALSE) {
+        %{ execution_helper.end_tx() %}
+        return ();
+    }
+
+    // TODO(Yoni): currently, the contract state is not fetched for reverted L1 handlers.
+    //   Once block hash is supported, we should fetch the contract state for them as well.
     let (local tx_execution_context: ExecutionContext*) = get_invoke_tx_execution_context(
         block_context=block_context,
         entry_point_type=ENTRY_POINT_TYPE_L1_HANDLER,
@@ -576,7 +593,7 @@ func execute_l1_handler_transaction{
     local tx_execution_info: ExecutionInfo* = tx_execution_context.execution_info;
 
     local nonce = nondet %{ tx.nonce %};
-    local chain_id = block_context.starknet_os_config.chain_id;
+    local chain_id = block_context.os_global_context.starknet_os_config.chain_id;
 
     let pedersen_ptr = builtin_ptrs.selectable.pedersen;
     with pedersen_ptr {
@@ -591,13 +608,6 @@ func execute_l1_handler_transaction{
             "Computed transaction_hash is inconsistent with the hash in the transaction. "
             f"Computed hash = {ids.transaction_hash}, Expected hash = {tx.hash_value}.")
     %}
-
-    %{ execution_helper.start_tx() %}
-    // Skip the execution step for reverted transaction.
-    if (nondet %{ execution_helper.tx_execution_info.is_reverted %} != FALSE) {
-        %{ execution_helper.end_tx() %}
-        return ();
-    }
 
     // Write the transaction info and complete the ExecutionInfo struct.
     tempvar tx_info = tx_execution_info.tx_info;
@@ -619,6 +629,8 @@ func execute_l1_handler_transaction{
         fee_data_availability_mode=0,
         account_deployment_data_start=cast(0, felt*),
         account_deployment_data_end=cast(0, felt*),
+        proof_facts_start=cast(0, felt*),
+        proof_facts_end=cast(0, felt*),
     );
     fill_deprecated_tx_info(tx_info=tx_info, dst=tx_execution_context.deprecated_tx_info);
     assert_deprecated_tx_fields_consistency(tx_info=tx_info);
@@ -815,6 +827,8 @@ func execute_deploy_account_transaction{
         common_tx_fields=common_tx_fields,
         account_deployment_data_size=0,
         account_deployment_data=cast(0, felt*),
+        proof_facts_size=0,
+        proof_facts=cast(0, felt*),
         tx_info_dst=tx_info,
         deprecated_tx_info_dst=deprecated_tx_info,
     );
@@ -957,6 +971,8 @@ func execute_declare_transaction{
         common_tx_fields=common_tx_fields,
         account_deployment_data_size=account_deployment_data_size,
         account_deployment_data=account_deployment_data,
+        proof_facts_size=0,
+        proof_facts=cast(0, felt*),
         tx_info_dst=tx_info,
         deprecated_tx_info_dst=deprecated_tx_info,
     );

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::fs::read_to_string;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -18,13 +18,16 @@ use crate::block::{
     GasPriceVector,
     GasPrices,
     NonzeroGasPrice,
+    StarknetVersion,
 };
 use crate::contract_address;
 use crate::contract_class::{ContractClass, SierraVersion};
 use crate::core::{ChainId, ContractAddress, Nonce};
+use crate::deprecated_contract_class::{ContractClass as DeprecatedContractClass, Program};
+use crate::executable_transaction::AccountTransaction;
 use crate::execution_resources::GasAmount;
 use crate::rpc_transaction::{InternalRpcTransaction, RpcTransaction};
-use crate::transaction::fields::Fee;
+use crate::transaction::fields::{AllResourceBounds, Fee, ResourceBounds, ValidResourceBounds};
 use crate::transaction::{Transaction, TransactionHash};
 
 pub mod declare;
@@ -58,11 +61,15 @@ pub fn path_in_resources<P: AsRef<Path>>(file_path: P) -> PathBuf {
 }
 
 /// Reads from the directory containing the manifest at run time, same as current working directory.
-pub fn read_json_file<P: AsRef<Path>>(path_in_resource_dir: P) -> serde_json::Value {
+pub fn read_json_file<P: AsRef<Path>, T>(path_in_resource_dir: P) -> T
+where
+    T: for<'a> serde::de::Deserialize<'a>,
+{
     let path = path_in_resources(path_in_resource_dir);
-    let json_str = read_to_string(path.to_str().unwrap())
-        .unwrap_or_else(|_| panic!("Failed to read file at path: {}", path.display()));
-    serde_json::from_str(&json_str).unwrap()
+    let file =
+        File::open(&path).unwrap_or_else(|_| panic!("Failed to open file at path: {path:?}"));
+    serde_json::from_reader(file)
+        .unwrap_or_else(|_| panic!("Failed to parse JSON from file at path: {path:?}"))
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -130,6 +137,18 @@ macro_rules! compiled_class_hash {
     };
 }
 
+pub const VALID_L1_GAS_MAX_AMOUNT: u64 = 203484;
+pub const VALID_L1_GAS_MAX_PRICE_PER_UNIT: u128 = 100000000000000;
+// Enough to declare the test class, but under the OS's upper limit.
+pub const VALID_L2_GAS_MAX_AMOUNT: u64 = 1_100_000_000;
+pub const VALID_L2_GAS_MAX_PRICE_PER_UNIT: u128 = 100000000000000;
+pub const VALID_L1_DATA_GAS_MAX_AMOUNT: u64 = 203484;
+pub const VALID_L1_DATA_GAS_MAX_PRICE_PER_UNIT: u128 = 100000000000000;
+
+#[allow(clippy::as_conversions)]
+pub const VALID_ACCOUNT_BALANCE: Fee =
+    Fee(VALID_L2_GAS_MAX_AMOUNT as u128 * VALID_L2_GAS_MAX_PRICE_PER_UNIT * 1000);
+
 // V3 transactions:
 pub const DEFAULT_L1_GAS_AMOUNT: GasAmount = GasAmount(u64::pow(10, 6));
 pub const DEFAULT_L1_DATA_GAS_MAX_AMOUNT: GasAmount = GasAmount(u64::pow(10, 6));
@@ -176,6 +195,7 @@ impl BlockInfo {
             gas_prices: DEFAULT_GAS_PRICES,
             // TODO(Yoni): change to true.
             use_kzg_da: false,
+            starknet_version: StarknetVersion::LATEST,
         }
     }
 
@@ -184,27 +204,138 @@ impl BlockInfo {
     }
 }
 
+pub fn resource_bounds_for_testing() -> AllResourceBounds {
+    AllResourceBounds {
+        l1_gas: ResourceBounds {
+            max_amount: GasAmount(VALID_L1_GAS_MAX_AMOUNT),
+            max_price_per_unit: GasPrice(VALID_L1_GAS_MAX_PRICE_PER_UNIT),
+        },
+        l2_gas: ResourceBounds {
+            max_amount: GasAmount(VALID_L2_GAS_MAX_AMOUNT),
+            max_price_per_unit: GasPrice(VALID_L2_GAS_MAX_PRICE_PER_UNIT),
+        },
+        l1_data_gas: ResourceBounds {
+            max_amount: GasAmount(VALID_L1_DATA_GAS_MAX_AMOUNT),
+            max_price_per_unit: GasPrice(VALID_L1_DATA_GAS_MAX_PRICE_PER_UNIT),
+        },
+    }
+}
+
+pub fn valid_resource_bounds_for_testing() -> ValidResourceBounds {
+    ValidResourceBounds::AllResources(resource_bounds_for_testing())
+}
+
 /// A trait for producing test transactions.
 pub trait TestingTxArgs {
     fn get_rpc_tx(&self) -> RpcTransaction;
     fn get_internal_tx(&self) -> InternalRpcTransaction;
+    /// Returns the executable transaction for the transaction.
+    /// Note: In the declare transaction, `class_info` is constructed using a default compiled
+    /// contract class, so if the test requires a specific contract class this function
+    /// shouldn't be used.
+    fn get_executable_tx(&self) -> AccountTransaction;
 }
+
+static TEST_CASM_CONTRACT_CLASS: LazyLock<ContractClass> = LazyLock::new(|| {
+    let default_casm = CasmContractClass {
+        prime: Default::default(),
+        compiler_version: Default::default(),
+        bytecode: vec![
+            BigUintAsHex { value: BigUint::from(1_u8) },
+            BigUintAsHex { value: BigUint::from(1_u8) },
+            BigUintAsHex { value: BigUint::from(1_u8) },
+        ],
+        bytecode_segment_lengths: Default::default(),
+        hints: Default::default(),
+        pythonic_hints: Default::default(),
+        entry_points_by_type: Default::default(),
+    };
+    ContractClass::V1((default_casm, SierraVersion::default()))
+});
+
+static TEST_DEPRECATED_CASM_CONTRACT_CLASS: LazyLock<ContractClass> = LazyLock::new(|| {
+    let default_deprecated_casm = DeprecatedContractClass {
+        abi: None,
+        program: Program {
+            attributes: serde_json::Value::Null,
+            builtins: serde_json::Value::Array(vec![]),
+            compiler_version: serde_json::Value::Null,
+            data: serde_json::Value::Array(vec![]),
+            debug_info: serde_json::Value::Null,
+            hints: serde_json::Value::Object(serde_json::Map::new()),
+            identifiers: serde_json::Value::Object(serde_json::Map::new()),
+            main_scope: serde_json::Value::String("__main__".to_string()),
+            prime: serde_json::Value::String(
+                "0x800000000000011000000000000000000000000000000000000000000000001".to_string(),
+            ),
+            reference_manager: serde_json::Value::Object({
+                let mut map = serde_json::Map::new();
+                map.insert("references".to_string(), serde_json::Value::Array(vec![]));
+                map
+            }),
+        },
+        entry_points_by_type: Default::default(),
+    };
+    ContractClass::V0(default_deprecated_casm)
+});
 
 impl ContractClass {
     pub fn test_casm_contract_class() -> Self {
-        let default_casm = CasmContractClass {
-            prime: Default::default(),
-            compiler_version: Default::default(),
-            bytecode: vec![
-                BigUintAsHex { value: BigUint::from(1_u8) },
-                BigUintAsHex { value: BigUint::from(1_u8) },
-                BigUintAsHex { value: BigUint::from(1_u8) },
-            ],
-            bytecode_segment_lengths: Default::default(),
-            hints: Default::default(),
-            pythonic_hints: Default::default(),
-            entry_points_by_type: Default::default(),
-        };
-        ContractClass::V1((default_casm, SierraVersion::default()))
+        TEST_CASM_CONTRACT_CLASS.clone()
     }
+
+    pub fn test_deprecated_casm_contract_class() -> Self {
+        TEST_DEPRECATED_CASM_CONTRACT_CLASS.clone()
+    }
+}
+
+/// Formats a json object in the same way that python's json.dumps() formats.
+pub(crate) struct PyJsonFormatter;
+
+impl PyJsonFormatter {
+    pub(crate) fn comma() -> &'static [u8; 2] {
+        b", "
+    }
+
+    pub(crate) fn colon() -> &'static [u8; 2] {
+        b": "
+    }
+}
+
+impl serde_json::ser::Formatter for PyJsonFormatter {
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if !first {
+            writer.write_all(Self::comma())?;
+        }
+        Ok(())
+    }
+
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if !first {
+            writer.write_all(Self::comma())?;
+        }
+        Ok(())
+    }
+
+    fn begin_object_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        writer.write_all(Self::colon())
+    }
+}
+
+pub(crate) fn py_json_dumps<T: ?Sized + Serialize>(value: &T) -> Result<String, serde_json::Error> {
+    let mut string_buffer = vec![];
+    let mut ser = serde_json::Serializer::with_formatter(&mut string_buffer, PyJsonFormatter);
+    value.serialize(&mut ser)?;
+    Ok(String::from_utf8(string_buffer).expect("serialized JSON should be valid UTF-8"))
 }

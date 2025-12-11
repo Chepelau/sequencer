@@ -1,20 +1,13 @@
-use std::collections::BTreeMap;
-use std::fmt::{Display, Formatter, Result};
-use std::iter::once;
 use std::path::PathBuf;
 
-use apollo_config::dumping::{prepend_sub_config_name, SerializeConfig};
-use apollo_config::{ParamPath, SerializedParam};
-use apollo_node::config::component_config::ComponentConfig;
-use apollo_node::config::config_utils::config_to_preset;
-use indexmap::IndexMap;
-use serde::Serialize;
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
 
 use crate::config_override::ConfigOverride;
-use crate::deployment_definitions::{Environment, BASE_APP_CONFIG_PATH, CONFIG_BASE_DIR};
+use crate::deployment_definitions::{Environment, CONFIG_BASE_DIR};
 use crate::k8s::{ExternalSecret, IngressParams, K8SServiceType, K8sServiceConfigParams};
-use crate::service::{NodeService, NodeType, Service};
+use crate::service::{NodeType, Service};
+
+// TODO(Tsabary): consider unifying pointer targets to a single file.
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Deployment {
@@ -36,10 +29,8 @@ impl Deployment {
     ) -> Self {
         let node_services = node_type.all_service_names();
 
-        let config_override_files =
+        let config_filenames =
             config_override.get_config_file_paths(&environment.env_dir_path(), instance_name);
-        let config_filenames: Vec<String> =
-            once(BASE_APP_CONFIG_PATH.to_string()).chain(config_override_files).collect();
 
         let services = node_services
             .iter()
@@ -69,34 +60,8 @@ impl Deployment {
         &self.deployment_aux_data.node_type
     }
 
-    pub fn application_config_values(&self) -> IndexMap<NodeService, Value> {
-        let component_configs = self.deployment_aux_data.node_type.get_component_configs(None);
-        let mut result = IndexMap::new();
-
-        for (service, component_config) in component_configs.into_iter() {
-            // Component configs, determined by the service.
-            let component_config_serialization_wrapper: ComponentConfigsSerializationWrapper =
-                component_config.into();
-
-            let flattened_component_config_map =
-                config_to_preset(&json!(component_config_serialization_wrapper.dump()));
-            result.insert(service, flattened_component_config_map);
-        }
-
-        result
-    }
-
-    pub fn get_config_file_paths(&self) -> Vec<Vec<String>> {
-        self.services
-            .iter()
-            .map(|service| {
-                service
-                    .get_config_paths()
-                    .into_iter()
-                    .map(|s| format!("{}{}", self.application_config_subdir.to_string_lossy(), s))
-                    .collect::<Vec<_>>()
-            })
-            .collect()
+    pub fn get_all_services_config_paths(&self) -> Vec<Vec<String>> {
+        self.services.iter().map(|service| service.get_service_config_paths()).collect()
     }
 
     pub fn deployment_file_path(&self) -> PathBuf {
@@ -130,38 +95,18 @@ struct DeploymentAuxData {
     config_override: ConfigOverride,
 }
 
-// TODO(Tsabary): test no conflicts between config entries defined in each of the override types.
-// TODO(Tsabary): delete duplicates from the base app config, and add a test that there are no
-// conflicts between all the override config entries and the values in the base app config.
-
-/// Represents the domain of the pragma directive in the configuration.
-pub enum PragmaDomain {
-    Dev,
-    Prod,
-}
-
-impl Display for PragmaDomain {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-        let s = match self {
-            PragmaDomain::Dev => "devnet",
-            PragmaDomain::Prod => "production",
-        };
-        write!(f, "{}", s)
-    }
-}
-
 // Creates the service name in the format: <node_service>.<namespace>.<domain>
 pub(crate) fn build_service_namespace_domain_address(
     node_service: &str,
     namespace: &str,
     domain: &str,
 ) -> String {
-    format!("{}.{}.{}", node_service, namespace, domain)
+    format!("{node_service}.{namespace}.{domain}")
 }
 
 // TODO(Tsabary): when transitioning runnings nodes in different clusters, this enum should be
 // removed, and the p2p address should always be `External`.
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum P2PCommunicationType {
     Internal,
     External,
@@ -178,25 +123,5 @@ impl P2PCommunicationType {
 
     pub(crate) fn get_k8s_service_type(&self) -> K8SServiceType {
         K8SServiceType::LoadBalancer
-    }
-}
-
-// TODO(Tsabary): move this to the service module once refactored out of here.
-// A helper struct for serializing the components config in the same hierarchy as of its
-// serialization as part of the entire config, i.e., by prepending "components.".
-#[derive(Clone, Debug, Default, Serialize)]
-pub(crate) struct ComponentConfigsSerializationWrapper {
-    components: ComponentConfig,
-}
-
-impl From<ComponentConfig> for ComponentConfigsSerializationWrapper {
-    fn from(value: ComponentConfig) -> Self {
-        ComponentConfigsSerializationWrapper { components: value }
-    }
-}
-
-impl SerializeConfig for ComponentConfigsSerializationWrapper {
-    fn dump(&self) -> BTreeMap<ParamPath, SerializedParam> {
-        prepend_sub_config_name(self.components.dump(), "components")
     }
 }

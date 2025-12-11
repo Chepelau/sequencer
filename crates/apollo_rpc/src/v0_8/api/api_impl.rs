@@ -551,7 +551,7 @@ impl JsonRpcServer for JsonRpcServerImpl {
             let tx = txn
                 .get_transaction(transaction_index)
                 .map_err(internal_server_error)?
-                .unwrap_or_else(|| panic!("Should have tx {}", transaction_hash));
+                .unwrap_or_else(|| panic!("Should have tx {transaction_hash}"));
 
             // TODO(Shahak): Add version function to transaction in SN_API.
             let tx_version = match &tx {
@@ -1534,8 +1534,8 @@ impl JsonRpcServer for JsonRpcServerImpl {
             let (casm, sierra) = option_casm
                 .zip(option_sierra)
                 .ok_or_else(|| ErrorObjectOwned::from(CLASS_HASH_NOT_FOUND))?;
-            let sierra_version = SierraVersion::extract_from_program(&sierra.sierra_program)
-                .map_err(internal_server_error_with_msg)?;
+            let sierra_version =
+                sierra.get_sierra_version().map_err(internal_server_error_with_msg)?;
             return Ok((CompiledContractClass::V1(casm), sierra_version));
         }
 

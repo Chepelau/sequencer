@@ -1,5 +1,5 @@
+use apollo_sizeof::SizeOf;
 use serde::{Deserialize, Serialize};
-use size_of::SizeOf;
 use starknet_types_core::felt::Felt;
 
 use crate::StarknetApiError;
@@ -7,17 +7,12 @@ use crate::StarknetApiError;
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, SizeOf,
 )]
+#[cfg_attr(any(test, feature = "testing"), derive(Default))]
 #[serde(try_from = "Deserializer")]
 pub enum DataAvailabilityMode {
+    #[cfg_attr(any(test, feature = "testing"), default)]
     L1 = 0,
     L2 = 1,
-}
-
-#[cfg(any(test, feature = "testing"))]
-impl Default for DataAvailabilityMode {
-    fn default() -> Self {
-        Self::L1
-    }
 }
 
 /// Deserialize a `DataAvailabilityMode` from a given `Deserializer`.
@@ -91,4 +86,20 @@ pub enum L1DataAvailabilityMode {
     #[default]
     Calldata,
     Blob,
+}
+
+impl L1DataAvailabilityMode {
+    pub fn from_use_kzg_da(use_kzg_da: bool) -> Self {
+        match use_kzg_da {
+            true => Self::Blob,
+            false => Self::Calldata,
+        }
+    }
+
+    pub fn is_use_kzg_da(&self) -> bool {
+        match self {
+            Self::Blob => true,
+            Self::Calldata => false,
+        }
+    }
 }

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use apollo_class_manager_types::{
     ClassManagerClientResult,
@@ -11,8 +11,7 @@ use apollo_test_utils::{get_rng, GetTestInstance};
 use blockifier::execution::contract_class::RunnableCompiledClass;
 use blockifier::state::errors::StateError;
 use blockifier::state::state_api::{StateReader, StateResult};
-use cairo_lang_starknet_classes::casm_contract_class::CasmContractClass;
-use lazy_static::lazy_static;
+use blockifier::state::state_api_test_utils::assert_eq_state_result;
 use mockall::predicate;
 use rstest::rstest;
 use starknet_api::block::{
@@ -25,13 +24,16 @@ use starknet_api::block::{
     GasPrices,
     NonzeroGasPrice,
 };
-use starknet_api::contract_class::{ContractClass, SierraVersion};
+use starknet_api::contract_class::ContractClass;
 use starknet_api::core::{ClassHash, SequencerContractAddress};
 use starknet_api::data_availability::L1DataAvailabilityMode;
 use starknet_api::{class_hash, contract_address, felt, nonce, storage_key};
 
 use crate::state_reader::MempoolStateReader;
 use crate::sync_state_reader::SyncStateReader;
+
+static DUMMY_CLASS_HASH: LazyLock<ClassHash> = LazyLock::new(|| class_hash!(2_u32));
+
 #[tokio::test]
 async fn test_get_block_info() {
     let mut mock_state_sync_client = MockStateSyncClient::new();
@@ -47,7 +49,7 @@ async fn test_get_block_info() {
 
     mock_state_sync_client.expect_get_block().times(1).with(predicate::eq(block_number)).returning(
         move |_| {
-            Ok(Some(SyncBlock {
+            Ok(SyncBlock {
                 state_diff: Default::default(),
                 account_transaction_hashes: Default::default(),
                 l1_transaction_hashes: Default::default(),
@@ -61,7 +63,7 @@ async fn test_get_block_info() {
                     l1_da_mode,
                     ..Default::default()
                 },
-            }))
+            })
         },
     );
 
@@ -71,7 +73,7 @@ async fn test_get_block_info() {
         block_number,
         tokio::runtime::Handle::current(),
     );
-    let result = state_sync_reader.get_block_info().unwrap();
+    let result = state_sync_reader.get_block_info().await.unwrap();
 
     assert_eq!(
         result,
@@ -95,10 +97,8 @@ async fn test_get_block_info() {
                     l2_gas_price: NonzeroGasPrice::new_unchecked(l2_gas_price.price_in_fri),
                 },
             },
-            use_kzg_da: match l1_da_mode {
-                L1DataAvailabilityMode::Blob => true,
-                L1DataAvailabilityMode::Calldata => false,
-            },
+            use_kzg_da: l1_da_mode.is_use_kzg_da(),
+            starknet_version: Default::default(),
         }
     );
 }
@@ -195,68 +195,46 @@ async fn test_get_class_hash_at() {
     assert_eq!(result, expected_result);
 }
 
-fn dummy_casm_contract_class() -> CasmContractClass {
-    CasmContractClass {
-        compiler_version: "0.0.0".to_string(),
-        prime: Default::default(),
-        bytecode: Default::default(),
-        bytecode_segment_lengths: Default::default(),
-        hints: Default::default(),
-        pythonic_hints: Default::default(),
-        entry_points_by_type: Default::default(),
-    }
-}
-
-lazy_static! {
-    static ref DUMMY_CLASS_HASH: ClassHash = class_hash!("0x2");
-}
-
-fn assert_eq_state_result(
-    a: &StateResult<RunnableCompiledClass>,
-    b: &StateResult<RunnableCompiledClass>,
-) {
-    match (a, b) {
-        (Ok(a), Ok(b)) => assert_eq!(a, b),
-        (Err(StateError::UndeclaredClassHash(a)), Err(StateError::UndeclaredClassHash(b))) => {
-            assert_eq!(a, b)
-        }
-        _ => panic!("StateResult mismatch (or unsupported comparison): {a:?} vs {b:?}"),
-    }
-}
-
 #[rstest]
 #[case::class_declared(
-    Ok(Some(ContractClass::V1((dummy_casm_contract_class(), SierraVersion::default())))),
+    Ok(Some(ContractClass::test_casm_contract_class())),
+    1,
     Ok(true),
-    Ok(RunnableCompiledClass::V1((dummy_casm_contract_class(), SierraVersion::default()).try_into().unwrap()))
+    Ok(RunnableCompiledClass::test_casm_contract_class()),
+    *DUMMY_CLASS_HASH,
 )]
 #[case::class_not_declared_but_in_class_manager(
-    Ok(Some(ContractClass::V1((dummy_casm_contract_class(), SierraVersion::default())))),
+    Ok(Some(ContractClass::test_casm_contract_class())),
+    0,
     Ok(false),
-    Err(StateError::UndeclaredClassHash(*DUMMY_CLASS_HASH))
+    Err(StateError::UndeclaredClassHash(*DUMMY_CLASS_HASH)),
+    *DUMMY_CLASS_HASH,
 )]
 #[case::class_not_declared(
     Ok(None),
+    0,
     Ok(false),
-    Err(StateError::UndeclaredClassHash(*DUMMY_CLASS_HASH))
+    Err(StateError::UndeclaredClassHash(*DUMMY_CLASS_HASH)),
+    *DUMMY_CLASS_HASH,
 )]
 #[tokio::test]
 async fn test_get_compiled_class(
     #[case] class_manager_client_result: ClassManagerClientResult<Option<ExecutableClass>>,
+    #[case] n_calls_to_class_manager_client: usize,
     #[case] sync_client_result: StateSyncClientResult<bool>,
     #[case] expected_result: StateResult<RunnableCompiledClass>,
+    #[case] class_hash: ClassHash,
 ) {
     let mut mock_state_sync_client = MockStateSyncClient::new();
     let mut mock_class_manager_client = MockClassManagerClient::new();
 
-    let class_hash = *DUMMY_CLASS_HASH;
     let block_number = BlockNumber(1);
 
     mock_class_manager_client
         .expect_get_executable()
-        .times(0..=1)
+        .times(n_calls_to_class_manager_client)
         .with(predicate::eq(class_hash))
-        .returning(move |_| class_manager_client_result.clone());
+        .return_once(move |_| class_manager_client_result);
 
     mock_state_sync_client
         .expect_is_class_declared_at()
@@ -279,12 +257,15 @@ async fn test_get_compiled_class(
 }
 
 #[tokio::test]
-#[should_panic]
+#[should_panic(expected = "Class with hash {class_hash:?} doesn't appear in class manager even \
+                           though it was declared")]
 async fn test_get_compiled_class_panics_when_class_exists_in_sync_but_not_in_class_manager() {
     test_get_compiled_class(
         Ok(None),
+        1,
         Ok(true),
         Err(StateError::UndeclaredClassHash(*DUMMY_CLASS_HASH)),
+        *DUMMY_CLASS_HASH,
     )
     .await;
 }

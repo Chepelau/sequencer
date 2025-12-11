@@ -6,21 +6,21 @@ use std::task::{Context, Poll, Waker};
 
 use futures::stream::{Stream, StreamExt};
 use libp2p::core::multiaddr::Protocol;
-use libp2p::Multiaddr;
+use libp2p::{Multiaddr, PeerId};
 
 // This is an implementation of `StreamMap` from tokio_stream. The reason we're implementing it
 // ourselves is that the implementation in tokio_stream requires that the values implement the
 // Stream trait from tokio_stream and not from futures.
 pub struct StreamMap<K: Unpin + Clone + Ord, V: Stream + Unpin> {
     map: BTreeMap<K, V>,
-    wakers_waiting_for_new_stream: Vec<Waker>,
+    last_waker_waiting_for_new_stream: Option<Waker>,
     next_index_to_poll: Option<usize>,
 }
 
 impl<K: Unpin + Clone + Ord, V: Stream + Unpin> StreamMap<K, V> {
     #[allow(dead_code)]
     pub fn new(map: BTreeMap<K, V>) -> Self {
-        Self { map, wakers_waiting_for_new_stream: Default::default(), next_index_to_poll: None }
+        Self { map, last_waker_waiting_for_new_stream: None, next_index_to_poll: None }
     }
 
     #[allow(dead_code)]
@@ -40,7 +40,7 @@ impl<K: Unpin + Clone + Ord, V: Stream + Unpin> StreamMap<K, V> {
 
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let res = self.map.insert(key, value);
-        for waker in self.wakers_waiting_for_new_stream.drain(..) {
+        if let Some(waker) = self.last_waker_waiting_for_new_stream.take() {
             waker.wake();
         }
         res
@@ -89,7 +89,7 @@ impl<K: Unpin + Clone + Ord, V: Stream + Unpin> Stream for StreamMap<K, V> {
             unpinned_self.map.remove(&finished_stream_key);
             return Poll::Ready(Some((finished_stream_key, None)));
         }
-        unpinned_self.wakers_waiting_for_new_stream.push(cx.waker().clone());
+        unpinned_self.last_waker_waiting_for_new_stream = Some(cx.waker().clone());
         Poll::Pending
     }
 }
@@ -103,4 +103,15 @@ pub fn is_localhost(address: &Multiaddr) -> bool {
         return false;
     };
     ip4_address == Ipv4Addr::LOCALHOST
+}
+
+/// Creates a `Multiaddr` from an `Ipv4Addr`, a port, and a `PeerId`.
+pub fn make_multiaddr(ip: Ipv4Addr, port: u16, peer_id: Option<PeerId>) -> Multiaddr {
+    let mut address = Multiaddr::empty().with(Protocol::Ip4(ip));
+    // TODO(AndrewL): address = address.with(Protocol::Udp(port)).with(Protocol::QuicV1);
+    address = address.with(Protocol::Tcp(port));
+    if let Some(peer_id) = peer_id {
+        address = address.with(Protocol::P2p(peer_id))
+    }
+    address
 }

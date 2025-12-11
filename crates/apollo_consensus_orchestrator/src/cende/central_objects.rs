@@ -1,6 +1,5 @@
-use std::str::FromStr;
-
 use apollo_class_manager_types::SharedClassManagerClient;
+use blockifier::blockifier::transaction_executor::CompiledClassHashesForMigration;
 use blockifier::bouncer::{BouncerWeights, CasmHashComputationData};
 use blockifier::state::cached_state::CommitmentStateDiff;
 use cairo_lang_starknet_classes::casm_contract_class::CasmContractClass;
@@ -63,6 +62,7 @@ pub(crate) type CentralCompressedStateDiff = CentralStateDiff;
 pub(crate) type CentralSierraContractClassEntry = (ClassHash, CentralSierraContractClass);
 pub(crate) type CentralCasmContractClassEntry = (CompiledClassHash, CentralCasmContractClass);
 pub(crate) type CentralCasmHashComputationData = CasmHashComputationData;
+pub(crate) type CentralCompiledClassHashesForMigration = CompiledClassHashesForMigration;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct CentralResourcePrice {
@@ -112,7 +112,7 @@ pub(crate) struct CentralStateDiff {
     nonces: IndexMap<DataAvailabilityMode, IndexMap<ContractAddress, Nonce>>,
     storage_updates:
         IndexMap<DataAvailabilityMode, IndexMap<ContractAddress, IndexMap<StorageKey, Felt>>>,
-    declared_classes: IndexMap<ClassHash, CompiledClassHash>,
+    class_hash_to_compiled_class_hash: IndexMap<ClassHash, CompiledClassHash>,
     block_info: CentralBlockInfo,
 }
 
@@ -131,7 +131,7 @@ impl From<(ThinStateDiff, CentralBlockInfo)> for CentralStateDiff {
             address_to_class_hash: state_diff.deployed_contracts,
             nonces: indexmap!(DataAvailabilityMode::L1=> state_diff.nonces),
             storage_updates: indexmap!(DataAvailabilityMode::L1=> state_diff.storage_diffs),
-            declared_classes: state_diff.declared_classes,
+            class_hash_to_compiled_class_hash: state_diff.class_hash_to_compiled_class_hash,
             block_info: central_block_info,
         }
     }
@@ -145,7 +145,7 @@ impl From<(CommitmentStateDiff, CentralBlockInfo)> for CentralStateDiff {
             address_to_class_hash: state_diff.address_to_class_hash,
             nonces: indexmap!(DataAvailabilityMode::L1=> state_diff.address_to_nonce),
             storage_updates: indexmap!(DataAvailabilityMode::L1=> state_diff.storage_updates),
-            declared_classes: state_diff.class_hash_to_compiled_class_hash,
+            class_hash_to_compiled_class_hash: state_diff.class_hash_to_compiled_class_hash,
             block_info: central_block_info,
         }
     }
@@ -312,8 +312,8 @@ impl TryFrom<(InternalRpcDeclareTransactionV3, &SierraContractClass, Transaction
             account_deployment_data: tx.account_deployment_data,
             sierra_program_size: sierra.sierra_program.len(),
             abi_size: sierra.abi.len(),
-            sierra_version: into_string_tuple(SierraVersion::from_str(
-                &sierra.contract_class_version,
+            sierra_version: into_string_tuple(SierraVersion::extract_from_program(
+                &sierra.sierra_program,
             )?),
             hash_value,
         })

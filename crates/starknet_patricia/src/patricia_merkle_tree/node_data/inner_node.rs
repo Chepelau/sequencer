@@ -1,8 +1,14 @@
+use std::collections::HashMap;
+
 use ethnum::U256;
+use starknet_api::hash::HashOutput;
 use starknet_types_core::felt::Felt;
 
-use crate::hash::hash_trait::HashOutput;
-use crate::patricia_merkle_tree::node_data::errors::{EdgePathError, PathToBottomError};
+use crate::patricia_merkle_tree::node_data::errors::{
+    EdgePathError,
+    PathToBottomError,
+    PreimageError,
+};
 use crate::patricia_merkle_tree::node_data::leaf::Leaf;
 use crate::patricia_merkle_tree::types::{NodeIndex, SubTreeHeight};
 
@@ -24,6 +30,12 @@ pub enum NodeData<L: Leaf> {
 pub struct BinaryData {
     pub left_hash: HashOutput,
     pub right_hash: HashOutput,
+}
+
+impl BinaryData {
+    pub fn flatten(&self) -> Vec<Felt> {
+        vec![self.left_hash.0, self.right_hash.0]
+    }
 }
 
 // Wraps a U256. Maximal possible value is the longest path in a tree of height 251 (2 ^ 251 - 1).
@@ -134,6 +146,16 @@ pub struct EdgeData {
     pub path_to_bottom: PathToBottom,
 }
 
+impl EdgeData {
+    pub fn flatten(&self) -> Vec<Felt> {
+        vec![
+            self.path_to_bottom.length.into(),
+            (&self.path_to_bottom.path).into(),
+            self.bottom_hash.0,
+        ]
+    }
+}
+
 impl PathToBottom {
     pub(crate) const LEFT_CHILD: Self =
         Self { path: EdgePath(U256::ZERO), length: EdgePathLength(1), _fake_field: () };
@@ -141,7 +163,7 @@ impl PathToBottom {
     pub(crate) const RIGHT_CHILD: Self =
         Self { path: EdgePath(U256::ONE), length: EdgePathLength(1), _fake_field: () };
 
-    pub(crate) fn bottom_index(&self, root_index: NodeIndex) -> NodeIndex {
+    pub fn bottom_index(&self, root_index: NodeIndex) -> NodeIndex {
         NodeIndex::compute_bottom_index(root_index, self)
     }
 
@@ -175,5 +197,68 @@ impl PathToBottom {
     pub fn new_zero() -> Self {
         Self::new(EdgePath(U256::new(0)), EdgePathLength(0))
             .expect("Creating a zero path unexpectedly failed.")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Preimage {
+    Binary(BinaryData),
+    Edge(EdgeData),
+}
+
+pub type PreimageMap = HashMap<HashOutput, Preimage>;
+
+pub fn flatten_preimages(preimage_map: &PreimageMap) -> HashMap<HashOutput, Vec<Felt>> {
+    preimage_map.iter().map(|(hash, preimage)| (*hash, preimage.flatten())).collect()
+}
+
+impl Preimage {
+    pub(crate) const BINARY_LENGTH: u8 = 2;
+    pub(crate) const EDGE_LENGTH: u8 = 3;
+
+    pub fn length(&self) -> u8 {
+        match self {
+            Self::Binary(_) => Self::BINARY_LENGTH,
+            Self::Edge(_) => Self::EDGE_LENGTH,
+        }
+    }
+
+    pub fn get_binary(&self) -> Result<&BinaryData, PreimageError> {
+        match self {
+            Self::Binary(binary) => Ok(binary),
+            Self::Edge(_) => Err(PreimageError::ExpectedBinary(self.clone())),
+        }
+    }
+
+    pub fn flatten(&self) -> Vec<Felt> {
+        match self {
+            Self::Binary(binary) => binary.flatten(),
+            Self::Edge(edge) => edge.flatten(),
+        }
+    }
+}
+
+impl TryFrom<&Vec<Felt>> for Preimage {
+    type Error = PreimageError;
+
+    fn try_from(raw_preimage: &Vec<Felt>) -> Result<Self, Self::Error> {
+        match raw_preimage.as_slice() {
+            [left, right] => Ok(Preimage::Binary(BinaryData {
+                left_hash: HashOutput(*left),
+                right_hash: HashOutput(*right),
+            })),
+            [length, path, bottom] => {
+                Ok(Preimage::Edge(EdgeData {
+                    bottom_hash: HashOutput(*bottom),
+                    path_to_bottom: PathToBottom::new(
+                        (*path).into(),
+                        EdgePathLength::new((*length).try_into().map_err(|_| {
+                            PreimageError::InvalidRawPreimage(raw_preimage.clone())
+                        })?)?,
+                    )?,
+                }))
+            }
+            _ => Err(PreimageError::InvalidRawPreimage(raw_preimage.clone())),
+        }
     }
 }

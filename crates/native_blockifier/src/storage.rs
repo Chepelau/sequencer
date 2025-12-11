@@ -5,6 +5,7 @@ use std::convert::TryFrom;
 use std::path::PathBuf;
 
 use apollo_storage::class::ClassStorageWriter;
+use apollo_storage::class_hash::ClassHashStorageWriter;
 use apollo_storage::compiled_class::CasmStorageWriter;
 use apollo_storage::header::{HeaderStorageReader, HeaderStorageWriter};
 use apollo_storage::state::{StateStorageReader, StateStorageWriter};
@@ -12,6 +13,7 @@ use cairo_lang_starknet_classes::casm_contract_class::CasmContractClass;
 use indexmap::IndexMap;
 use pyo3::prelude::*;
 use starknet_api::block::{BlockHash, BlockHeader, BlockHeaderWithoutHash, BlockNumber};
+use starknet_api::contract_class::compiled_class_hash::{HashVersion, HashableCompiledClass};
 use starknet_api::core::{ChainId, ClassHash, CompiledClassHash};
 use starknet_api::deprecated_contract_class::ContractClass as DeprecatedContractClass;
 use starknet_api::hash::StarkHash;
@@ -39,7 +41,6 @@ pub struct PapyrusStorage {
 }
 
 impl PapyrusStorage {
-    #[allow(clippy::result_large_err)]
     pub fn new(config: StorageConfig) -> NativeBlockifierResult<PapyrusStorage> {
         log::debug!("Initializing Blockifier storage...");
         let db_config = apollo_storage::db::DbConfig {
@@ -49,6 +50,7 @@ impl PapyrusStorage {
             min_size: 1 << 20, // 1MB.
             max_size: config.max_size,
             growth_step: 1 << 26, // 64MB.
+            max_readers: 1 << 13, // 8K readers
         };
         let storage_config = apollo_storage::StorageConfig {
             db_config,
@@ -77,6 +79,7 @@ impl PapyrusStorage {
             min_size: 1 << 20,    // 1MB
             max_size: 1 << 35,    // 32GB
             growth_step: 1 << 26, // 64MB
+            max_readers: 1 << 13, // 8K readers
         };
         let storage_config = apollo_storage::StorageConfig { db_config, ..Default::default() };
         let (reader, writer) = apollo_storage::open_storage(storage_config).unwrap();
@@ -87,30 +90,26 @@ impl PapyrusStorage {
 
 impl Storage for PapyrusStorage {
     /// Returns the next block number, for which state diff was not yet appended.
-    #[allow(clippy::result_large_err)]
     fn get_state_marker(&self) -> NativeBlockifierResult<u64> {
         let block_number = self.reader().begin_ro_txn()?.get_state_marker()?;
         Ok(block_number.0)
     }
 
-    #[allow(clippy::result_large_err)]
     fn get_header_marker(&self) -> NativeBlockifierResult<u64> {
         let block_number = self.reader().begin_ro_txn()?.get_header_marker()?;
         Ok(block_number.0)
     }
 
-    #[allow(clippy::result_large_err)]
     fn get_block_id(&self, block_number: u64) -> NativeBlockifierResult<Option<Vec<u8>>> {
         let block_number = BlockNumber(block_number);
         let block_hash = self
             .reader()
             .begin_ro_txn()?
             .get_block_header(block_number)?
-            .map(|block_header| Vec::from(block_header.block_hash.0.to_bytes_be().as_slice()));
+            .map(|block_header| Vec::from(block_header.block_hash.to_bytes_be().as_slice()));
         Ok(block_hash)
     }
 
-    #[allow(clippy::result_large_err)]
     fn revert_block(&mut self, block_number: u64) -> NativeBlockifierResult<()> {
         log::debug!("Reverting state diff for {block_number:?}.");
         let block_number = BlockNumber(block_number);
@@ -123,7 +122,6 @@ impl Storage for PapyrusStorage {
     }
 
     // TODO(Gilad): Refactor.
-    #[allow(clippy::result_large_err)]
     fn append_block(
         &mut self,
         block_id: u64,
@@ -157,10 +155,22 @@ impl Storage for PapyrusStorage {
                 deprecated_declared_classes.insert(class_hash, deprecated_contract_class);
             }
         }
+        // Migrated class hash are class hash in class hash to compiled class hash mapping,
+        // but not in the declared classes.
+        let migrated_class_hash_to_compiled_class_hash: IndexMap<ClassHash, CompiledClassHash> =
+            py_state_diff
+                .class_hash_to_compiled_class_hash
+                .iter()
+                .filter(|(class_hash, _)| !declared_class_hash_to_class.contains_key(*class_hash))
+                .map(|(class_hash, compiled_class_hash)| {
+                    (ClassHash(class_hash.0), CompiledClassHash(compiled_class_hash.0))
+                })
+                .collect();
 
         let mut declared_classes =
             IndexMap::<ClassHash, (CompiledClassHash, SierraContractClass)>::new();
-        let mut undeclared_casm_contracts = Vec::<(ClassHash, CasmContractClass)>::new();
+        let mut undeclared_casm_contracts =
+            Vec::<(ClassHash, CasmContractClass, CompiledClassHash)>::new();
         for (class_hash, (raw_sierra, (compiled_class_hash, raw_casm))) in
             declared_class_hash_to_class
         {
@@ -179,13 +189,20 @@ impl Storage for PapyrusStorage {
                     (CompiledClassHash(compiled_class_hash.0), sierra_contract_class),
                 );
                 let casm_contract_class: CasmContractClass = serde_json::from_str(&raw_casm)?;
-                undeclared_casm_contracts.push((class_hash, casm_contract_class));
+                let compiled_class_hash_v2 = casm_contract_class.hash(&HashVersion::V2);
+                undeclared_casm_contracts.push((
+                    class_hash,
+                    casm_contract_class,
+                    compiled_class_hash_v2,
+                ));
             }
         }
 
         let mut append_txn = self.writer().begin_rw_txn()?;
-        for (class_hash, contract_class) in undeclared_casm_contracts {
-            append_txn = append_txn.append_casm(&class_hash, &contract_class)?;
+        for (class_hash, casm_contract_class, compiled_class_hash_v2) in undeclared_casm_contracts {
+            append_txn = append_txn.append_casm(&class_hash, &casm_contract_class)?;
+            append_txn =
+                append_txn.set_executable_class_hash_v2(&class_hash, compiled_class_hash_v2)?;
         }
 
         // Construct state diff; manually add declared classes.
@@ -193,8 +210,14 @@ impl Storage for PapyrusStorage {
         state_diff.deprecated_declared_classes = deprecated_declared_classes;
         state_diff.declared_classes = declared_classes;
 
-        let (thin_state_diff, declared_classes, deprecated_declared_classes) =
+        let (mut thin_state_diff, declared_classes, deprecated_declared_classes) =
             ThinStateDiff::from_state_diff(state_diff);
+        // Add the migrated class hash to the state diff.
+        for (class_hash, compiled_class_hash) in migrated_class_hash_to_compiled_class_hash {
+            thin_state_diff
+                .class_hash_to_compiled_class_hash
+                .insert(class_hash, compiled_class_hash);
+        }
 
         append_txn = append_txn.append_state_diff(block_number, thin_state_diff)?.append_classes(
             block_number,
@@ -221,6 +244,18 @@ impl Storage for PapyrusStorage {
         append_txn = append_txn.append_header(block_number, &block_header)?;
 
         append_txn.commit()?;
+        Ok(())
+    }
+
+    fn set_executable_class_hash_v2(
+        &mut self,
+        class_hash: &ClassHash,
+        compiled_class_hash_v2: CompiledClassHash,
+    ) -> NativeBlockifierResult<()> {
+        self.writer()
+            .begin_rw_txn()?
+            .set_executable_class_hash_v2(class_hash, compiled_class_hash_v2)?
+            .commit()?;
         Ok(())
     }
 
@@ -280,16 +315,11 @@ impl StorageConfig {
 }
 
 pub trait Storage {
-    #[allow(clippy::result_large_err)]
     fn get_state_marker(&self) -> NativeBlockifierResult<u64>;
-    #[allow(clippy::result_large_err)]
     fn get_header_marker(&self) -> NativeBlockifierResult<u64>;
-    #[allow(clippy::result_large_err)]
     fn get_block_id(&self, block_number: u64) -> NativeBlockifierResult<Option<Vec<u8>>>;
 
-    #[allow(clippy::result_large_err)]
     fn revert_block(&mut self, block_number: u64) -> NativeBlockifierResult<()>;
-    #[allow(clippy::result_large_err)]
     fn append_block(
         &mut self,
         block_id: u64,
@@ -306,4 +336,10 @@ pub trait Storage {
     fn writer(&mut self) -> &mut apollo_storage::StorageWriter;
 
     fn close(&mut self);
+
+    fn set_executable_class_hash_v2(
+        &mut self,
+        class_hash: &ClassHash,
+        compiled_class_hash_v2: CompiledClassHash,
+    ) -> NativeBlockifierResult<()>;
 }

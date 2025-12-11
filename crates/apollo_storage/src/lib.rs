@@ -34,6 +34,7 @@
 //!     min_size: 1 << 20,    // 1MB
 //!     max_size: 1 << 35,    // 32GB
 //!     growth_step: 1 << 26, // 64MB
+//!     max_readers: 1 << 13, // 8K readers
 //! };
 //! # let storage_config = StorageConfig{db_config, ..Default::default()};
 //! let (reader, mut writer) = open_storage(storage_config)?;
@@ -76,13 +77,18 @@
 //! [`libmdbx`]: https://docs.rs/libmdbx/latest/libmdbx/
 
 pub mod base_layer;
+pub mod block_hash;
+pub mod block_hash_marker;
 pub mod body;
 pub mod class;
 pub mod class_hash;
 pub mod class_manager;
 pub mod compiled_class;
-#[cfg(feature = "document_calls")]
-pub mod document_calls;
+pub mod consensus;
+#[allow(missing_docs)]
+pub mod metrics;
+pub mod partial_block_hash;
+pub mod state_roots;
 pub mod storage_metrics;
 // TODO(yair): Make the compression_utils module pub(crate) or extract it from the crate.
 #[doc(hidden)]
@@ -92,12 +98,17 @@ pub mod header;
 pub mod mmap_file;
 mod serialization;
 pub mod state;
+/// Storage reader server framework for handling remote storage queries.
+pub mod storage_reader_server;
 mod version;
 
 mod deprecated;
 
 #[cfg(test)]
 mod test_instances;
+
+#[cfg(test)]
+mod open_storage_test;
 
 #[cfg(any(feature = "testing", test))]
 pub mod test_utils;
@@ -109,7 +120,8 @@ use std::sync::Arc;
 
 use apollo_config::dumping::{prepend_sub_config_name, ser_param, SerializeConfig};
 use apollo_config::{ParamPath, ParamPrivacyInput, SerializedParam};
-use apollo_proc_macros::latency_histogram;
+use apollo_metrics::metrics::MetricGauge;
+use apollo_proc_macros::{latency_histogram, sequencer_latency_histogram};
 use body::events::EventIndex;
 use cairo_lang_starknet_classes::casm_contract_class::CasmContractClass;
 use db::db_stats::{DbTableStats, DbWholeStats};
@@ -126,9 +138,11 @@ use mmap_file::{
 };
 use serde::{Deserialize, Serialize};
 use starknet_api::block::{BlockHash, BlockNumber, BlockSignature, StarknetVersion};
+use starknet_api::block_hash::block_hash_calculator::PartialBlockHashComponents;
 use starknet_api::core::{ClassHash, CompiledClassHash, ContractAddress, Nonce};
 use starknet_api::deprecated_contract_class::ContractClass as DeprecatedContractClass;
-use starknet_api::state::{SierraContractClass, StateNumber, StorageKey, ThinStateDiff};
+use starknet_api::hash::StateRoots;
+use starknet_api::state::{SierraContractClass, StorageKey, ThinStateDiff};
 use starknet_api::transaction::{Transaction, TransactionHash, TransactionOutput};
 use starknet_types_core::felt::Felt;
 use tracing::{debug, info, warn};
@@ -136,6 +150,7 @@ use validator::Validate;
 use version::{StorageVersionError, Version};
 
 use crate::body::TransactionIndex;
+use crate::consensus::LastVotedMarker;
 use crate::db::table_types::SimpleTable;
 use crate::db::{
     open_env,
@@ -151,6 +166,7 @@ use crate::db::{
     RW,
 };
 use crate::header::StorageBlockHeader;
+use crate::metrics::{register_metrics, STORAGE_COMMIT_LATENCY};
 use crate::mmap_file::MMapFileStats;
 use crate::state::data::IndexedDeprecatedContractClass;
 use crate::version::{VersionStorageReader, VersionStorageWriter};
@@ -165,7 +181,23 @@ pub const STORAGE_VERSION_BLOCKS: Version = Version { major: 6, minor: 0 };
 pub fn open_storage(
     storage_config: StorageConfig,
 ) -> StorageResult<(StorageReader, StorageWriter)> {
+    open_storage_internal(storage_config, None)
+}
+
+/// Same as [`open_storage`], but also updates the given metric for the number of open readers.
+pub fn open_storage_with_metric(
+    storage_config: StorageConfig,
+    open_readers_metric: &'static MetricGauge,
+) -> StorageResult<(StorageReader, StorageWriter)> {
+    open_storage_internal(storage_config, Some(open_readers_metric))
+}
+
+fn open_storage_internal(
+    storage_config: StorageConfig,
+    open_readers_metric: Option<&'static MetricGauge>,
+) -> StorageResult<(StorageReader, StorageWriter)> {
     info!("Opening storage: {}", storage_config.db_config.path_prefix.display());
+    register_metrics();
     if !storage_config.db_config.path_prefix.exists()
         && !storage_config.db_config.enforce_file_exists
     {
@@ -188,20 +220,26 @@ pub fn open_storage(
         deployed_contracts: db_writer.create_simple_table("deployed_contracts")?,
         events: db_writer.create_common_prefix_table("events")?,
         headers: db_writer.create_simple_table("headers")?,
+        last_voted_marker: db_writer.create_simple_table("last_voted_marker")?,
         markers: db_writer.create_simple_table("markers")?,
         nonces: db_writer.create_common_prefix_table("nonces")?,
         file_offsets: db_writer.create_simple_table("file_offsets")?,
         state_diffs: db_writer.create_simple_table("state_diffs")?,
         transaction_hash_to_idx: db_writer.create_simple_table("transaction_hash_to_idx")?,
         transaction_metadata: db_writer.create_simple_table("transaction_metadata")?,
+        block_hashes: db_writer.create_simple_table("block_hashes")?,
+        state_roots: db_writer.create_simple_table("state_roots")?,
+        partial_block_hashes_components: db_writer
+            .create_simple_table("partial_block_hashes_components")?,
 
         // Version tables.
         starknet_version: db_writer.create_simple_table("starknet_version")?,
         storage_version: db_writer.create_simple_table("storage_version")?,
 
         // Class hashes.
-        class_hash_to_executable_class_hash: db_writer
-            .create_simple_table("class_hash_to_executable_class_hash")?,
+        compiled_class_hash: db_writer.create_common_prefix_table("compiled_class_hash")?,
+        stateless_compiled_class_hash_v2: db_writer
+            .create_simple_table("stateless_compiled_class_hash_v2")?,
     });
     let (file_writers, file_readers) = open_storage_files(
         &storage_config.db_config,
@@ -215,6 +253,7 @@ pub fn open_storage(
         tables: tables.clone(),
         scope: storage_config.scope,
         file_readers,
+        open_readers_metric,
     };
     let writer = StorageWriter { db_writer, tables, scope: storage_config.scope, file_writers };
 
@@ -422,18 +461,20 @@ pub struct StorageReader {
     file_readers: FileHandlers<RO>,
     tables: Arc<Tables>,
     scope: StorageScope,
+    open_readers_metric: Option<&'static MetricGauge>,
 }
 
 impl StorageReader {
     /// Takes a snapshot of the current state of the storage and returns a [`StorageTxn`] for
     /// reading data from the storage.
     pub fn begin_ro_txn(&self) -> StorageResult<StorageTxn<'_, RO>> {
-        Ok(StorageTxn {
-            txn: self.db_reader.begin_ro_txn()?,
-            file_handlers: self.file_readers.clone(),
-            tables: self.tables.clone(),
-            scope: self.scope,
-        })
+        Ok(StorageTxn::new(
+            self.db_reader.begin_ro_txn()?,
+            self.file_readers.clone(),
+            self.tables.clone(),
+            self.scope,
+            MetricsHandler::new(self.open_readers_metric),
+        ))
     }
 
     /// Returns metadata about the tables in the storage.
@@ -470,12 +511,37 @@ impl StorageWriter {
     /// Takes a snapshot of the current state of the storage and returns a [`StorageTxn`] for
     /// reading and modifying data in the storage.
     pub fn begin_rw_txn(&mut self) -> StorageResult<StorageTxn<'_, RW>> {
-        Ok(StorageTxn {
-            txn: self.db_writer.begin_rw_txn()?,
-            file_handlers: self.file_writers.clone(),
-            tables: self.tables.clone(),
-            scope: self.scope,
-        })
+        Ok(StorageTxn::new(
+            self.db_writer.begin_rw_txn()?,
+            self.file_writers.clone(),
+            self.tables.clone(),
+            self.scope,
+            MetricsHandler::new(None),
+        ))
+    }
+}
+
+/// A struct for increasing a gauge metric when an instance is created and decreasing it when it is
+/// dropped.
+pub struct MetricsHandler {
+    metric: Option<&'static MetricGauge>,
+}
+
+impl MetricsHandler {
+    /// Creates a new instance and increases the metric by 1 if not `None`.
+    pub fn new(metric: Option<&'static MetricGauge>) -> Self {
+        if let Some(metric) = metric {
+            metric.increment(1);
+        }
+        Self { metric }
+    }
+}
+
+impl Drop for MetricsHandler {
+    fn drop(&mut self) {
+        if let Some(metric) = self.metric {
+            metric.decrement(1);
+        }
     }
 }
 
@@ -486,18 +552,30 @@ pub struct StorageTxn<'env, Mode: TransactionKind> {
     file_handlers: FileHandlers<Mode>,
     tables: Arc<Tables>,
     scope: StorageScope,
+    // Do not remove this. It is used to automatically update metrics on create/drop.
+    _metric_updater: MetricsHandler,
 }
 
 impl StorageTxn<'_, RW> {
     /// Commits the changes made in the transaction to the storage.
-    #[latency_histogram("storage_commit_latency_seconds", false)]
+    #[sequencer_latency_histogram(STORAGE_COMMIT_LATENCY, false)]
     pub fn commit(self) -> StorageResult<()> {
         self.file_handlers.flush();
         Ok(self.txn.commit()?)
     }
 }
 
-impl<Mode: TransactionKind> StorageTxn<'_, Mode> {
+impl<'env, Mode: TransactionKind> StorageTxn<'env, Mode> {
+    fn new(
+        txn: DbTransaction<'env, Mode>,
+        file_handlers: FileHandlers<Mode>,
+        tables: Arc<Tables>,
+        scope: StorageScope,
+        metric_updater: MetricsHandler,
+    ) -> Self {
+        Self { txn, file_handlers, tables, scope, _metric_updater: metric_updater }
+    }
+
     pub(crate) fn open_table<K: Key + Debug, V: ValueSerde + Debug, T: TableType>(
         &self,
         table_id: &TableIdentifier<K, V, T>,
@@ -525,6 +603,7 @@ pub fn table_names() -> &'static [&'static str] {
 }
 
 struct_field_names! {
+    // When adding a new table you need to update the MAX_DBS.
     struct Tables {
         block_hash_to_number: TableIdentifier<BlockHash, NoVersionValueWrapper<BlockNumber>, SimpleTable>,
         block_signatures: TableIdentifier<BlockNumber, VersionZeroWrapper<BlockSignature>, SimpleTable>,
@@ -539,21 +618,27 @@ struct_field_names! {
         // TODO(dvir): consider use here also the CommonPrefix table type.
         deployed_contracts: TableIdentifier<(ContractAddress, BlockNumber), VersionZeroWrapper<ClassHash>, SimpleTable>,
         events: TableIdentifier<(ContractAddress, TransactionIndex), NoVersionValueWrapper<NoValue>, CommonPrefix>,
+        // TODO(Shahak): Remove the block hashes from this table and use block hash tables instead.
         headers: TableIdentifier<BlockNumber, VersionZeroWrapper<StorageBlockHeader>, SimpleTable>,
+        last_voted_marker: TableIdentifier<(), VersionZeroWrapper<LastVotedMarker>, SimpleTable>,
         markers: TableIdentifier<MarkerKind, VersionZeroWrapper<BlockNumber>, SimpleTable>,
         nonces: TableIdentifier<(ContractAddress, BlockNumber), VersionZeroWrapper<Nonce>, CommonPrefix>,
+        partial_block_hashes_components: TableIdentifier<BlockNumber, VersionZeroWrapper<PartialBlockHashComponents>, SimpleTable>,
         file_offsets: TableIdentifier<OffsetKind, NoVersionValueWrapper<usize>, SimpleTable>,
         state_diffs: TableIdentifier<BlockNumber, VersionZeroWrapper<LocationInFile>, SimpleTable>,
         transaction_hash_to_idx: TableIdentifier<TransactionHash, NoVersionValueWrapper<TransactionIndex>, SimpleTable>,
         // TODO(dvir): consider not saving transaction hash and calculating it from the transaction on demand.
         transaction_metadata: TableIdentifier<TransactionIndex, VersionZeroWrapper<TransactionMetadata>, SimpleTable>,
+        block_hashes: TableIdentifier<BlockNumber, VersionZeroWrapper<BlockHash>, SimpleTable>,
+        state_roots: TableIdentifier<BlockNumber, NoVersionValueWrapper<StateRoots>, SimpleTable>,
 
         // Version tables
         starknet_version: TableIdentifier<BlockNumber, VersionZeroWrapper<StarknetVersion>, SimpleTable>,
         storage_version: TableIdentifier<String, NoVersionValueWrapper<Version>, SimpleTable>,
 
-        // Class hashes.
-        class_hash_to_executable_class_hash: TableIdentifier<ClassHash, NoVersionValueWrapper<CompiledClassHash>, SimpleTable>
+        // Compiled class hashes.
+        compiled_class_hash: TableIdentifier<(ClassHash, BlockNumber), VersionZeroWrapper<CompiledClassHash>, CommonPrefix>,
+        stateless_compiled_class_hash_v2: TableIdentifier<ClassHash, NoVersionValueWrapper<CompiledClassHash>, SimpleTable>
     }
 }
 
@@ -632,9 +717,9 @@ pub type StorageResult<V> = std::result::Result<V, StorageError>;
 #[allow(missing_docs)]
 #[derive(Serialize, Debug, Default, Deserialize, Clone, PartialEq, Validate)]
 pub struct StorageConfig {
-    #[validate]
+    #[validate(nested)]
     pub db_config: DbConfig,
-    #[validate]
+    #[validate(nested)]
     pub mmap_file_config: MmapFileConfig,
     pub scope: StorageScope,
 }
@@ -682,6 +767,7 @@ pub(crate) enum MarkerKind {
     /// Marks the block beyond the last block that its classes can't be compiled with the current
     /// compiler version used in the class manager. Determined by starknet version.
     CompilerBackwardCompatibility,
+    BlockHash,
 }
 
 pub(crate) type MarkersTable<'env> =
@@ -764,7 +850,7 @@ impl<Mode: TransactionKind> FileHandlers<Mode> {
         location: LocationInFile,
     ) -> StorageResult<ThinStateDiff> {
         self.thin_state_diff.get(location)?.ok_or(StorageError::DBInconsistency {
-            msg: format!("ThinStateDiff at location {:?} not found.", location),
+            msg: format!("ThinStateDiff at location {location:?} not found."),
         })
     }
 
@@ -774,14 +860,14 @@ impl<Mode: TransactionKind> FileHandlers<Mode> {
         location: LocationInFile,
     ) -> StorageResult<SierraContractClass> {
         self.contract_class.get(location)?.ok_or(StorageError::DBInconsistency {
-            msg: format!("ContractClass at location {:?} not found.", location),
+            msg: format!("ContractClass at location {location:?} not found."),
         })
     }
 
     // Returns the CASM at the given location or an error in case it doesn't exist.
     fn get_casm_unchecked(&self, location: LocationInFile) -> StorageResult<CasmContractClass> {
         self.casm.get(location)?.ok_or(StorageError::DBInconsistency {
-            msg: format!("CasmContractClass at location {:?} not found.", location),
+            msg: format!("CasmContractClass at location {location:?} not found."),
         })
     }
 
@@ -792,7 +878,7 @@ impl<Mode: TransactionKind> FileHandlers<Mode> {
         location: LocationInFile,
     ) -> StorageResult<DeprecatedContractClass> {
         self.deprecated_contract_class.get(location)?.ok_or(StorageError::DBInconsistency {
-            msg: format!("DeprecatedContractClass at location {:?} not found.", location),
+            msg: format!("DeprecatedContractClass at location {location:?} not found."),
         })
     }
 
@@ -803,14 +889,14 @@ impl<Mode: TransactionKind> FileHandlers<Mode> {
         location: LocationInFile,
     ) -> StorageResult<TransactionOutput> {
         self.transaction_output.get(location)?.ok_or(StorageError::DBInconsistency {
-            msg: format!("TransactionOutput at location {:?} not found.", location),
+            msg: format!("TransactionOutput at location {location:?} not found."),
         })
     }
 
     // Returns the transaction at the given location or an error in case it doesn't exist.
     fn get_transaction_unchecked(&self, location: LocationInFile) -> StorageResult<Transaction> {
         self.transaction.get(location)?.ok_or(StorageError::DBInconsistency {
-            msg: format!("Transaction at location {:?} not found.", location),
+            msg: format!("Transaction at location {location:?} not found."),
         })
     }
 }
@@ -901,18 +987,4 @@ pub enum OffsetKind {
     TransactionOutput,
     /// A transaction file.
     Transaction,
-}
-
-/// A storage query. Used for benchmarking in the storage_benchmark binary.
-// TODO(dvir): add more queries (especially get casm).
-// TODO(dvir): consider move this, maybe to test_utils.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StorageQuery {
-    /// Get the class hash at a given state number.
-    GetClassHashAt(StateNumber, ContractAddress),
-    /// Get the nonce at a given state number.
-    GetNonceAt(StateNumber, ContractAddress),
-    /// Get the storage at a given state number.
-    GetStorageAt(StateNumber, ContractAddress, StorageKey),
 }

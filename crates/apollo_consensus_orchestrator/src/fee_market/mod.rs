@@ -4,6 +4,7 @@ use ethnum::U256;
 use serde::Serialize;
 use starknet_api::block::GasPrice;
 use starknet_api::execution_resources::GasAmount;
+use starknet_api::versioned_constants_logic::VersionedConstantsTrait;
 
 use crate::orchestrator_versioned_constants;
 
@@ -24,7 +25,7 @@ pub struct FeeMarketInfo {
 /// # Parameters
 /// - `price`: The base gas price per unit (in fri) of the current block.
 /// - `gas_used`: The total gas used in the current block.
-/// - `gas_target`: The target gas usage per block (usually half of a block's gas limit).
+/// - `gas_target`: The target gas usage per block.
 pub fn calculate_next_base_gas_price(
     price: GasPrice,
     gas_used: GasAmount,
@@ -32,17 +33,20 @@ pub fn calculate_next_base_gas_price(
 ) -> GasPrice {
     let versioned_constants =
         orchestrator_versioned_constants::VersionedConstants::latest_constants();
-    // Setting target to 50% of max block size balances price changes and prevents spikes.
-    assert_eq!(
-        gas_target,
-        versioned_constants.max_block_size.checked_factor_div(2).expect("Failed to divide by 2"),
-        "Gas target must be 50% of max block size to balance price changes."
+    assert!(
+        gas_target < versioned_constants.max_block_size,
+        "Gas target must be lower than max block size."
     );
     // A minimum gas price prevents precision loss. Additionally, a minimum gas price helps avoid
     // extended periods of low pricing.
     assert!(
         price >= versioned_constants.min_gas_price,
         "The gas price must be at least the minimum to prevent precision loss."
+    );
+    assert!(gas_target.0 > 0, "Gas target must be greater than zero.");
+    assert!(
+        versioned_constants.gas_price_max_change_denominator > 0,
+        "Denominator constant must be greater than zero."
     );
 
     // Use U256 to avoid overflow, as multiplying a u128 by a u64 remains within U256 bounds.
@@ -65,6 +69,7 @@ pub fn calculate_next_base_gas_price(
             || gas_used <= gas_target && adjusted_price_u256 <= price_u256
     );
 
-    let adjusted_price: u128 = adjusted_price_u256.try_into().expect("Failed to convert to u128");
+    // Price should not realistically exceed u128::MAX, bound to avoid theoretical overflow.
+    let adjusted_price = u128::try_from(adjusted_price_u256).unwrap_or(u128::MAX);
     GasPrice(max(adjusted_price, versioned_constants.min_gas_price.0))
 }

@@ -3,22 +3,23 @@ use std::collections::HashMap;
 use pretty_assertions::assert_eq;
 use rstest::rstest;
 use starknet_api::core::{ClassHash, ContractAddress, Nonce};
-use starknet_patricia::hash::hash_trait::HashOutput;
+use starknet_api::hash::HashOutput;
 use starknet_patricia::patricia_merkle_tree::external_test_utils::{
     create_32_bytes_entry,
-    create_binary_entry,
+    create_binary_entry_from_u128,
     create_binary_skeleton_node,
-    create_edge_entry,
+    create_edge_entry_from_u128,
     create_edge_skeleton_node,
     create_expected_skeleton_nodes,
     create_root_edge_entry,
     create_unmodified_subtree_skeleton_node,
+    AdditionHash,
 };
 use starknet_patricia::patricia_merkle_tree::original_skeleton_tree::tree::OriginalSkeletonTreeImpl;
 use starknet_patricia::patricia_merkle_tree::types::{NodeIndex, SortedLeafIndices, SubTreeHeight};
 use starknet_patricia_storage::db_object::DBObject;
 use starknet_patricia_storage::map_storage::MapStorage;
-use starknet_patricia_storage::storage_trait::{DbKey, DbValue};
+use starknet_patricia_storage::storage_trait::{DbHashMap, DbKey, DbValue};
 use starknet_types_core::felt::Felt;
 use tracing::level_filters::LevelFilter;
 
@@ -31,6 +32,8 @@ use crate::block_committer::input::{
     StarknetStorageValue,
     StateDiff,
 };
+use crate::db::facts_db::FactsDb;
+use crate::db::forest_trait::ForestReader;
 use crate::forest::original_skeleton_forest::{ForestSortedIndices, OriginalSkeletonForest};
 use crate::patricia_merkle_tree::leaf::leaf_impl::ContractState;
 use crate::patricia_merkle_tree::types::CompiledClassHash;
@@ -65,7 +68,7 @@ pub(crate) fn create_contract_state_leaf_entry(val: u128) -> (DbKey, DbValue) {
     (leaf.get_db_key(&felt.to_bytes_be()), leaf.serialize())
 }
 
-// This test assumes for simplicity that hash is addition (i.e hash(a,b) = a + b).
+// This test uses addition hash for simplicity (i.e hash(a,b) = a + b).
 // I.e., the value of a binary node is the sum of its children's values, and the value of an edge
 // node is the sum of its path, bottom value and path length.
 ///                                Old forest structure:
@@ -127,59 +130,10 @@ pub(crate) fn create_contract_state_leaf_entry(val: u128) -> (DbKey, DbValue) {
 ///       /  \     \     \                             / \   \     \
 ///      NZ   2     NZ    NZ                          NZ  9  16    15
 
+#[tokio::test]
 #[rstest]
 #[case(
     Input {
-        storage: HashMap::from([
-            // Roots.
-            create_root_edge_entry(29, SubTreeHeight::new(3)),
-            create_root_edge_entry(55, SubTreeHeight::new(3)),
-            create_root_edge_entry(155, SubTreeHeight::new(3)),
-            create_root_edge_entry(861, SubTreeHeight::new(3)),
-            // Contracts trie inner nodes.
-            create_binary_entry(303, 1),
-            create_binary_entry(277, 277),
-            create_edge_entry(304, 0, 1),
-            create_edge_entry(554, 1, 1),
-            create_binary_entry(305, 556),
-            // Contracts trie leaves.
-            create_contract_state_leaf_entry(277),
-            create_contract_state_leaf_entry(303),
-            create_contract_state_leaf_entry(1),
-            // Classes trie inner nodes.
-            create_binary_entry(33, 47),
-            create_edge_entry(72, 1, 1),
-            create_binary_entry(80, 74),
-            create_edge_entry(154, 0, 1),
-            // Classes trie leaves.
-            create_compiled_class_leaf_entry(33),
-            create_compiled_class_leaf_entry(47),
-            create_compiled_class_leaf_entry(72),
-            // Storage tries #6, #7 inner nodes.
-            create_binary_entry(10, 2),
-            create_edge_entry(3, 1, 1),
-            create_binary_entry(4, 7),
-            create_edge_entry(12, 0, 1),
-            create_binary_entry(5, 11),
-            create_binary_entry(13, 16),
-            // Storage tries #6, #7 leaves.
-            create_storage_leaf_entry(2),
-            create_storage_leaf_entry(3),
-            create_storage_leaf_entry(4),
-            create_storage_leaf_entry(7),
-            create_storage_leaf_entry(10),
-            // Storage trie #0 inner nodes.
-            create_binary_entry(8, 9),
-            create_edge_entry(16, 1, 1),
-            create_edge_entry(15, 3, 2),
-            create_binary_entry(17, 18),
-            create_binary_entry(35, 20),
-            // Storage trie #0 leaves.
-            create_storage_leaf_entry(8),
-            create_storage_leaf_entry(9),
-            create_storage_leaf_entry(15),
-            create_storage_leaf_entry(16),
-        ]),
         state_diff: StateDiff {
             storage_updates: create_storage_updates(&[
                 (7, &[0, 3, 5]),
@@ -192,7 +146,58 @@ pub(crate) fn create_contract_state_leaf_entry(val: u128) -> (DbKey, DbValue) {
         contracts_trie_root_hash: HashOutput(Felt::from(861_u128 + 248_u128)),
         classes_trie_root_hash: HashOutput(Felt::from(155_u128 + 248_u128)),
         config: ConfigImpl::new(true, LevelFilter::DEBUG),
-    }, OriginalSkeletonForest{
+    },
+    MapStorage(DbHashMap::from([
+        // Roots.
+        create_root_edge_entry(29, SubTreeHeight::new(3)),
+        create_root_edge_entry(55, SubTreeHeight::new(3)),
+        create_root_edge_entry(155, SubTreeHeight::new(3)),
+        create_root_edge_entry(861, SubTreeHeight::new(3)),
+        // Contracts trie inner nodes.
+        create_binary_entry_from_u128::<AdditionHash>(303, 1),
+        create_binary_entry_from_u128::<AdditionHash>(277, 277),
+        create_edge_entry_from_u128::<AdditionHash>(304, 0, 1),
+        create_edge_entry_from_u128::<AdditionHash>(554, 1, 1),
+        create_binary_entry_from_u128::<AdditionHash>(305, 556),
+        // Contracts trie leaves.
+        create_contract_state_leaf_entry(277),
+        create_contract_state_leaf_entry(303),
+        create_contract_state_leaf_entry(1),
+        // Classes trie inner nodes.
+        create_binary_entry_from_u128::<AdditionHash>(33, 47),
+        create_edge_entry_from_u128::<AdditionHash>(72, 1, 1),
+        create_binary_entry_from_u128::<AdditionHash>(80, 74),
+        create_edge_entry_from_u128::<AdditionHash>(154, 0, 1),
+        // Classes trie leaves.
+        create_compiled_class_leaf_entry(33),
+        create_compiled_class_leaf_entry(47),
+        create_compiled_class_leaf_entry(72),
+        // Storage tries #6, #7 inner nodes.
+        create_binary_entry_from_u128::<AdditionHash>(10, 2),
+        create_edge_entry_from_u128::<AdditionHash>(3, 1, 1),
+        create_binary_entry_from_u128::<AdditionHash>(4, 7),
+        create_edge_entry_from_u128::<AdditionHash>(12, 0, 1),
+        create_binary_entry_from_u128::<AdditionHash>(5, 11),
+        create_binary_entry_from_u128::<AdditionHash>(13, 16),
+        // Storage tries #6, #7 leaves.
+        create_storage_leaf_entry(2),
+        create_storage_leaf_entry(3),
+        create_storage_leaf_entry(4),
+        create_storage_leaf_entry(7),
+        create_storage_leaf_entry(10),
+        // Storage trie #0 inner nodes.
+        create_binary_entry_from_u128::<AdditionHash>(8, 9),
+        create_edge_entry_from_u128::<AdditionHash>(16, 1, 1),
+        create_edge_entry_from_u128::<AdditionHash>(15, 3, 2),
+        create_binary_entry_from_u128::<AdditionHash>(17, 18),
+        create_binary_entry_from_u128::<AdditionHash>(35, 20),
+        // Storage trie #0 leaves.
+        create_storage_leaf_entry(8),
+        create_storage_leaf_entry(9),
+        create_storage_leaf_entry(15),
+        create_storage_leaf_entry(16),
+        ])),
+     OriginalSkeletonForest{
         classes_trie: OriginalSkeletonTreeImpl {
             nodes: create_expected_skeleton_nodes(
                         vec![
@@ -288,8 +293,9 @@ pub(crate) fn create_contract_state_leaf_entry(val: u128) -> (DbKey, DbValue) {
         vec![6, 7, 0],
         vec![7, 6, 0],
 )]
-fn test_create_original_skeleton_forest(
+async fn test_create_original_skeleton_forest(
     #[case] input: Input<ConfigImpl>,
+    #[case] storage: MapStorage,
     #[case] expected_forest: OriginalSkeletonForest<'_>,
     #[case] expected_original_contracts_trie_leaves: HashMap<ContractAddress, ContractState>,
     #[case] expected_storage_tries_sorted_indices: HashMap<u128, Vec<u128>>,
@@ -306,16 +312,20 @@ fn test_create_original_skeleton_forest(
         contracts_trie_sorted_indices: SortedLeafIndices::new(&mut contracts_trie_indices),
         classes_trie_sorted_indices: SortedLeafIndices::new(&mut classes_trie_indices),
     };
-    let (actual_forest, original_contracts_trie_leaves) = OriginalSkeletonForest::create(
-        MapStorage::from(input.storage),
-        input.contracts_trie_root_hash,
-        input.classes_trie_root_hash,
-        &input.state_diff.actual_storage_updates(),
-        &input.state_diff.actual_classes_updates(),
-        &forest_sorted_indices,
-        &ConfigImpl::new(false, LevelFilter::DEBUG),
-    )
-    .unwrap();
+
+    let actual_storage_updates = input.state_diff.actual_storage_updates();
+    let actual_classes_updates = input.state_diff.actual_classes_updates();
+    let (actual_forest, original_contracts_trie_leaves) = FactsDb::new(storage)
+        .read(
+            input.contracts_trie_root_hash,
+            input.classes_trie_root_hash,
+            &actual_storage_updates,
+            &actual_classes_updates,
+            &forest_sorted_indices,
+            ConfigImpl::new(false, LevelFilter::DEBUG),
+        )
+        .await
+        .unwrap();
     let expected_original_contracts_trie_leaves = expected_original_contracts_trie_leaves
         .into_iter()
         .map(|(address, state)| (contract_address_into_node_index(&address), state))
@@ -373,7 +383,7 @@ fn create_storage_updates(
                     .iter()
                     .map(|val| {
                         (
-                            StarknetStorageKey(Felt::from(u128::from(*val))),
+                            StarknetStorageKey::from(u128::from(*val)),
                             StarknetStorageValue(Felt::from(u128::from(*val))),
                         )
                     })

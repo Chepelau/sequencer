@@ -1,15 +1,19 @@
 use std::fmt::Debug;
 
+use blockifier::blockifier::transaction_executor::CompiledClassHashesForMigration;
 use blockifier::bouncer::{BouncerWeights, CasmHashComputationData};
 use blockifier::state::cached_state::CommitmentStateDiff;
 use blockifier::transaction::objects::TransactionExecutionInfo;
 use chrono::prelude::*;
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use starknet_api::block::{BlockHashAndNumber, BlockInfo, BlockNumber};
+use starknet_api::block::{BlockHashAndNumber, BlockHeader, BlockInfo, BlockNumber};
+use starknet_api::block_hash::block_hash_calculator::BlockHeaderCommitments;
 use starknet_api::consensus_transaction::InternalConsensusTransaction;
 use starknet_api::core::StateDiffCommitment;
 use starknet_api::execution_resources::GasAmount;
 use starknet_api::state::ThinStateDiff;
+use starknet_api::transaction::TransactionHash;
 
 use crate::errors::BatcherError;
 
@@ -69,7 +73,6 @@ pub enum GetProposalContent {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-// TODO(Dan): Consider unifying with BuildProposalInput as they have the same fields.
 pub struct ValidateBlockInput {
     pub proposal_id: ProposalId,
     pub deadline: chrono::DateTime<Utc>,
@@ -100,11 +103,12 @@ pub struct SendProposalContentResponse {
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(any(test, feature = "testing"), derive(Default))]
 pub struct CentralObjects {
-    pub execution_infos: Vec<TransactionExecutionInfo>,
+    pub execution_infos: IndexMap<TransactionHash, TransactionExecutionInfo>,
     pub bouncer_weights: BouncerWeights,
     pub compressed_state_diff: Option<CommitmentStateDiff>,
     pub casm_hash_computation_data_sierra_gas: CasmHashComputationData,
     pub casm_hash_computation_data_proving_gas: CasmHashComputationData,
+    pub compiled_class_hashes_for_migration: CompiledClassHashesForMigration,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -115,6 +119,7 @@ pub struct DecisionReachedResponse {
     pub state_diff: ThinStateDiff,
     pub l2_gas_used: GasAmount,
     pub central_objects: CentralObjects,
+    pub block_header_commitments: BlockHeaderCommitments,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -126,7 +131,7 @@ pub enum ProposalStatus {
     Aborted,
     // May be caused due to handling of a previous item of the new proposal.
     // In this case, the proposal is aborted and no additional content will be processed.
-    InvalidProposal,
+    InvalidProposal(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -142,6 +147,22 @@ pub struct DecisionReachedInput {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RevertBlockInput {
     pub height: BlockNumber,
+}
+
+// TODO(Dean): Fill in with actual storage table names and operations.
+/// Storage-related requests for the batcher.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum BatcherStorageRequest {
+    /// Request to read data in Table1 for the given block height.
+    Table1Replacer(BlockNumber),
+}
+
+// TODO(Dean): Fill in with actual response types matching the request variants.
+/// Response for batcher storage requests.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum BatcherStorageResponse {
+    /// Table1 data for the requested operation.
+    Table1Replacer(BlockHeader),
 }
 
 pub type BatcherResult<T> = Result<T, BatcherError>;

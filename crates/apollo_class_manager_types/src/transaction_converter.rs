@@ -1,5 +1,3 @@
-use std::str::FromStr;
-
 use async_trait::async_trait;
 #[cfg(any(feature = "testing", test))]
 use mockall::automock;
@@ -29,7 +27,11 @@ use thiserror::Error;
 
 use crate::{ClassHashes, ClassManagerClientError, SharedClassManagerClient};
 
-#[derive(Error, Debug, Clone)]
+#[cfg(test)]
+#[path = "transaction_converter_test.rs"]
+pub mod transaction_converter_test;
+
+#[derive(Error, Debug, Clone, PartialEq)]
 pub enum TransactionConverterError {
     #[error(transparent)]
     ClassManagerClientError(#[from] ClassManagerClientError),
@@ -175,12 +177,14 @@ impl TransactionConverterTrait for TransactionConverter {
         let tx_without_hash = match tx {
             RpcTransaction::Invoke(tx) => InternalRpcTransactionWithoutTxHash::Invoke(tx),
             RpcTransaction::Declare(RpcDeclareTransaction::V3(tx)) => {
-                let ClassHashes { class_hash, executable_class_hash } =
+                let ClassHashes { class_hash, executable_class_hash_v2 } =
                     self.class_manager_client.add_class(tx.contract_class).await?;
-                if tx.compiled_class_hash != executable_class_hash {
+                // TODO(Aviv): Ensure that we do not want to
+                // allow declare with compiled class hash v1.
+                if tx.compiled_class_hash != executable_class_hash_v2 {
                     return Err(TransactionConverterError::ValidateCompiledClassHashError(
                         ValidateCompiledClassHashError::CompiledClassHashMismatch {
-                            computed_class_hash: executable_class_hash,
+                            computed_class_hash: executable_class_hash_v2,
                             supplied_class_hash: tx.compiled_class_hash,
                         },
                     ));
@@ -226,12 +230,15 @@ impl TransactionConverterTrait for TransactionConverter {
                 }))
             }
             InternalRpcTransactionWithoutTxHash::Declare(tx) => {
-                let sierra = self.get_sierra(tx.class_hash).await?;
+                let (sierra, contract_class) = tokio::try_join!(
+                    self.get_sierra(tx.class_hash),
+                    self.get_executable(tx.class_hash)
+                )?;
                 let class_info = ClassInfo {
-                    contract_class: self.get_executable(tx.class_hash).await?,
+                    contract_class,
                     sierra_program_length: sierra.sierra_program.len(),
                     abi_length: sierra.abi.len(),
-                    sierra_version: SierraVersion::from_str(&sierra.contract_class_version)?,
+                    sierra_version: SierraVersion::extract_from_program(&sierra.sierra_program)?,
                 };
 
                 Ok(AccountTransaction::Declare(executable_transaction::DeclareTransaction {
